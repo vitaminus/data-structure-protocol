@@ -110,6 +110,13 @@ export class DSPDatabase {
         metadata_json TEXT,
         created_at TEXT NOT NULL
       );
+
+      CREATE INDEX IF NOT EXISTS idx_entities_path ON entities(path);
+      CREATE INDEX IF NOT EXISTS idx_entities_kind_path ON entities(kind, path);
+      CREATE INDEX IF NOT EXISTS idx_relations_from_uid ON relations(from_uid);
+      CREATE INDEX IF NOT EXISTS idx_relations_to_uid ON relations(to_uid);
+      CREATE INDEX IF NOT EXISTS idx_relations_kind ON relations(kind);
+      CREATE INDEX IF NOT EXISTS idx_unresolved_references_path ON unresolved_references(path);
     `);
     }
     close() {

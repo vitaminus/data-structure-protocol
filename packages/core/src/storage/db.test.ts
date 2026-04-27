@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DSPDatabase } from "./db.js";
 import { buildUid, stableNowIso } from "../graph/uid.js";
@@ -62,5 +63,24 @@ describe("DSPDatabase", () => {
     fresh.importJson(output);
     expect(fresh.getEntity(uid)?.name).toBe("main.ts");
     fresh.close();
+  });
+
+  it("creates indexes for common graph lookups", () => {
+    const sqlite = new Database(db.dbPath, { readonly: true });
+    const rows = sqlite
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+      .all() as { name: string }[];
+    sqlite.close();
+
+    expect(rows.map((row) => row.name)).toEqual(
+      expect.arrayContaining([
+        "idx_entities_path",
+        "idx_entities_kind_path",
+        "idx_relations_from_uid",
+        "idx_relations_to_uid",
+        "idx_relations_kind",
+        "idx_unresolved_references_path"
+      ])
+    );
   });
 });
