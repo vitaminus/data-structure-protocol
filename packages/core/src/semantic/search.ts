@@ -20,6 +20,19 @@ function cosineSimilarity(a: number[], b: number[]): number {
   return dot / Math.sqrt(normA * normB);
 }
 
+function tokenize(text: string): string[] {
+  return text
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[^a-zA-Z0-9]+/g, " ")
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function normalizedText(text: string): string {
+  return tokenize(text).join(" ");
+}
+
 export async function semanticSearch(
   db: DSPDatabase,
   query: string,
@@ -31,7 +44,8 @@ export async function semanticSearch(
 ): Promise<SearchResult[]> {
   const topK = options.topK ?? 20;
   const entities = db.getEntities(200000);
-  const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
+  const tokens = tokenize(query);
+  const normalizedQuery = tokens.join(" ");
 
   let queryVector: number[] | undefined;
   if (options.embeddingsEnabled && options.provider) {
@@ -40,23 +54,51 @@ export async function semanticSearch(
 
   const scored: SearchResult[] = [];
   for (const entity of entities) {
-    const lexicalCorpus = [
+    const lexicalParts = [
       entity.name,
       entity.path ?? "",
       entity.signature ?? "",
       entity.description ?? "",
       entity.docstring ?? ""
-    ]
-      .join(" ")
-      .toLowerCase();
+    ];
+    const corpusTokens = new Set(tokenize(lexicalParts.join(" ")));
 
     let lexicalScore = 0;
-    for (const token of tokens) {
-      if (lexicalCorpus.includes(token)) {
-        lexicalScore += 0.2;
-      }
+    if (tokens.length > 0) {
+      const matchedTokens = tokens.filter((token) => corpusTokens.has(token)).length;
+      lexicalScore += (matchedTokens / tokens.length) * 0.55;
+    }
+    if (normalizedQuery && normalizedText(entity.name) === normalizedQuery) {
+      lexicalScore += 0.35;
+    }
+    if (normalizedQuery && normalizedText(entity.path ?? "").includes(normalizedQuery)) {
+      lexicalScore += 0.2;
+    }
+    if (normalizedQuery && normalizedText(entity.signature ?? "").includes(normalizedQuery)) {
+      lexicalScore += 0.1;
     }
     lexicalScore = Math.min(1, lexicalScore);
+
+    const neighborIds = [
+      ...db.getRelationsFrom(entity.uid).slice(0, 5).map((relation) => relation.to),
+      ...db.getRelationsTo(entity.uid).slice(0, 5).map((relation) => relation.from)
+    ];
+    let neighborScore = 0;
+    if (tokens.length > 0 && neighborIds.length > 0) {
+      const neighborTokens = new Set(
+        neighborIds.flatMap((uid) => {
+          const neighbor = db.getEntity(uid);
+          if (!neighbor) {
+            return [];
+          }
+          return tokenize(
+            [neighbor.name, neighbor.path ?? "", neighbor.signature ?? "", neighbor.description ?? ""].join(" ")
+          );
+        })
+      );
+      const matchedNeighborTokens = tokens.filter((token) => neighborTokens.has(token)).length;
+      neighborScore = Math.min(1, matchedNeighborTokens / tokens.length);
+    }
 
     let embeddingScore = 0;
     if (queryVector && options.provider) {
@@ -78,11 +120,12 @@ export async function semanticSearch(
       embeddingScore = cosineSimilarity(queryVector, vector);
     }
 
-    const score = lexicalScore * 0.65 + embeddingScore * 0.35;
+    const lexicalAndGraphScore = Math.min(1, lexicalScore * 0.85 + neighborScore * 0.15);
+    const score = lexicalAndGraphScore * 0.65 + embeddingScore * 0.35;
     if (score <= 0) {
       continue;
     }
-    const neighbors = db.getRelationsFrom(entity.uid).slice(0, 5).map((r) => r.to);
+    const neighbors = neighborIds.slice(0, 5);
     scored.push({
       uid: entity.uid,
       kind: entity.kind,
@@ -90,8 +133,8 @@ export async function semanticSearch(
       score,
       explanation:
         embeddingScore > 0
-          ? `lexical=${lexicalScore.toFixed(2)}, semantic=${embeddingScore.toFixed(2)}`
-          : `lexical=${lexicalScore.toFixed(2)}`,
+          ? `lexical=${lexicalScore.toFixed(2)}, neighbors=${neighborScore.toFixed(2)}, semantic=${embeddingScore.toFixed(2)}`
+          : `lexical=${lexicalScore.toFixed(2)}, neighbors=${neighborScore.toFixed(2)}`,
       neighbors
     });
   }
