@@ -15,24 +15,38 @@ export function getNeighbors(
   depth = 1
 ): { entities: Entity[]; relations: Relation[] } {
   const entities = new Map<string, Entity>();
+  const relationKeys = new Set<string>();
   const relations: Relation[] = [];
   const frontier = new Set<string>([uid]);
+  const expanded = new Set<string>();
   for (let currentDepth = 0; currentDepth < depth; currentDepth += 1) {
     const next = new Set<string>();
     for (const node of frontier) {
+      if (expanded.has(node)) {
+        continue;
+      }
+      expanded.add(node);
       const fromRelations = db.getRelationsFrom(node);
       const toRelations = db.getRelationsTo(node);
       for (const relation of [...fromRelations, ...toRelations]) {
-        relations.push(relation);
+        const relationKey = `${relation.from}\0${relation.kind}\0${relation.to}`;
+        if (!relationKeys.has(relationKey)) {
+          relationKeys.add(relationKey);
+          relations.push(relation);
+        }
         const left = db.getEntity(relation.from);
         const right = db.getEntity(relation.to);
         if (left) {
           entities.set(left.uid, left);
-          next.add(left.uid);
+          if (!expanded.has(left.uid)) {
+            next.add(left.uid);
+          }
         }
         if (right) {
           entities.set(right.uid, right);
-          next.add(right.uid);
+          if (!expanded.has(right.uid)) {
+            next.add(right.uid);
+          }
         }
       }
     }
