@@ -1,0 +1,16 @@
+{
+  "name": "@dsp/language-typescript",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@dsp/core": "workspace:*",
+    "typescript": "^5.7.2"
+  }
+}
