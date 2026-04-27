@@ -1,6 +1,7 @@
+import fs from "node:fs";
 import path from "node:path";
 import type { Entity, LanguageAdapter, ParseResult, Relation, UnresolvedReference } from "@dsp/core";
-import { buildUid, stableNowIso } from "@dsp/core";
+import { buildUid, normalizePath, stableNowIso } from "@dsp/core";
 
 function prov(confidence: number, evidence: string) {
   return [
@@ -12,6 +13,70 @@ function prov(confidence: number, evidence: string) {
       evidence
     }
   ];
+}
+
+function rustModuleFiles(baseDir: string, modulePath: string): string[] {
+  const normalized = normalizePath(path.posix.join(baseDir, modulePath));
+  return [`${normalized}.rs`, normalizePath(path.posix.join(normalized, "mod.rs"))];
+}
+
+function firstExisting(candidates: string[]): string | undefined {
+  return candidates.find((candidate) => fs.existsSync(candidate));
+}
+
+function resolveModDeclaration(filePath: string, name: string): { path: string; confidence: number } {
+  const baseDir = normalizePath(path.posix.dirname(filePath));
+  const candidates = rustModuleFiles(baseDir, name);
+  return { path: firstExisting(candidates) ?? candidates[0]!, confidence: firstExisting(candidates) ? 0.92 : 0.76 };
+}
+
+function cleanUseSpec(spec: string): string {
+  return spec
+    .replace(/\s+as\s+.+$/, "")
+    .replace(/\{.*$/, "")
+    .replace(/::\*$/, "")
+    .replace(/;+$/, "")
+    .trim();
+}
+
+function resolveUsePath(filePath: string, spec: string): { path: string; confidence: number } | undefined {
+  const clean = cleanUseSpec(spec);
+  if (!clean) {
+    return undefined;
+  }
+  const rawSegments = clean.split("::").filter(Boolean);
+  const first = rawSegments[0];
+  let baseDir = normalizePath(path.posix.dirname(filePath));
+  let segments = rawSegments;
+
+  if (first === "crate") {
+    baseDir = "src";
+    segments = rawSegments.slice(1);
+  } else if (first === "self") {
+    segments = rawSegments.slice(1);
+  } else if (first === "super") {
+    baseDir = normalizePath(path.posix.dirname(baseDir));
+    segments = rawSegments.slice(1);
+  }
+
+  if (segments.length === 0) {
+    return undefined;
+  }
+
+  for (let length = segments.length; length >= 1; length -= 1) {
+    const modulePath = segments.slice(0, length).join("/");
+    const existing = firstExisting(rustModuleFiles(baseDir, modulePath));
+    if (existing) {
+      return { path: existing, confidence: 0.88 };
+    }
+  }
+
+  if (first === "crate" || first === "self" || first === "super") {
+    const fallbackPath = rustModuleFiles(baseDir, segments.join("/"))[0]!;
+    return { path: fallbackPath, confidence: 0.72 };
+  }
+
+  return undefined;
 }
 
 export class RustLanguageAdapter implements LanguageAdapter {
@@ -34,9 +99,10 @@ export class RustLanguageAdapter implements LanguageAdapter {
       const raw = lines[index];
       const line = raw.trim();
 
-      const modMatch = line.match(/^mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;?$/);
+      const modMatch = line.match(/^(pub\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;?$/);
       if (modMatch) {
-        const name = modMatch[1];
+        const name = modMatch[2];
+        const resolvedMod = resolveModDeclaration(filePath, name);
         const uid = buildUid("module", filePath, name);
         entities.push({
           uid,
@@ -46,6 +112,7 @@ export class RustLanguageAdapter implements LanguageAdapter {
           language: "rust",
           startLine: index + 1,
           endLine: index + 1,
+          metadata: { rustKind: "module", modulePath: resolvedMod.path, public: Boolean(modMatch[1]) },
           confidence: 0.93,
           provenance: prov(0.93, "mod declaration"),
           createdAt: now,
@@ -58,25 +125,28 @@ export class RustLanguageAdapter implements LanguageAdapter {
           confidence: 1,
           provenance: prov(1, "file contains module")
         });
+        relations.push({
+          from: fileUid,
+          to: buildUid("file", resolvedMod.path),
+          kind: "imports",
+          reason: `mod ${name}`,
+          confidence: resolvedMod.confidence,
+          provenance: prov(resolvedMod.confidence, "mod file resolution")
+        });
       }
 
       const useMatch = line.match(/^use\s+(.+);$/);
       if (useMatch) {
         const spec = useMatch[1].trim();
-        if (spec.startsWith("crate::") || spec.startsWith("self::") || spec.startsWith("super::")) {
-          const target = spec
-            .replace(/^crate::/, "src/")
-            .replaceAll("::", "/")
-            .replace(/\{.*$/, "")
-            .replace(/\*$/, "")
-            .replace(/;+$/, "");
+        const resolvedUse = resolveUsePath(filePath, spec);
+        if (resolvedUse) {
           relations.push({
             from: fileUid,
-            to: buildUid("file", `${target}.rs`),
+            to: buildUid("file", resolvedUse.path),
             kind: "imports",
             reason: spec,
-            confidence: 0.84,
-            provenance: prov(0.84, "use import")
+            confidence: resolvedUse.confidence,
+            provenance: prov(resolvedUse.confidence, "use import resolution")
           });
         } else {
           unresolvedReferences.push({

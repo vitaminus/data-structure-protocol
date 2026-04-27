@@ -63,3 +63,11 @@ Status: done
 - Resolve relative TypeScript/JavaScript imports through the TypeScript compiler resolver when files are available.
 - Honor nearby `tsconfig.json` compiler options before falling back to deterministic path heuristics.
 - Add coverage for extensionless `./module` imports resolving to real `.ts` files.
+
+## 9. Improve Rust module and `use` resolution
+
+Status: done
+
+- Resolve `mod name;` declarations to sibling `name.rs` or `name/mod.rs` files when present.
+- Resolve `crate::`, `self::`, `super::`, and sibling `use` paths to existing module files before falling back.
+- Add coverage for `pub mod user`, `use user::User`, and `use crate::user::User` resolving to `src/user.rs`.
