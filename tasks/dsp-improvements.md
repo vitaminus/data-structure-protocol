@@ -55,3 +55,11 @@ Status: done
 - Add a database transaction helper for grouped graph mutations.
 - Wrap deleted-file cleanup and per-file index writes in SQLite transactions.
 - Add rollback coverage so a failed relation write cannot leave partially refreshed file graph data.
+
+## 8. Use TypeScript module resolution for internal imports
+
+Status: done
+
+- Resolve relative TypeScript/JavaScript imports through the TypeScript compiler resolver when files are available.
+- Honor nearby `tsconfig.json` compiler options before falling back to deterministic path heuristics.
+- Add coverage for extensionless `./module` imports resolving to real `.ts` files.

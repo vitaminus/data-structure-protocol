@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import ts from "typescript";
 import type { Entity, LanguageAdapter, ParseResult, Relation, UnresolvedReference } from "@dsp/core";
@@ -20,12 +21,67 @@ function withProv(confidence: number, evidence: string) {
   ];
 }
 
+function pathForUid(resolvedFileName: string, fromPath: string): string {
+  const normalizedResolved = normalizePath(resolvedFileName);
+  if (!path.isAbsolute(resolvedFileName)) {
+    return normalizedResolved;
+  }
+  if (path.isAbsolute(fromPath)) {
+    return normalizedResolved;
+  }
+  const relativeToCwd = normalizePath(path.relative(process.cwd(), resolvedFileName));
+  return relativeToCwd.startsWith("..") ? normalizedResolved : relativeToCwd;
+}
+
+function compilerOptionsFor(containingFile: string): ts.CompilerOptions {
+  const configPath = ts.findConfigFile(path.dirname(containingFile), ts.sys.fileExists);
+  if (!configPath) {
+    return {
+      allowJs: true,
+      module: ts.ModuleKind.NodeNext,
+      moduleResolution: ts.ModuleResolutionKind.NodeNext,
+      target: ts.ScriptTarget.Latest,
+      jsx: ts.JsxEmit.ReactJSX
+    };
+  }
+  const config = ts.readConfigFile(configPath, ts.sys.readFile);
+  if (config.error) {
+    return {};
+  }
+  return ts.parseJsonConfigFileContent(config.config, ts.sys, path.dirname(configPath)).options;
+}
+
 function resolveImport(fromPath: string, specifier: string): string | undefined {
   if (!specifier.startsWith(".")) {
     return undefined;
   }
+
+  const containingFile = path.isAbsolute(fromPath) ? fromPath : path.resolve(fromPath);
+  const resolved = ts.resolveModuleName(
+    specifier,
+    containingFile,
+    compilerOptionsFor(containingFile),
+    ts.sys
+  ).resolvedModule;
+  if (resolved && !resolved.isExternalLibraryImport) {
+    return pathForUid(resolved.resolvedFileName, fromPath);
+  }
+
   const base = path.dirname(fromPath);
   const candidate = normalizePath(path.join(base, specifier));
+  const extensions = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
+  for (const ext of extensions) {
+    const withExtension = `${candidate}${ext}`;
+    if (fs.existsSync(withExtension)) {
+      return normalizePath(withExtension);
+    }
+  }
+  for (const ext of extensions) {
+    const indexFile = normalizePath(path.join(candidate, `index${ext}`));
+    if (fs.existsSync(indexFile)) {
+      return indexFile;
+    }
+  }
   return candidate;
 }
 
