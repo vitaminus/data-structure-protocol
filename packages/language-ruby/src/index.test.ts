@@ -34,4 +34,30 @@ end
     );
     expect(parsedRoutes.entities.some((entity) => entity.kind === "route")).toBe(true);
   });
+
+  it("uses Ripper to extract nested classes, methods and mixins", async () => {
+    const adapter = new RubyLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "app/models/admin/user.rb",
+      `
+module Admin
+  class User
+    include Auditable
+
+    def self.find_active
+    end
+
+    def name
+    end
+  end
+end
+`
+    );
+    const entities = adapter.extractEntities(parsed);
+    const relations = adapter.extractRelations(parsed, entities);
+    expect(entities.some((entity) => entity.kind === "module" && entity.name === "Admin")).toBe(true);
+    expect(entities.some((entity) => entity.kind === "class" && entity.name === "User")).toBe(true);
+    expect(entities.some((entity) => entity.kind === "method" && entity.name === "find_active")).toBe(true);
+    expect(relations.some((relation) => relation.kind === "implements" && relation.reason === "include Auditable")).toBe(true);
+  });
 });

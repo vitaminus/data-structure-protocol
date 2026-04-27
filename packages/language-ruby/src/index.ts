@@ -1,17 +1,309 @@
+import { spawnSync } from "node:child_process";
 import path from "node:path";
 import type { Entity, LanguageAdapter, ParseResult, Relation, UnresolvedReference } from "@dsp/core";
 import { buildUid, stableNowIso } from "@dsp/core";
 
-function prov(confidence: number, source: "ast" | "regex", evidence: string) {
+type RubySource = "ast" | "regex";
+
+type RubySymbol = {
+  kind: "module" | "class" | "method";
+  name: string;
+  owner?: string;
+  startLine: number;
+  endLine: number;
+  classMethod?: boolean;
+};
+
+type RubyMixin = {
+  kind: "include" | "extend" | "prepend";
+  owner: string;
+  target: string;
+  line: number;
+};
+
+type RubyRoute = {
+  verb: string;
+  path: string;
+  controllerAction?: string;
+  line: number;
+};
+
+type RubyParsed = {
+  symbols: RubySymbol[];
+  requires: { spec: string; relative: boolean; line: number }[];
+  mixins: RubyMixin[];
+  routes: RubyRoute[];
+  source: RubySource;
+};
+
+type RubyToken = {
+  line: number;
+  type: string;
+  value: string;
+};
+
+const RIPPER_LEX_SCRIPT = `
+require "json"
+require "ripper"
+source = STDIN.read
+tokens = Ripper.lex(source).map do |pos, type, token, _state|
+  { line: pos[0], type: type.to_s.sub(/^on_/, ""), value: token }
+end
+puts JSON.generate(tokens)
+`;
+
+function prov(confidence: number, source: RubySource, evidence: string) {
   return [
     {
       source,
-      tool: source === "ast" ? "ruby-syntax-lite" : "ruby-regex-fallback",
+      tool: source === "ast" ? "ruby-ripper" : "ruby-regex-fallback",
       timestamp: stableNowIso(),
       confidence,
       evidence
     }
   ];
+}
+
+function tokenIsWhitespace(token: RubyToken): boolean {
+  return ["sp", "ignored_nl", "nl", "comment"].includes(token.type);
+}
+
+function skipWhitespace(tokens: RubyToken[], index: number): number {
+  let current = index;
+  while (current < tokens.length && tokenIsWhitespace(tokens[current]!)) {
+    current += 1;
+  }
+  return current;
+}
+
+function readConstantPath(tokens: RubyToken[], index: number): { name?: string; next: number } {
+  let current = skipWhitespace(tokens, index);
+  const parts: string[] = [];
+  while (current < tokens.length) {
+    const token = tokens[current]!;
+    if (token.type === "const" || token.type === "ident") {
+      parts.push(token.value);
+      current += 1;
+      const afterName = skipWhitespace(tokens, current);
+      if (tokens[afterName]?.value === "::") {
+        current = afterName + 1;
+        continue;
+      }
+      break;
+    }
+    break;
+  }
+  return { name: parts.length > 0 ? parts.join("::") : undefined, next: current };
+}
+
+function readMethodName(tokens: RubyToken[], index: number): { name?: string; classMethod: boolean; next: number } {
+  let current = skipWhitespace(tokens, index);
+  if (tokens[current]?.value === "self") {
+    const maybeDot = skipWhitespace(tokens, current + 1);
+    if ([".", "::"].includes(tokens[maybeDot]?.value ?? "")) {
+      const nameIndex = skipWhitespace(tokens, maybeDot + 1);
+      const name = tokens[nameIndex]?.value;
+      return { name, classMethod: true, next: nameIndex + 1 };
+    }
+  }
+  const name = tokens[current]?.value;
+  return { name, classMethod: false, next: current + 1 };
+}
+
+function parseWithRipper(content: string): RubyParsed | undefined {
+  const result = spawnSync("ruby", ["-e", RIPPER_LEX_SCRIPT], {
+    input: content,
+    encoding: "utf8"
+  });
+  if (result.status !== 0 || !result.stdout) {
+    return undefined;
+  }
+
+  let tokens: RubyToken[];
+  try {
+    tokens = JSON.parse(result.stdout) as RubyToken[];
+  } catch {
+    return undefined;
+  }
+
+  const symbols: RubySymbol[] = [];
+  const mixins: RubyMixin[] = [];
+  const stack: { kind: "module" | "class" | "method" | "block"; name?: string; symbolIndex?: number }[] = [];
+
+  const currentOwner = () => [...stack].reverse().find((item) => item.kind === "class" || item.kind === "module")?.name;
+
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i]!;
+    if (token.type === "kw" && token.value === "class") {
+      const read = readConstantPath(tokens, i + 1);
+      if (read.name) {
+        const symbolIndex = symbols.push({ kind: "class", name: read.name, startLine: token.line, endLine: token.line }) - 1;
+        stack.push({ kind: "class", name: read.name, symbolIndex });
+      }
+      i = read.next;
+      continue;
+    }
+
+    if (token.type === "kw" && token.value === "module") {
+      const read = readConstantPath(tokens, i + 1);
+      if (read.name) {
+        const symbolIndex = symbols.push({ kind: "module", name: read.name, startLine: token.line, endLine: token.line }) - 1;
+        stack.push({ kind: "module", name: read.name, symbolIndex });
+      }
+      i = read.next;
+      continue;
+    }
+
+    if (token.type === "kw" && token.value === "def") {
+      const read = readMethodName(tokens, i + 1);
+      if (read.name) {
+        const owner = currentOwner();
+        const symbolIndex =
+          symbols.push({
+            kind: "method",
+            name: read.name,
+            owner,
+            startLine: token.line,
+            endLine: token.line,
+            classMethod: read.classMethod
+          }) - 1;
+        stack.push({ kind: "method", name: read.name, symbolIndex });
+      }
+      i = read.next;
+      continue;
+    }
+
+    if (token.type === "ident" && ["include", "extend", "prepend"].includes(token.value)) {
+      const read = readConstantPath(tokens, i + 1);
+      const owner = currentOwner();
+      if (owner && read.name) {
+        mixins.push({ kind: token.value as RubyMixin["kind"], owner, target: read.name, line: token.line });
+      }
+      i = read.next;
+      continue;
+    }
+
+    if (token.type === "kw" && token.value === "do") {
+      stack.push({ kind: "block" });
+      continue;
+    }
+
+    if (token.type === "kw" && token.value === "end") {
+      const closed = stack.pop();
+      if (closed?.symbolIndex !== undefined) {
+        symbols[closed.symbolIndex]!.endLine = token.line;
+      }
+    }
+  }
+
+  return {
+    symbols,
+    mixins,
+    requires: parseRequires(content),
+    routes: parseRoutes(content),
+    source: "ast"
+  };
+}
+
+function parseRequires(content: string): RubyParsed["requires"] {
+  return content.split("\n").flatMap((raw, index) => {
+    const line = raw.trim();
+    const match = line.match(/^require(_relative)?\s+["']([^"']+)["']/);
+    return match ? [{ spec: match[2]!, relative: Boolean(match[1]), line: index + 1 }] : [];
+  });
+}
+
+function parseRoutes(content: string): RubyRoute[] {
+  return content.split("\n").flatMap((raw, index) => {
+    const line = raw.trim();
+    const routeMatch = line.match(/^(get|post|put|patch|delete)\s+["']([^"']+)["'](?:,\s*to:\s*["']([^"']+)["'])?/);
+    return routeMatch
+      ? [
+          {
+            verb: routeMatch[1]!,
+            path: routeMatch[2]!,
+            controllerAction: routeMatch[3],
+            line: index + 1
+          }
+        ]
+      : [];
+  });
+}
+
+function parseWithRegex(content: string): RubyParsed {
+  const symbols: RubySymbol[] = [];
+  const mixins: RubyMixin[] = [];
+  const moduleStack: string[] = [];
+  const classStack: string[] = [];
+  let singletonClassActive = false;
+
+  const owner = () => classStack.at(-1) ?? moduleStack.at(-1);
+
+  const lines = content.split("\n");
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]!.trim();
+    const moduleMatch = line.match(/^module\s+([A-Za-z_][A-Za-z0-9_:]*)/);
+    if (moduleMatch) {
+      const name = moduleMatch[1]!;
+      moduleStack.push(name);
+      symbols.push({ kind: "module", name, startLine: i + 1, endLine: i + 1 });
+    }
+
+    const classMatch = line.match(/^class\s+([A-Za-z_][A-Za-z0-9_:]*)/);
+    if (classMatch) {
+      const name = classMatch[1]!;
+      classStack.push(name);
+      symbols.push({ kind: "class", name, startLine: i + 1, endLine: i + 1 });
+    }
+
+    if (line.startsWith("class << self")) {
+      singletonClassActive = true;
+    }
+
+    const methodMatch = line.match(/^def\s+(self\.)?([A-Za-z_][A-Za-z0-9_!?=]*)/);
+    if (methodMatch) {
+      symbols.push({
+        kind: "method",
+        name: methodMatch[2]!,
+        owner: owner() ?? "Object",
+        startLine: i + 1,
+        endLine: i + 1,
+        classMethod: Boolean(methodMatch[1]) || singletonClassActive
+      });
+    }
+
+    const includeMatch = line.match(/^(include|extend|prepend)\s+([A-Za-z_][A-Za-z0-9_:]*)/);
+    if (includeMatch && owner()) {
+      mixins.push({
+        kind: includeMatch[1] as RubyMixin["kind"],
+        owner: owner()!,
+        target: includeMatch[2]!,
+        line: i + 1
+      });
+    }
+
+    if (line === "end") {
+      if (singletonClassActive) {
+        singletonClassActive = false;
+      } else if (classStack.length > 0) {
+        classStack.pop();
+      } else if (moduleStack.length > 0) {
+        moduleStack.pop();
+      }
+    }
+  }
+
+  return {
+    symbols,
+    mixins,
+    requires: parseRequires(content),
+    routes: parseRoutes(content),
+    source: "regex"
+  };
+}
+
+function isRailsPath(filePath: string): boolean {
+  return filePath.includes("/app/") || filePath.startsWith("app/") || filePath.endsWith("config/routes.rb");
 }
 
 export class RubyLanguageAdapter implements LanguageAdapter {
@@ -27,10 +319,8 @@ export class RubyLanguageAdapter implements LanguageAdapter {
     const entities: Entity[] = [];
     const relations: Relation[] = [];
     const unresolvedReferences: UnresolvedReference[] = [];
-    const lines = content.split("\n");
-    const moduleStack: string[] = [];
-    const classStack: string[] = [];
-    let singletonClassActive = false;
+    const parsed = parseWithRipper(content) ?? parseWithRegex(content);
+    const confidence = parsed.source === "ast" ? 0.9 : 0.72;
 
     const addEntity = (entity: Entity) => {
       entities.push(entity);
@@ -39,144 +329,101 @@ export class RubyLanguageAdapter implements LanguageAdapter {
         to: entity.uid,
         kind: "contains",
         confidence: 1,
-        provenance: prov(1, "ast", "file contains symbol")
+        provenance: prov(1, parsed.source, "file contains symbol")
       });
     };
 
-    for (let i = 0; i < lines.length; i += 1) {
-      const line = lines[i].trim();
-      if (line.startsWith("require ")) {
-        const spec = line.replace(/^require\s+["']/, "").replace(/["']$/, "");
-        unresolvedReferences.push({
-          path: filePath,
-          fromUid: fileUid,
-          symbol: spec,
-          kind: "require",
-          reason: "ruby require dependency",
-          confidence: 0.7
-        });
-      }
-
-      const moduleMatch = line.match(/^module\s+([A-Za-z_][A-Za-z0-9_:]*)/);
-      if (moduleMatch) {
-        const name = moduleMatch[1];
-        moduleStack.push(name);
+    for (const symbol of parsed.symbols) {
+      if (symbol.kind === "module") {
         addEntity({
-          uid: buildUid("module", filePath, name),
+          uid: buildUid("module", filePath, symbol.name),
           kind: "module",
-          name,
+          name: symbol.name,
           path: filePath,
           language: "ruby",
-          startLine: i + 1,
-          endLine: i + 1,
-          confidence: 0.9,
-          provenance: prov(0.9, "ast", "module declaration"),
-          metadata: {
-            rails:
-              filePath.includes("/app/models/") || filePath.includes("/app/controllers/")
-                ? true
-                : false
-          },
+          startLine: symbol.startLine,
+          endLine: symbol.endLine,
+          confidence,
+          provenance: prov(confidence, parsed.source, "module declaration"),
+          metadata: { rails: isRailsPath(filePath) },
           createdAt: now,
           updatedAt: now
         });
-      }
-
-      const classMatch = line.match(/^class\s+([A-Za-z_][A-Za-z0-9_:]*)/);
-      if (classMatch) {
-        const className = classMatch[1];
-        classStack.push(className);
+      } else if (symbol.kind === "class") {
         addEntity({
-          uid: buildUid("class", filePath, className),
+          uid: buildUid("class", filePath, symbol.name),
           kind: "class",
-          name: className,
+          name: symbol.name,
           path: filePath,
           language: "ruby",
-          startLine: i + 1,
-          endLine: i + 1,
-          confidence: 0.9,
-          provenance: prov(0.9, "ast", "class declaration"),
+          startLine: symbol.startLine,
+          endLine: symbol.endLine,
+          confidence,
+          provenance: prov(confidence, parsed.source, "class declaration"),
           metadata: {
-            railsModel: filePath.includes("/app/models/"),
-            railsController: filePath.includes("/app/controllers/")
+            railsModel: filePath.includes("/app/models/") || filePath.startsWith("app/models/"),
+            railsController: filePath.includes("/app/controllers/") || filePath.startsWith("app/controllers/")
           },
           createdAt: now,
           updatedAt: now
         });
-      }
-
-      if (line.startsWith("class << self")) {
-        singletonClassActive = true;
-      }
-
-      const methodMatch = line.match(/^def\s+(self\.)?([A-Za-z_][A-Za-z0-9_!?=]*)/);
-      if (methodMatch) {
-        const isClassMethod = Boolean(methodMatch[1]) || singletonClassActive;
-        const name = methodMatch[2];
-        const owner =
-          classStack.at(-1) ?? moduleStack.at(-1) ?? path.basename(filePath).replace(".rb", "");
-        const uid = buildUid("method", filePath, `${owner}.${name}`);
+      } else {
+        const owner = symbol.owner ?? path.basename(filePath).replace(".rb", "");
         addEntity({
-          uid,
+          uid: buildUid("method", filePath, `${owner}.${symbol.name}`),
           kind: "method",
-          name,
+          name: symbol.name,
           path: filePath,
           language: "ruby",
-          startLine: i + 1,
-          endLine: i + 1,
-          confidence: 0.82,
-          provenance: prov(0.82, "ast", isClassMethod ? "class method" : "instance method"),
-          metadata: { classMethod: isClassMethod, owner, public: !name.startsWith("_") },
+          startLine: symbol.startLine,
+          endLine: symbol.endLine,
+          confidence: parsed.source === "ast" ? 0.86 : 0.72,
+          provenance: prov(parsed.source === "ast" ? 0.86 : 0.72, parsed.source, symbol.classMethod ? "class method" : "instance method"),
+          metadata: { classMethod: Boolean(symbol.classMethod), owner, public: !symbol.name.startsWith("_") },
           createdAt: now,
           updatedAt: now
         });
       }
+    }
 
-      const includeMatch = line.match(/^(include|extend)\s+([A-Za-z_][A-Za-z0-9_:]*)/);
-      if (includeMatch) {
-        const kind = includeMatch[1];
-        const target = includeMatch[2];
-        const owner = classStack.at(-1) ?? moduleStack.at(-1);
-        if (owner) {
-          relations.push({
-            from: buildUid("class", filePath, owner),
-            to: buildUid("module", filePath, target),
-            kind: kind === "include" ? "implements" : "uses",
-            reason: `${kind} ${target}`,
-            confidence: 0.7,
-            provenance: prov(0.7, "regex", `${kind} mixin`)
-          });
-        }
-      }
+    for (const mixin of parsed.mixins) {
+      relations.push({
+        from: buildUid("class", filePath, mixin.owner),
+        to: buildUid("module", filePath, mixin.target),
+        kind: mixin.kind === "include" || mixin.kind === "prepend" ? "implements" : "uses",
+        reason: `${mixin.kind} ${mixin.target}`,
+        confidence: parsed.source === "ast" ? 0.78 : 0.7,
+        provenance: prov(parsed.source === "ast" ? 0.78 : 0.7, parsed.source, `${mixin.kind} mixin`)
+      });
+    }
 
-      if (filePath.endsWith("config/routes.rb")) {
-        const routeMatch = line.match(/(get|post|put|patch|delete)\s+["']([^"']+)["']/);
-        if (routeMatch) {
-          const routePath = routeMatch[2];
-          addEntity({
-            uid: buildUid("route", filePath, routePath),
-            kind: "route",
-            name: routePath,
-            path: filePath,
-            language: "ruby",
-            startLine: i + 1,
-            endLine: i + 1,
-            confidence: 0.75,
-            provenance: prov(0.75, "regex", "rails route"),
-            createdAt: now,
-            updatedAt: now
-          });
-        }
-      }
+    for (const req of parsed.requires) {
+      unresolvedReferences.push({
+        path: filePath,
+        fromUid: fileUid,
+        symbol: req.spec,
+        kind: "require",
+        reason: req.relative ? "ruby relative require dependency" : "ruby require dependency",
+        confidence: req.relative ? 0.8 : 0.7
+      });
+    }
 
-      if (line === "end") {
-        if (singletonClassActive) {
-          singletonClassActive = false;
-        } else if (classStack.length > 0) {
-          classStack.pop();
-        } else if (moduleStack.length > 0) {
-          moduleStack.pop();
-        }
+    if (filePath.endsWith("config/routes.rb")) {
+      for (const route of parsed.routes) {
+        addEntity({
+          uid: buildUid("route", filePath, `${route.verb} ${route.path}`),
+          kind: "route",
+          name: route.path,
+          path: filePath,
+          language: "ruby",
+          startLine: route.line,
+          endLine: route.line,
+          confidence: 0.78,
+          provenance: prov(0.78, parsed.source, "rails route"),
+          metadata: { verb: route.verb, controllerAction: route.controllerAction },
+          createdAt: now,
+          updatedAt: now
+        });
       }
     }
 

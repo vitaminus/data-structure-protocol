@@ -87,3 +87,11 @@ Status: done
 - Add `error`/`warning`/`info` severity to every validation issue.
 - Add aggregate validation summaries with total/error/warning/info counts.
 - Keep existing issue kinds while making CLI/API validation output easier for agents to triage.
+
+## 12. Parse Ruby symbols with Ripper
+
+Status: done
+
+- Add a Ripper-backed lexer parser for Ruby classes, modules, methods, and mixins.
+- Keep the regex parser as a safe fallback when Ruby/Ripper is unavailable.
+- Add coverage for nested modules/classes, class methods, instance methods, and mixins.
