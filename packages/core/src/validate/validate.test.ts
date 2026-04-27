@@ -39,5 +39,7 @@ describe("validation", () => {
     const result = validateGraph(db, tempDir);
     expect(result.ok).toBe(false);
     expect(result.issues.some((issue) => issue.kind === "stale_hash")).toBe(true);
+    expect(result.issues.find((issue) => issue.kind === "stale_hash")?.severity).toBe("warning");
+    expect(result.summary).toEqual({ total: 1, errors: 0, warnings: 1, info: 0 });
   });
 });

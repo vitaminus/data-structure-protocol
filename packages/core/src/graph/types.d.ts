@@ -79,8 +79,10 @@ export type ImpactResult = {
     confidence: number;
     reasons: string[];
 };
+export type ValidationSeverity = "error" | "warning" | "info";
 export type ValidationIssue = {
     kind: "missing_file" | "stale_hash" | "dangling_relation" | "unresolved_reference" | "low_confidence_critical" | "annotation_conflict";
+    severity: ValidationSeverity;
     message: string;
     path?: string;
     uid?: string;
@@ -91,9 +93,16 @@ export type ValidationIssue = {
     };
     confidence?: number;
 };
+export type ValidationSummary = {
+    total: number;
+    errors: number;
+    warnings: number;
+    info: number;
+};
 export type ValidationResult = {
     ok: boolean;
     issues: ValidationIssue[];
+    summary: ValidationSummary;
 };
 export type ContextPackRequest = {
     task: string;

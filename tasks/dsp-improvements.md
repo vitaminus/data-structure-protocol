@@ -79,3 +79,11 @@ Status: done
 - Parse `git diff --name-status` entries so renames preserve both old and new paths.
 - Clear graph data and file hashes for old rename paths before indexing the new file path.
 - Add coverage for `git mv` leaving no stale old-path entity behind.
+
+## 11. Add severity and summaries to validation reports
+
+Status: done
+
+- Add `error`/`warning`/`info` severity to every validation issue.
+- Add aggregate validation summaries with total/error/warning/info counts.
+- Keep existing issue kinds while making CLI/API validation output easier for agents to triage.
