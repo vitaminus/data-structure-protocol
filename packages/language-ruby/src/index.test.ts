@@ -85,4 +85,31 @@ end
       relations.some((relation) => relation.kind === "uses" && relation.to === "file:app/controllers/users_controller.rb")
     ).toBe(true);
   });
+
+  it("maps Rails routes to controller action methods", async () => {
+    const adapter = new RubyLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "config/routes.rb",
+      `
+get "/users", to: "users#index"
+resources :accounts
+`
+    );
+    const relations = adapter.extractRelations(parsed, parsed.entities);
+    expect(parsed.entities.some((entity) => entity.kind === "route" && entity.name === "/users")).toBe(true);
+    expect(
+      relations.some(
+        (relation) =>
+          relation.kind === "routes_to" &&
+          relation.to === "method:app/controllers/users_controller.rb#UsersController.index"
+      )
+    ).toBe(true);
+    expect(
+      relations.some(
+        (relation) =>
+          relation.kind === "routes_to" &&
+          relation.to === "method:app/controllers/accounts_controller.rb#AccountsController.index"
+      )
+    ).toBe(true);
+  });
 });

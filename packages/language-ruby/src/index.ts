@@ -248,16 +248,29 @@ function parseRoutes(content: string): RubyRoute[] {
   return content.split("\n").flatMap((raw, index) => {
     const line = raw.trim();
     const routeMatch = line.match(/^(get|post|put|patch|delete)\s+["']([^"']+)["'](?:,\s*to:\s*["']([^"']+)["'])?/);
-    return routeMatch
-      ? [
-          {
-            verb: routeMatch[1]!,
-            path: routeMatch[2]!,
-            controllerAction: routeMatch[3],
-            line: index + 1
-          }
-        ]
-      : [];
+    if (routeMatch) {
+      return [
+        {
+          verb: routeMatch[1]!,
+          path: routeMatch[2]!,
+          controllerAction: routeMatch[3],
+          line: index + 1
+        }
+      ];
+    }
+    const resourcesMatch = line.match(/^resources\s+:([A-Za-z_][A-Za-z0-9_]*)/);
+    if (resourcesMatch) {
+      const resource = resourcesMatch[1]!;
+      return [
+        {
+          verb: "resources",
+          path: `/${resource}`,
+          controllerAction: `${resource}#index`,
+          line: index + 1
+        }
+      ];
+    }
+    return [];
   });
 }
 
@@ -367,6 +380,25 @@ function railsPathForConstant(constant: string): string | undefined {
     return `app/mailers/${underscored}.rb`;
   }
   return `app/models/${underscored}.rb`;
+}
+
+function controllerActionTarget(controllerAction: string): { filePath: string; className: string; methodName: string } | undefined {
+  const [controller, action] = controllerAction.split("#");
+  if (!controller || !action) {
+    return undefined;
+  }
+  const filePath = `app/controllers/${controller}_controller.rb`;
+  const className = `${controller
+    .split("/")
+    .map((part) =>
+      part
+        .split("_")
+        .filter(Boolean)
+        .map((piece) => `${piece[0]!.toUpperCase()}${piece.slice(1)}`)
+        .join("")
+    )
+    .join("::")}Controller`;
+  return { filePath, className, methodName: action };
 }
 
 function railsConstantForPath(filePath: string): string | undefined {
@@ -506,8 +538,9 @@ export class RubyLanguageAdapter implements LanguageAdapter {
 
     if (filePath.endsWith("config/routes.rb")) {
       for (const route of parsed.routes) {
+        const routeUid = buildUid("route", filePath, `${route.verb} ${route.path}`);
         addEntity({
-          uid: buildUid("route", filePath, `${route.verb} ${route.path}`),
+          uid: routeUid,
           kind: "route",
           name: route.path,
           path: filePath,
@@ -520,6 +553,17 @@ export class RubyLanguageAdapter implements LanguageAdapter {
           createdAt: now,
           updatedAt: now
         });
+        const target = route.controllerAction ? controllerActionTarget(route.controllerAction) : undefined;
+        if (target) {
+          relations.push({
+            from: routeUid,
+            to: buildUid("method", target.filePath, `${target.className}.${target.methodName}`),
+            kind: "routes_to",
+            reason: route.controllerAction,
+            confidence: 0.78,
+            provenance: prov(0.78, parsed.source, "rails route controller action")
+          });
+        }
       }
     }
 

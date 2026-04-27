@@ -103,3 +103,11 @@ Status: done
 - Infer conventional Rails constants from `app/models`, `app/controllers`, `app/services`, `app/jobs`, and `app/mailers` paths.
 - Map constant references such as `User` and `UsersController` to likely Rails files via Zeitwerk naming conventions.
 - Add low-confidence `uses` relations for constant-to-file dependencies with provenance metadata.
+
+## 14. Map Rails routes to controller actions
+
+Status: done
+
+- Extract `to: "controller#action"` route targets and basic `resources :name` routes.
+- Create `routes_to` relations from route entities to conventional controller action method UIDs.
+- Add coverage for explicit HTTP routes and resource routes.
