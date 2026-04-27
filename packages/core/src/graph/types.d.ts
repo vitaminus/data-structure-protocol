@@ -109,6 +109,14 @@ export type ContextPackResponse = {
     files: string[];
     dependencies: Relation[];
     tests: Entity[];
+    code?: {
+        path: string;
+        mode: "snippets-only" | "full-files";
+        content: string;
+        startLine?: number;
+        endLine?: number;
+        truncated: boolean;
+    }[];
     riskNotes: string[];
     suggestedEditOrder: string[];
     estimatedTokens: number;

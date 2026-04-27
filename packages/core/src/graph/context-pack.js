@@ -1,6 +1,70 @@
+import fs from "node:fs";
+import path from "node:path";
 import { semanticSearch } from "../semantic/search.js";
+const STRATEGY_DEFAULTS = {
+    minimal: { maxFiles: 8, maxDepth: 1, includeTests: false },
+    balanced: { maxFiles: 20, maxDepth: 2, includeTests: true },
+    deep: { maxFiles: 40, maxDepth: 3, includeTests: true },
+    debug: { maxFiles: 30, maxDepth: 2, includeTests: true }
+};
 function estimateTokens(text) {
     return Math.ceil(text.length / 4);
+}
+function rootDirForDb(db) {
+    return path.dirname(path.dirname(db.dbPath));
+}
+function lineRangeForEntities(entities) {
+    const starts = entities.map((entity) => entity.startLine).filter((line) => Boolean(line));
+    const ends = entities.map((entity) => entity.endLine).filter((line) => Boolean(line));
+    if (starts.length === 0 || ends.length === 0) {
+        return {};
+    }
+    return {
+        startLine: Math.max(1, Math.min(...starts) - 3),
+        endLine: Math.max(...ends) + 3
+    };
+}
+function readCodePayload(db, files, entities, mode) {
+    if (mode === "none") {
+        return undefined;
+    }
+    const rootDir = rootDirForDb(db);
+    return files.flatMap((filePath) => {
+        const absPath = path.resolve(rootDir, filePath);
+        let raw;
+        try {
+            raw = fs.readFileSync(absPath, "utf8");
+        }
+        catch {
+            return [];
+        }
+        if (mode === "full-files") {
+            const maxChars = 24_000;
+            return [
+                {
+                    path: filePath,
+                    mode,
+                    content: raw.slice(0, maxChars),
+                    truncated: raw.length > maxChars
+                }
+            ];
+        }
+        const fileEntities = entities.filter((entity) => entity.path === filePath);
+        const range = lineRangeForEntities(fileEntities);
+        const lines = raw.split(/\r?\n/);
+        const startLine = range.startLine ?? 1;
+        const endLine = range.endLine ?? Math.min(lines.length, 80);
+        return [
+            {
+                path: filePath,
+                mode,
+                content: lines.slice(startLine - 1, endLine).join("\n"),
+                startLine,
+                endLine,
+                truncated: startLine > 1 || endLine < lines.length
+            }
+        ];
+    });
 }
 function relationDepthFilter(relations, seedUids, maxDepth) {
     const accepted = [];
@@ -38,9 +102,12 @@ function relationDepthFilter(relations, seedUids, maxDepth) {
     return { entities: visited, relations: accepted };
 }
 export async function buildContextPack(db, request) {
+    const strategyDefaults = STRATEGY_DEFAULTS[request.strategy ?? "balanced"];
     const maxTokens = request.maxTokens ?? 8000;
-    const maxFiles = request.maxFiles ?? 20;
-    const maxDepth = request.maxDepth ?? 2;
+    const maxFiles = request.maxFiles ?? strategyDefaults.maxFiles;
+    const maxDepth = request.maxDepth ?? strategyDefaults.maxDepth;
+    const includeTests = request.includeTests ?? strategyDefaults.includeTests;
+    const includeCode = request.includeCode ?? "none";
     const searchResults = await semanticSearch(db, request.task, {
         topK: Math.max(25, maxFiles * 2),
         embeddingsEnabled: false
@@ -51,7 +118,8 @@ export async function buildContextPack(db, request) {
     }
     const rankedEntities = searchResults
         .map((result) => entitiesByUid.get(result.uid))
-        .filter((entity) => Boolean(entity));
+        .filter((entity) => Boolean(entity))
+        .filter((entity) => includeTests || entity.kind !== "test");
     const selectedEntities = rankedEntities.slice(0, maxFiles * 3);
     const selectedUids = new Set(selectedEntities.map((entity) => entity.uid));
     const allRelations = db.getRelations(500000);
@@ -63,13 +131,17 @@ export async function buildContextPack(db, request) {
     const contextEntityUids = new Set(contextEntities.map((entity) => entity.uid));
     for (const uid of graphSlice.entities) {
         const entity = entitiesByUid.get(uid);
+        if (!includeTests && entity?.kind === "test") {
+            continue;
+        }
         if (entity && !contextEntityUids.has(uid)) {
             contextEntityUids.add(uid);
             contextEntities.push(entity);
         }
     }
     const files = [...new Set(contextEntities.map((entity) => entity.path).filter(Boolean))].slice(0, maxFiles);
-    const tests = contextEntities.filter((entity) => entity.kind === "test").slice(0, 20);
+    const tests = includeTests ? contextEntities.filter((entity) => entity.kind === "test").slice(0, 20) : [];
+    const code = readCodePayload(db, files, contextEntities, includeCode);
     const riskNotes = [
         dependencies.some((rel) => rel.kind === "exports")
             ? "Public API nodes involved in context."
@@ -82,6 +154,7 @@ export async function buildContextPack(db, request) {
         files,
         dependencies,
         tests,
+        ...(code ? { code } : {}),
         riskNotes,
         suggestedEditOrder,
         estimatedTokens: 0,

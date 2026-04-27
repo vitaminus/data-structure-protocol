@@ -102,4 +102,58 @@ describe("context pack", () => {
     expect(entityUids).toContain(storeUid);
     expect(result.files).toContain("src/store.ts");
   });
+
+  it("honors includeTests and includeCode options", async () => {
+    fs.mkdirSync(path.join(tempDir, "src"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, "src", "auth.ts"),
+      ["export function login() {", "  const token = createToken();", "  return token;", "}"].join(
+        "\n"
+      ),
+      "utf8"
+    );
+
+    const now = stableNowIso();
+    const authUid = buildUid("function", "src/auth.ts", "login");
+    db.upsertEntity({
+      uid: authUid,
+      kind: "function",
+      name: "login",
+      path: "src/auth.ts",
+      description: "Handles authentication logic",
+      startLine: 1,
+      endLine: 4,
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+    db.upsertEntity({
+      uid: buildUid("test", "src/auth.test.ts"),
+      kind: "test",
+      name: "auth.test.ts",
+      path: "src/auth.test.ts",
+      description: "authentication login regression",
+      confidence: 1,
+      provenance: [{ source: "test", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+
+    const result = await buildContextPack(db, {
+      task: "authentication login",
+      includeTests: false,
+      includeCode: "snippets-only",
+      strategy: "debug"
+    });
+
+    expect(result.tests).toEqual([]);
+    expect(result.relevantEntities.every((entity) => entity.kind !== "test")).toBe(true);
+    expect(result.code?.[0]).toMatchObject({
+      path: "src/auth.ts",
+      mode: "snippets-only",
+      truncated: false
+    });
+    expect(result.code?.[0]?.content).toContain("createToken");
+  });
 });
