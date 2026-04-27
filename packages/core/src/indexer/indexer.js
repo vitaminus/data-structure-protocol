@@ -1,5 +1,5 @@
 import path from "node:path";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { buildUid, contentHash, normalizePath, stableNowIso } from "../graph/uid.js";
 import { discoverFiles, findRepoRoot } from "../util/fs.js";
 import { changedFilesFromGit } from "../util/git.js";
@@ -117,6 +117,59 @@ function containsRelations(fileUid, entities, nowIso) {
         ]
     }));
 }
+function filePathFromFileUid(uid) {
+    if (!uid.startsWith("file:") || uid.includes("#")) {
+        return undefined;
+    }
+    return uid.slice("file:".length);
+}
+function pathCandidates(targetRelPath, fromRelPath) {
+    const normalizedTarget = normalizePath(targetRelPath);
+    const extensions = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".rb", ".rs"];
+    const candidates = [];
+    const addVariants = (candidate) => {
+        const normalized = normalizePath(path.posix.normalize(candidate));
+        candidates.push(normalized);
+        if (!path.posix.extname(normalized)) {
+            for (const ext of extensions) {
+                candidates.push(`${normalized}${ext}`);
+            }
+            for (const ext of extensions) {
+                candidates.push(`${normalized}/index${ext}`);
+            }
+            candidates.push(`${normalized}/mod.rs`);
+        }
+    };
+    addVariants(normalizedTarget);
+    if (fromRelPath && !normalizedTarget.includes("/")) {
+        addVariants(path.posix.join(path.posix.dirname(fromRelPath), normalizedTarget));
+    }
+    return [...new Set(candidates)];
+}
+function canonicalFilePath(targetRelPath, fromRelPath, availableFiles) {
+    return pathCandidates(targetRelPath, fromRelPath).find((candidate) => availableFiles.has(candidate));
+}
+function canonicalizeFileRelations(relations, availableFiles) {
+    return relations.map((relation) => {
+        const targetRelPath = filePathFromFileUid(relation.to);
+        if (!targetRelPath) {
+            return relation;
+        }
+        const fromRelPath = filePathFromFileUid(relation.from);
+        const resolvedPath = canonicalFilePath(targetRelPath, fromRelPath, availableFiles);
+        if (!resolvedPath || resolvedPath === targetRelPath) {
+            return relation;
+        }
+        return {
+            ...relation,
+            to: buildUid("file", resolvedPath),
+            metadata: {
+                ...(relation.metadata ?? {}),
+                resolvedPath
+            }
+        };
+    });
+}
 export async function indexRepository(db, adapters, request, config) {
     const scanRoot = path.resolve(request.rootDir);
     const repoRoot = findRepoRoot(scanRoot);
@@ -134,6 +187,7 @@ export async function indexRepository(db, adapters, request, config) {
             excludes: config.performance.exclude,
             maxFileSizeKb: config.performance.maxFileSizeKb
         });
+        const availableRelPaths = new Set(discovered.map((absPath) => normalizePath(path.relative(scanRoot, absPath))));
         const requestedFiles = request.files?.map((file) => path.resolve(scanRoot, file));
         const changedFromGit = request.fromGitDiff || request.changedOnly
             ? changedFilesFromGit(repoRoot).filter((file) => {
@@ -143,6 +197,13 @@ export async function indexRepository(db, adapters, request, config) {
                 return file.startsWith(`${scanRoot}${path.sep}`);
             })
             : undefined;
+        if (changedFromGit) {
+            for (const deletedPath of changedFromGit.filter((file) => !existsSync(file))) {
+                const relPath = normalizePath(path.relative(scanRoot, deletedPath));
+                db.clearAstDataForPath(relPath);
+                db.removeFileHash(relPath);
+            }
+        }
         let selectedFiles = discovered.filter((absPath) => {
             if (requestedFiles && requestedFiles.length > 0) {
                 return requestedFiles.includes(absPath);
@@ -191,7 +252,7 @@ export async function indexRepository(db, adapters, request, config) {
             db.clearAstDataForPath(relPath);
             const parsed = await adapter.parseFile(relPath, content);
             const extractedEntities = adapter.extractEntities(parsed);
-            const extractedRelations = adapter.extractRelations(parsed, extractedEntities);
+            const extractedRelations = canonicalizeFileRelations(adapter.extractRelations(parsed, extractedEntities), availableRelPaths);
             const unresolved = parsed.unresolvedReferences ?? [];
             const nowIso = stableNowIso();
             const fileNode = fileEntity(relPath, adapter.language, nowIso);

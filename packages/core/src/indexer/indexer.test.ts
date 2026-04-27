@@ -89,4 +89,56 @@ describe("indexer", () => {
     expect(summary.filesIndexed).toBe(0);
     expect(summary.filesSkipped).toBe(0);
   });
+
+  it("removes stale graph data for deleted git-diff files", async () => {
+    execSync("git init", { cwd: tempDir, stdio: "ignore" });
+    execSync("git config user.email test@example.com", { cwd: tempDir, stdio: "ignore" });
+    execSync("git config user.name Test", { cwd: tempDir, stdio: "ignore" });
+    execSync("git add src/a.ts", { cwd: tempDir, stdio: "ignore" });
+    execSync("git commit -m initial", { cwd: tempDir, stdio: "ignore" });
+
+    const adapter = new MockAdapter();
+    await indexRepository(db, [adapter], { rootDir: tempDir, full: true }, DEFAULT_CONFIG);
+    expect(db.getEntity(buildUid("file", "src/a.ts"))).toBeDefined();
+    expect(db.getFileHash("src/a.ts")).toBeDefined();
+
+    fs.rmSync(path.join(tempDir, "src", "a.ts"));
+    const summary = await indexRepository(
+      db,
+      [adapter],
+      { rootDir: tempDir, changedOnly: true },
+      DEFAULT_CONFIG
+    );
+
+    expect(summary.filesIndexed).toBe(0);
+    expect(db.getEntity(buildUid("file", "src/a.ts"))).toBeUndefined();
+    expect(db.getFileHash("src/a.ts")).toBeUndefined();
+  });
+
+  it("canonicalizes extensionless file import relations to discovered files", async () => {
+    fs.writeFileSync(path.join(tempDir, "src", "b.ts"), "export const b = 1;\n", "utf8");
+    class ImportAdapter extends MockAdapter {
+      override async parseFile(filePath: string): Promise<ParseResult> {
+        const parsed = await super.parseFile(filePath);
+        if (filePath === "src/a.ts") {
+          parsed.relations.push({
+            from: buildUid("file", "src/a.ts"),
+            to: buildUid("file", "src/b"),
+            kind: "imports",
+            confidence: 0.9,
+            provenance: [{ source: "ast", timestamp: stableNowIso(), confidence: 0.9 }]
+          });
+        }
+        return parsed;
+      }
+    }
+
+    await indexRepository(db, [new ImportAdapter()], { rootDir: tempDir, full: true }, DEFAULT_CONFIG);
+
+    expect(
+      db
+        .getRelationsFrom(buildUid("file", "src/a.ts"))
+        .some((relation) => relation.kind === "imports" && relation.to === buildUid("file", "src/b.ts"))
+    ).toBe(true);
+  });
 });

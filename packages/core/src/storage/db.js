@@ -275,6 +275,9 @@ export class DSPDatabase {
             .get(filePath);
         return row?.content_hash;
     }
+    removeFileHash(filePath) {
+        this.db.prepare("DELETE FROM file_hashes WHERE path = ?").run(filePath);
+    }
     clearUnresolvedForPath(filePath) {
         this.db.prepare("DELETE FROM unresolved_references WHERE path = ?").run(filePath);
     }

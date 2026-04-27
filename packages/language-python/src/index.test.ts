@@ -25,4 +25,18 @@ def login():
     expect(entities.some((entity) => entity.kind === "function")).toBe(true);
     expect(relations.some((relation) => relation.kind === "imports")).toBe(true);
   });
+
+  it("preserves relative import levels from Python AST", async () => {
+    const adapter = new PythonLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "app/auth.py",
+      `
+from .crypto import hash_password
+`
+    );
+    const relations = adapter.extractRelations(parsed, parsed.entities);
+    expect(
+      relations.some((relation) => relation.kind === "imports" && relation.to === "file:app/crypto.py")
+    ).toBe(true);
+  });
 });

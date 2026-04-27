@@ -1,5 +1,5 @@
 import path from "node:path";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import type {
   Entity,
   FileIndexRequest,
@@ -136,6 +136,69 @@ function containsRelations(fileUid: string, entities: Entity[], nowIso: string):
     }));
 }
 
+function filePathFromFileUid(uid: string): string | undefined {
+  if (!uid.startsWith("file:") || uid.includes("#")) {
+    return undefined;
+  }
+  return uid.slice("file:".length);
+}
+
+function pathCandidates(targetRelPath: string, fromRelPath?: string): string[] {
+  const normalizedTarget = normalizePath(targetRelPath);
+  const extensions = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".rb", ".rs"];
+  const candidates: string[] = [];
+  const addVariants = (candidate: string) => {
+    const normalized = normalizePath(path.posix.normalize(candidate));
+    candidates.push(normalized);
+    if (!path.posix.extname(normalized)) {
+      for (const ext of extensions) {
+        candidates.push(`${normalized}${ext}`);
+      }
+      for (const ext of extensions) {
+        candidates.push(`${normalized}/index${ext}`);
+      }
+      candidates.push(`${normalized}/mod.rs`);
+    }
+  };
+
+  addVariants(normalizedTarget);
+  if (fromRelPath && !normalizedTarget.includes("/")) {
+    addVariants(path.posix.join(path.posix.dirname(fromRelPath), normalizedTarget));
+  }
+
+  return [...new Set(candidates)];
+}
+
+function canonicalFilePath(
+  targetRelPath: string,
+  fromRelPath: string | undefined,
+  availableFiles: Set<string>
+): string | undefined {
+  return pathCandidates(targetRelPath, fromRelPath).find((candidate) => availableFiles.has(candidate));
+}
+
+function canonicalizeFileRelations(relations: Relation[], availableFiles: Set<string>): Relation[] {
+  return relations.map((relation) => {
+    const targetRelPath = filePathFromFileUid(relation.to);
+    if (!targetRelPath) {
+      return relation;
+    }
+    const fromRelPath = filePathFromFileUid(relation.from);
+    const resolvedPath = canonicalFilePath(targetRelPath, fromRelPath, availableFiles);
+    if (!resolvedPath || resolvedPath === targetRelPath) {
+      return relation;
+    }
+    return {
+      ...relation,
+      to: buildUid("file", resolvedPath),
+      metadata: {
+        ...(relation.metadata ?? {}),
+        resolvedPath
+      }
+    };
+  });
+}
+
 export async function indexRepository(
   db: DSPDatabase,
   adapters: LanguageAdapter[],
@@ -159,6 +222,9 @@ export async function indexRepository(
       excludes: config.performance.exclude,
       maxFileSizeKb: config.performance.maxFileSizeKb
     });
+    const availableRelPaths = new Set(
+      discovered.map((absPath) => normalizePath(path.relative(scanRoot, absPath)))
+    );
     const requestedFiles = request.files?.map((file) => path.resolve(scanRoot, file));
     const changedFromGit =
       request.fromGitDiff || request.changedOnly
@@ -169,6 +235,14 @@ export async function indexRepository(
             return file.startsWith(`${scanRoot}${path.sep}`);
           })
         : undefined;
+
+    if (changedFromGit) {
+      for (const deletedPath of changedFromGit.filter((file) => !existsSync(file))) {
+        const relPath = normalizePath(path.relative(scanRoot, deletedPath));
+        db.clearAstDataForPath(relPath);
+        db.removeFileHash(relPath);
+      }
+    }
 
     let selectedFiles = discovered.filter((absPath) => {
       if (requestedFiles && requestedFiles.length > 0) {
@@ -223,7 +297,10 @@ export async function indexRepository(
       db.clearAstDataForPath(relPath);
       const parsed = await adapter.parseFile(relPath, content);
       const extractedEntities = adapter.extractEntities(parsed);
-      const extractedRelations = adapter.extractRelations(parsed, extractedEntities);
+      const extractedRelations = canonicalizeFileRelations(
+        adapter.extractRelations(parsed, extractedEntities),
+        availableRelPaths
+      );
       const unresolved = parsed.unresolvedReferences ?? [];
       const nowIso = stableNowIso();
 

@@ -23,6 +23,7 @@ export declare class DSPDatabase {
     upsertRelation(relation: Relation): void;
     markFileHash(filePath: string, hash: string, indexedAt: string): void;
     getFileHash(filePath: string): string | undefined;
+    removeFileHash(filePath: string): void;
     clearUnresolvedForPath(filePath: string): void;
     upsertUnresolvedReference(ref: UnresolvedReference, createdAt: string): void;
     getUnresolvedReferences(): UnresolvedReference[];

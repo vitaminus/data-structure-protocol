@@ -39,3 +39,11 @@ Status: done
 - Tokenize camelCase, snake_case, paths, and punctuation more consistently.
 - Boost exact name/path matches over substring matches.
 - Add lightweight graph-neighbor signal to lexical scoring.
+
+## 6. Reduce stale/dangling graph edges in incremental indexing
+
+Status: done
+
+- Remove graph entities, relations, unresolved references, and file hashes for files deleted in a git diff.
+- Canonicalize extensionless/internal file import relations to discovered files before storage.
+- Preserve Python relative import levels so `from .module import x` resolves to the local module path.
