@@ -2,7 +2,7 @@ import path from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { buildUid, contentHash, normalizePath, stableNowIso } from "../graph/uid.js";
 import { discoverFiles, findRepoRoot } from "../util/fs.js";
-import { changedFilesFromGit } from "../util/git.js";
+import { changedFileEntriesFromGit, changedFilesFromGit } from "../util/git.js";
 function languageFromFile(filePath) {
     const ext = path.extname(filePath).toLowerCase();
     if ([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"].includes(ext)) {
@@ -189,20 +189,28 @@ export async function indexRepository(db, adapters, request, config) {
         });
         const availableRelPaths = new Set(discovered.map((absPath) => normalizePath(path.relative(scanRoot, absPath))));
         const requestedFiles = request.files?.map((file) => path.resolve(scanRoot, file));
-        const changedFromGit = request.fromGitDiff || request.changedOnly
-            ? changedFilesFromGit(repoRoot).filter((file) => {
-                if (file === scanRoot) {
-                    return true;
-                }
-                return file.startsWith(`${scanRoot}${path.sep}`);
+        const changedEntries = request.fromGitDiff || request.changedOnly
+            ? changedFileEntriesFromGit(repoRoot).filter((entry) => {
+                const paths = [entry.path, entry.oldPath].filter(Boolean);
+                return paths.some((file) => file === scanRoot || file.startsWith(`${scanRoot}${path.sep}`));
             })
             : undefined;
-        if (changedFromGit) {
+        const changedFromGit = changedEntries?.map((entry) => entry.path);
+        if (changedEntries) {
             db.transaction(() => {
-                for (const deletedPath of changedFromGit.filter((file) => !existsSync(file))) {
-                    const relPath = normalizePath(path.relative(scanRoot, deletedPath));
-                    db.clearAstDataForPath(relPath);
-                    db.removeFileHash(relPath);
+                for (const entry of changedEntries) {
+                    const stalePaths = [
+                        ...(entry.oldPath && entry.oldPath !== entry.path ? [entry.oldPath] : []),
+                        ...(!existsSync(entry.path) || entry.status.startsWith("D") ? [entry.path] : [])
+                    ];
+                    for (const stalePath of stalePaths) {
+                        if (stalePath === scanRoot || !stalePath.startsWith(`${scanRoot}${path.sep}`)) {
+                            continue;
+                        }
+                        const relPath = normalizePath(path.relative(scanRoot, stalePath));
+                        db.clearAstDataForPath(relPath);
+                        db.removeFileHash(relPath);
+                    }
                 }
             });
         }

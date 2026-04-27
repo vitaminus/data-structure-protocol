@@ -115,6 +115,30 @@ describe("indexer", () => {
     expect(db.getFileHash("src/a.ts")).toBeUndefined();
   });
 
+  it("removes old graph data when git reports a rename", async () => {
+    execSync("git init", { cwd: tempDir, stdio: "ignore" });
+    execSync("git config user.email test@example.com", { cwd: tempDir, stdio: "ignore" });
+    execSync("git config user.name Test", { cwd: tempDir, stdio: "ignore" });
+    execSync("git add src/a.ts", { cwd: tempDir, stdio: "ignore" });
+    execSync("git commit -m initial", { cwd: tempDir, stdio: "ignore" });
+
+    const adapter = new MockAdapter();
+    await indexRepository(db, [adapter], { rootDir: tempDir, full: true }, DEFAULT_CONFIG);
+    execSync("git mv src/a.ts src/renamed.ts", { cwd: tempDir, stdio: "ignore" });
+
+    const summary = await indexRepository(
+      db,
+      [adapter],
+      { rootDir: tempDir, changedOnly: true },
+      DEFAULT_CONFIG
+    );
+
+    expect(summary.filesIndexed).toBe(1);
+    expect(db.getEntity(buildUid("file", "src/a.ts"))).toBeUndefined();
+    expect(db.getFileHash("src/a.ts")).toBeUndefined();
+    expect(db.getEntity(buildUid("file", "src/renamed.ts"))).toBeDefined();
+  });
+
   it("canonicalizes extensionless file import relations to discovered files", async () => {
     fs.writeFileSync(path.join(tempDir, "src", "b.ts"), "export const b = 1;\n", "utf8");
     class ImportAdapter extends MockAdapter {

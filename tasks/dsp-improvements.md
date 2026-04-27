@@ -71,3 +71,11 @@ Status: done
 - Resolve `mod name;` declarations to sibling `name.rs` or `name/mod.rs` files when present.
 - Resolve `crate::`, `self::`, `super::`, and sibling `use` paths to existing module files before falling back.
 - Add coverage for `pub mod user`, `use user::User`, and `use crate::user::User` resolving to `src/user.rs`.
+
+## 10. Clean up orphaned graph data for renamed files
+
+Status: done
+
+- Parse `git diff --name-status` entries so renames preserve both old and new paths.
+- Clear graph data and file hashes for old rename paths before indexing the new file path.
+- Add coverage for `git mv` leaving no stale old-path entity behind.

@@ -10,7 +10,7 @@ import type {
 } from "../graph/types.js";
 import { buildUid, contentHash, normalizePath, stableNowIso } from "../graph/uid.js";
 import { discoverFiles, findRepoRoot } from "../util/fs.js";
-import { changedFilesFromGit } from "../util/git.js";
+import { changedFileEntriesFromGit, changedFilesFromGit } from "../util/git.js";
 import type { DSPDatabase } from "../storage/db.js";
 import type { DSPConfig } from "../config/types.js";
 
@@ -226,22 +226,30 @@ export async function indexRepository(
       discovered.map((absPath) => normalizePath(path.relative(scanRoot, absPath)))
     );
     const requestedFiles = request.files?.map((file) => path.resolve(scanRoot, file));
-    const changedFromGit =
+    const changedEntries =
       request.fromGitDiff || request.changedOnly
-        ? changedFilesFromGit(repoRoot).filter((file) => {
-            if (file === scanRoot) {
-              return true;
-            }
-            return file.startsWith(`${scanRoot}${path.sep}`);
+        ? changedFileEntriesFromGit(repoRoot).filter((entry) => {
+            const paths = [entry.path, entry.oldPath].filter(Boolean) as string[];
+            return paths.some((file) => file === scanRoot || file.startsWith(`${scanRoot}${path.sep}`));
           })
         : undefined;
+    const changedFromGit = changedEntries?.map((entry) => entry.path);
 
-    if (changedFromGit) {
+    if (changedEntries) {
       db.transaction(() => {
-        for (const deletedPath of changedFromGit.filter((file) => !existsSync(file))) {
-          const relPath = normalizePath(path.relative(scanRoot, deletedPath));
-          db.clearAstDataForPath(relPath);
-          db.removeFileHash(relPath);
+        for (const entry of changedEntries) {
+          const stalePaths = [
+            ...(entry.oldPath && entry.oldPath !== entry.path ? [entry.oldPath] : []),
+            ...(!existsSync(entry.path) || entry.status.startsWith("D") ? [entry.path] : [])
+          ];
+          for (const stalePath of stalePaths) {
+            if (stalePath === scanRoot || !stalePath.startsWith(`${scanRoot}${path.sep}`)) {
+              continue;
+            }
+            const relPath = normalizePath(path.relative(scanRoot, stalePath));
+            db.clearAstDataForPath(relPath);
+            db.removeFileHash(relPath);
+          }
         }
       });
     }
