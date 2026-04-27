@@ -95,3 +95,11 @@ Status: done
 - Add a Ripper-backed lexer parser for Ruby classes, modules, methods, and mixins.
 - Keep the regex parser as a safe fallback when Ruby/Ripper is unavailable.
 - Add coverage for nested modules/classes, class methods, instance methods, and mixins.
+
+## 13. Resolve Rails Zeitwerk constants
+
+Status: done
+
+- Infer conventional Rails constants from `app/models`, `app/controllers`, `app/services`, `app/jobs`, and `app/mailers` paths.
+- Map constant references such as `User` and `UsersController` to likely Rails files via Zeitwerk naming conventions.
+- Add low-confidence `uses` relations for constant-to-file dependencies with provenance metadata.

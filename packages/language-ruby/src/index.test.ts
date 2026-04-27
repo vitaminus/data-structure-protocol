@@ -60,4 +60,29 @@ end
     expect(entities.some((entity) => entity.kind === "method" && entity.name === "find_active")).toBe(true);
     expect(relations.some((relation) => relation.kind === "implements" && relation.reason === "include Auditable")).toBe(true);
   });
+
+  it("maps Rails Zeitwerk constants to conventional files", async () => {
+    const adapter = new RubyLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "app/services/billing/create_invoice.rb",
+      `
+module Billing
+  class CreateInvoice
+    def call
+      User.find(1)
+      UsersController
+    end
+  end
+end
+`
+    );
+    const relations = adapter.extractRelations(parsed, parsed.entities);
+    expect(parsed.entities.find((entity) => entity.kind === "class")?.metadata?.zeitwerkConstant).toBe(
+      "Billing::CreateInvoice"
+    );
+    expect(relations.some((relation) => relation.kind === "uses" && relation.to === "file:app/models/user.rb")).toBe(true);
+    expect(
+      relations.some((relation) => relation.kind === "uses" && relation.to === "file:app/controllers/users_controller.rb")
+    ).toBe(true);
+  });
 });

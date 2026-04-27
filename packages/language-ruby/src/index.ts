@@ -28,11 +28,18 @@ type RubyRoute = {
   line: number;
 };
 
+type RubyConstantReference = {
+  name: string;
+  owner?: string;
+  line: number;
+};
+
 type RubyParsed = {
   symbols: RubySymbol[];
   requires: { spec: string; relative: boolean; line: number }[];
   mixins: RubyMixin[];
   routes: RubyRoute[];
+  constants: RubyConstantReference[];
   source: RubySource;
 };
 
@@ -74,6 +81,15 @@ function skipWhitespace(tokens: RubyToken[], index: number): number {
     current += 1;
   }
   return current;
+}
+
+function previousSignificant(tokens: RubyToken[], index: number): RubyToken | undefined {
+  for (let current = index - 1; current >= 0; current -= 1) {
+    if (!tokenIsWhitespace(tokens[current]!)) {
+      return tokens[current];
+    }
+  }
+  return undefined;
 }
 
 function readConstantPath(tokens: RubyToken[], index: number): { name?: string; next: number } {
@@ -128,6 +144,7 @@ function parseWithRipper(content: string): RubyParsed | undefined {
 
   const symbols: RubySymbol[] = [];
   const mixins: RubyMixin[] = [];
+  const constants: RubyConstantReference[] = [];
   const stack: { kind: "module" | "class" | "method" | "block"; name?: string; symbolIndex?: number }[] = [];
 
   const currentOwner = () => [...stack].reverse().find((item) => item.kind === "class" || item.kind === "module")?.name;
@@ -188,6 +205,18 @@ function parseWithRipper(content: string): RubyParsed | undefined {
       continue;
     }
 
+    if (token.type === "const") {
+      const previous = previousSignificant(tokens, i);
+      if (!previous || !(previous.type === "kw" && ["class", "module"].includes(previous.value))) {
+        const read = readConstantPath(tokens, i);
+        if (read.name) {
+          constants.push({ name: read.name, owner: currentOwner(), line: token.line });
+          i = read.next;
+          continue;
+        }
+      }
+    }
+
     if (token.type === "kw" && token.value === "end") {
       const closed = stack.pop();
       if (closed?.symbolIndex !== undefined) {
@@ -196,11 +225,13 @@ function parseWithRipper(content: string): RubyParsed | undefined {
     }
   }
 
+  const declared = new Set(symbols.filter((symbol) => symbol.kind !== "method").map((symbol) => symbol.name));
   return {
     symbols,
     mixins,
     requires: parseRequires(content),
     routes: parseRoutes(content),
+    constants: constants.filter((constant) => !declared.has(constant.name)),
     source: "ast"
   };
 }
@@ -293,17 +324,66 @@ function parseWithRegex(content: string): RubyParsed {
     }
   }
 
+  const declared = new Set(symbols.filter((symbol) => symbol.kind !== "method").map((symbol) => symbol.name));
+  const constants = [...content.matchAll(/\b([A-Z][A-Za-z0-9_]*(?:::[A-Z][A-Za-z0-9_]*)*)\b/g)]
+    .map((match) => ({ name: match[1]!, line: content.slice(0, match.index).split("\n").length }))
+    .filter((constant) => !declared.has(constant.name));
+
   return {
     symbols,
     mixins,
     requires: parseRequires(content),
     routes: parseRoutes(content),
+    constants,
     source: "regex"
   };
 }
 
 function isRailsPath(filePath: string): boolean {
   return filePath.includes("/app/") || filePath.startsWith("app/") || filePath.endsWith("config/routes.rb");
+}
+
+function underscore(input: string): string {
+  return input
+    .replace(/::/g, "/")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
+    .replace(/([a-z\d])([A-Z])/g, "$1_$2")
+    .replace(/-/g, "_")
+    .toLowerCase();
+}
+
+function railsPathForConstant(constant: string): string | undefined {
+  if (!constant || ["String", "Integer", "Array", "Hash", "Time", "Date", "JSON", "Object", "Class", "Module"].includes(constant)) {
+    return undefined;
+  }
+  const underscored = underscore(constant);
+  if (constant.endsWith("Controller")) {
+    return `app/controllers/${underscored}.rb`;
+  }
+  if (constant.endsWith("Job")) {
+    return `app/jobs/${underscored}.rb`;
+  }
+  if (constant.endsWith("Mailer")) {
+    return `app/mailers/${underscored}.rb`;
+  }
+  return `app/models/${underscored}.rb`;
+}
+
+function railsConstantForPath(filePath: string): string | undefined {
+  const match = filePath.match(/(?:^|\/)app\/(models|controllers|services|jobs|mailers)\/(.+)\.rb$/);
+  if (!match) {
+    return undefined;
+  }
+  return match[2]!
+    .split("/")
+    .map((part) =>
+      part
+        .split("_")
+        .filter(Boolean)
+        .map((piece) => `${piece[0]!.toUpperCase()}${piece.slice(1)}`)
+        .join("")
+    )
+    .join("::");
 }
 
 export class RubyLanguageAdapter implements LanguageAdapter {
@@ -345,7 +425,7 @@ export class RubyLanguageAdapter implements LanguageAdapter {
           endLine: symbol.endLine,
           confidence,
           provenance: prov(confidence, parsed.source, "module declaration"),
-          metadata: { rails: isRailsPath(filePath) },
+          metadata: { rails: isRailsPath(filePath), zeitwerkConstant: railsConstantForPath(filePath) },
           createdAt: now,
           updatedAt: now
         });
@@ -362,7 +442,8 @@ export class RubyLanguageAdapter implements LanguageAdapter {
           provenance: prov(confidence, parsed.source, "class declaration"),
           metadata: {
             railsModel: filePath.includes("/app/models/") || filePath.startsWith("app/models/"),
-            railsController: filePath.includes("/app/controllers/") || filePath.startsWith("app/controllers/")
+            railsController: filePath.includes("/app/controllers/") || filePath.startsWith("app/controllers/"),
+            zeitwerkConstant: railsConstantForPath(filePath)
           },
           createdAt: now,
           updatedAt: now
@@ -395,6 +476,21 @@ export class RubyLanguageAdapter implements LanguageAdapter {
         confidence: parsed.source === "ast" ? 0.78 : 0.7,
         provenance: prov(parsed.source === "ast" ? 0.78 : 0.7, parsed.source, `${mixin.kind} mixin`)
       });
+    }
+
+    for (const constant of parsed.constants) {
+      const targetPath = railsPathForConstant(constant.name);
+      if (targetPath && targetPath !== filePath) {
+        relations.push({
+          from: fileUid,
+          to: buildUid("file", targetPath),
+          kind: "uses",
+          reason: `constant ${constant.name}`,
+          confidence: 0.58,
+          provenance: prov(0.58, parsed.source, "rails zeitwerk constant heuristic"),
+          metadata: { constant: constant.name, owner: constant.owner, line: constant.line }
+        });
+      }
     }
 
     for (const req of parsed.requires) {
