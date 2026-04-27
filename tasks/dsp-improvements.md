@@ -47,3 +47,11 @@ Status: done
 - Remove graph entities, relations, unresolved references, and file hashes for files deleted in a git diff.
 - Canonicalize extensionless/internal file import relations to discovered files before storage.
 - Preserve Python relative import levels so `from .module import x` resolves to the local module path.
+
+## 7. Make file indexing writes atomic
+
+Status: done
+
+- Add a database transaction helper for grouped graph mutations.
+- Wrap deleted-file cleanup and per-file index writes in SQLite transactions.
+- Add rollback coverage so a failed relation write cannot leave partially refreshed file graph data.

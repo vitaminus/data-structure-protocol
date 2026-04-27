@@ -122,6 +122,9 @@ export class DSPDatabase {
     close() {
         this.db.close();
     }
+    transaction(fn) {
+        return this.db.transaction(fn)();
+    }
     beginRun(mode, startedAt) {
         const stmt = this.db.prepare("INSERT INTO index_runs(started_at, mode, status, metadata_json) VALUES (?, ?, 'running', ?)");
         const res = stmt.run(startedAt, mode, "{}");

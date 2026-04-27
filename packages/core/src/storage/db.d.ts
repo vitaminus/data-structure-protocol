@@ -10,6 +10,7 @@ export declare class DSPDatabase {
     constructor(rootDir: string);
     initialize(): void;
     close(): void;
+    transaction<T>(fn: () => T): T;
     beginRun(mode: string, startedAt: string): number;
     finishRun(runId: number, status: "ok" | "failed", endedAt: string, meta: unknown): void;
     private rowToEntity;

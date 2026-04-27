@@ -198,11 +198,13 @@ export async function indexRepository(db, adapters, request, config) {
             })
             : undefined;
         if (changedFromGit) {
-            for (const deletedPath of changedFromGit.filter((file) => !existsSync(file))) {
-                const relPath = normalizePath(path.relative(scanRoot, deletedPath));
-                db.clearAstDataForPath(relPath);
-                db.removeFileHash(relPath);
-            }
+            db.transaction(() => {
+                for (const deletedPath of changedFromGit.filter((file) => !existsSync(file))) {
+                    const relPath = normalizePath(path.relative(scanRoot, deletedPath));
+                    db.clearAstDataForPath(relPath);
+                    db.removeFileHash(relPath);
+                }
+            });
         }
         let selectedFiles = discovered.filter((absPath) => {
             if (requestedFiles && requestedFiles.length > 0) {
@@ -249,7 +251,6 @@ export async function indexRepository(db, adapters, request, config) {
                 filesSkipped += 1;
                 continue;
             }
-            db.clearAstDataForPath(relPath);
             const parsed = await adapter.parseFile(relPath, content);
             const extractedEntities = adapter.extractEntities(parsed);
             const extractedRelations = canonicalizeFileRelations(adapter.extractRelations(parsed, extractedEntities), availableRelPaths);
@@ -282,19 +283,24 @@ export async function indexRepository(db, adapters, request, config) {
                     ]
                     : [])
             ];
-            for (const entity of allEntities) {
-                db.upsertEntity(entity);
-            }
+            db.transaction(() => {
+                db.clearAstDataForPath(relPath);
+                for (const entity of allEntities) {
+                    db.upsertEntity(entity);
+                }
+                for (const relation of allRelations) {
+                    db.upsertRelation(relation);
+                }
+                for (const ref of unresolved) {
+                    db.upsertUnresolvedReference(ref, nowIso);
+                }
+                db.markFileHash(relPath, hash, nowIso);
+            });
             for (const relation of allRelations) {
-                db.upsertRelation(relation);
                 if (relation.confidence < 0.4) {
                     lowConfidenceCount += 1;
                 }
             }
-            for (const ref of unresolved) {
-                db.upsertUnresolvedReference(ref, nowIso);
-            }
-            db.markFileHash(relPath, hash, nowIso);
             filesIndexed += 1;
             entityCount += allEntities.length;
             relationCount += allRelations.length;

@@ -141,4 +141,33 @@ describe("indexer", () => {
         .some((relation) => relation.kind === "imports" && relation.to === buildUid("file", "src/b.ts"))
     ).toBe(true);
   });
+
+  it("rolls back per-file graph writes when indexing a file fails", async () => {
+    const adapter = new MockAdapter();
+    await indexRepository(db, [adapter], { rootDir: tempDir, full: true }, DEFAULT_CONFIG);
+    const oldHash = db.getFileHash("src/a.ts");
+
+    fs.writeFileSync(path.join(tempDir, "src", "a.ts"), "export const a = 2;\n", "utf8");
+    class BadRelationAdapter extends MockAdapter {
+      override async parseFile(filePath: string): Promise<ParseResult> {
+        const parsed = await super.parseFile(filePath);
+        parsed.relations.push({
+          from: undefined,
+          to: buildUid("function", filePath, "demo"),
+          kind: "calls",
+          confidence: 1,
+          provenance: [{ source: "ast", timestamp: stableNowIso(), confidence: 1 }]
+        } as any);
+        return parsed;
+      }
+    }
+
+    await expect(
+      indexRepository(db, [new BadRelationAdapter()], { rootDir: tempDir, full: true }, DEFAULT_CONFIG)
+    ).rejects.toThrow();
+
+    expect(db.getEntity(buildUid("file", "src/a.ts"))).toBeDefined();
+    expect(db.getEntity(buildUid("function", "src/a.ts", "demo"))).toBeDefined();
+    expect(db.getFileHash("src/a.ts")).toBe(oldHash);
+  });
 });
