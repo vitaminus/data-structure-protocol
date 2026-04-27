@@ -174,7 +174,7 @@ export async function indexRepository(
       if (requestedFiles && requestedFiles.length > 0) {
         return requestedFiles.includes(absPath);
       }
-      if (changedFromGit && changedFromGit.length > 0) {
+      if (changedFromGit) {
         return changedFromGit.includes(absPath);
       }
       return true;

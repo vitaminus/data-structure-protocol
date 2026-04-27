@@ -118,7 +118,8 @@ function containsRelations(fileUid, entities, nowIso) {
     }));
 }
 export async function indexRepository(db, adapters, request, config) {
-    const root = findRepoRoot(request.rootDir);
+    const scanRoot = path.resolve(request.rootDir);
+    const repoRoot = findRepoRoot(scanRoot);
     const now = stableNowIso();
     const runId = db.beginRun(request.fromGitDiff ? "update-git-diff" : "index", now);
     let filesIndexed = 0;
@@ -129,23 +130,30 @@ export async function indexRepository(db, adapters, request, config) {
     let unresolvedCount = 0;
     let lowConfidenceCount = 0;
     try {
-        const discovered = discoverFiles(root, {
+        const discovered = discoverFiles(scanRoot, {
             excludes: config.performance.exclude,
             maxFileSizeKb: config.performance.maxFileSizeKb
         });
-        const requestedFiles = request.files?.map((file) => path.resolve(root, file));
-        const changedFromGit = request.fromGitDiff || request.changedOnly ? changedFilesFromGit(root) : undefined;
+        const requestedFiles = request.files?.map((file) => path.resolve(scanRoot, file));
+        const changedFromGit = request.fromGitDiff || request.changedOnly
+            ? changedFilesFromGit(repoRoot).filter((file) => {
+                if (file === scanRoot) {
+                    return true;
+                }
+                return file.startsWith(`${scanRoot}${path.sep}`);
+            })
+            : undefined;
         let selectedFiles = discovered.filter((absPath) => {
             if (requestedFiles && requestedFiles.length > 0) {
                 return requestedFiles.includes(absPath);
             }
-            if (changedFromGit && changedFromGit.length > 0) {
+            if (changedFromGit) {
                 return changedFromGit.includes(absPath);
             }
             return true;
         });
         if (changedFromGit && changedFromGit.length > 0) {
-            const changedUids = changedFromGit.map((absPath) => buildUid("file", normalizePath(path.relative(root, absPath))));
+            const changedUids = changedFromGit.map((absPath) => buildUid("file", normalizePath(path.relative(scanRoot, absPath))));
             const neighborRelPaths = new Set();
             for (const uid of changedUids) {
                 for (const incoming of db.getRelationsTo(uid)) {
@@ -156,12 +164,12 @@ export async function indexRepository(db, adapters, request, config) {
                 }
             }
             for (const relPath of neighborRelPaths) {
-                selectedFiles.push(path.resolve(root, relPath));
+                selectedFiles.push(path.resolve(scanRoot, relPath));
             }
             selectedFiles = [...new Set(selectedFiles)];
         }
         for (const absPath of selectedFiles) {
-            const relPath = normalizePath(path.relative(root, absPath));
+            const relPath = normalizePath(path.relative(scanRoot, absPath));
             const language = languageFromFile(relPath);
             if (!language) {
                 filesSkipped += 1;
@@ -289,10 +297,17 @@ export async function bootstrapRepository(db, adapters, rootDir, config, options
     };
 }
 export function changedFiles(db, rootDir) {
-    const gitChanged = changedFilesFromGit(rootDir);
+    const scanRoot = path.resolve(rootDir);
+    const repoRoot = findRepoRoot(scanRoot);
+    const gitChanged = changedFilesFromGit(repoRoot).filter((file) => {
+        if (file === scanRoot) {
+            return true;
+        }
+        return file.startsWith(`${scanRoot}${path.sep}`);
+    });
     const indexed = new Set(db.listFilesInHashTable());
     return gitChanged
-        .map((file) => normalizePath(path.relative(rootDir, file)))
+        .map((file) => normalizePath(path.relative(scanRoot, file)))
         .filter((rel) => indexed.has(rel));
 }
 //# sourceMappingURL=indexer.js.map

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { LanguageAdapter, ParseResult } from "../graph/types.js";
 import { DEFAULT_CONFIG } from "../config/types.js";
@@ -67,5 +68,25 @@ describe("indexer", () => {
     expect(first.filesIndexed).toBeGreaterThan(0);
     expect(second.filesIndexed).toBe(0);
     expect(second.filesSkipped).toBeGreaterThan(0);
+  });
+
+  it("does not fall back to a full scan when changedOnly has an empty git diff", async () => {
+    execSync("git init", { cwd: tempDir, stdio: "ignore" });
+    execSync("git config user.email test@example.com", { cwd: tempDir, stdio: "ignore" });
+    execSync("git config user.name Test", { cwd: tempDir, stdio: "ignore" });
+    execSync("git add src/a.ts", { cwd: tempDir, stdio: "ignore" });
+    execSync("git commit -m initial", { cwd: tempDir, stdio: "ignore" });
+
+    const adapter = new MockAdapter();
+    const summary = await indexRepository(
+      db,
+      [adapter],
+      { rootDir: tempDir, changedOnly: true },
+      DEFAULT_CONFIG
+    );
+
+    expect(summary.filesScanned).toBe(0);
+    expect(summary.filesIndexed).toBe(0);
+    expect(summary.filesSkipped).toBe(0);
   });
 });
