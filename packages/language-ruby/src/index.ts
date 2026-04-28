@@ -34,12 +34,21 @@ type RubyConstantReference = {
   line: number;
 };
 
+type ActiveRecordMacro = {
+  kind: "association" | "validation" | "scope" | "callback" | "enum";
+  macro: string;
+  name: string;
+  owner: string;
+  line: number;
+};
+
 type RubyParsed = {
   symbols: RubySymbol[];
   requires: { spec: string; relative: boolean; line: number }[];
   mixins: RubyMixin[];
   routes: RubyRoute[];
   constants: RubyConstantReference[];
+  activeRecordMacros: ActiveRecordMacro[];
   source: RubySource;
 };
 
@@ -232,6 +241,7 @@ function parseWithRipper(content: string): RubyParsed | undefined {
     requires: parseRequires(content),
     routes: parseRoutes(content),
     constants: constants.filter((constant) => !declared.has(constant.name)),
+    activeRecordMacros: parseActiveRecordMacros(content),
     source: "ast"
   };
 }
@@ -242,6 +252,45 @@ function parseRequires(content: string): RubyParsed["requires"] {
     const match = line.match(/^require(_relative)?\s+["']([^"']+)["']/);
     return match ? [{ spec: match[2]!, relative: Boolean(match[1]), line: index + 1 }] : [];
   });
+}
+
+function parseActiveRecordMacros(content: string): ActiveRecordMacro[] {
+  const macros: ActiveRecordMacro[] = [];
+  const classStack: string[] = [];
+  for (const [index, raw] of content.split("\n").entries()) {
+    const line = raw.trim();
+    const classMatch = line.match(/^class\s+([A-Za-z_][A-Za-z0-9_:]*)/);
+    if (classMatch) {
+      classStack.push(classMatch[1]!);
+    }
+    const owner = classStack.at(-1);
+    if (owner) {
+      const association = line.match(/^(belongs_to|has_many|has_one)\s+:([A-Za-z_][A-Za-z0-9_]*)/);
+      if (association) {
+        macros.push({ kind: "association", macro: association[1]!, name: association[2]!, owner, line: index + 1 });
+      }
+      const validation = line.match(/^(validates|validate)\s+:?([A-Za-z_][A-Za-z0-9_]*)/);
+      if (validation) {
+        macros.push({ kind: "validation", macro: validation[1]!, name: validation[2]!, owner, line: index + 1 });
+      }
+      const scope = line.match(/^scope\s+:([A-Za-z_][A-Za-z0-9_]*)/);
+      if (scope) {
+        macros.push({ kind: "scope", macro: "scope", name: scope[1]!, owner, line: index + 1 });
+      }
+      const callback = line.match(/^((?:before|after|around)_(?:validation|save|create|update|destroy|commit|rollback))\s+:([A-Za-z_][A-Za-z0-9_]*)/);
+      if (callback) {
+        macros.push({ kind: "callback", macro: callback[1]!, name: callback[2]!, owner, line: index + 1 });
+      }
+      const enumMatch = line.match(/^enum\s+:?([A-Za-z_][A-Za-z0-9_]*)/);
+      if (enumMatch) {
+        macros.push({ kind: "enum", macro: "enum", name: enumMatch[1]!, owner, line: index + 1 });
+      }
+    }
+    if (line === "end" && classStack.length > 0) {
+      classStack.pop();
+    }
+  }
+  return macros;
 }
 
 function parseRoutes(content: string): RubyRoute[] {
@@ -348,6 +397,7 @@ function parseWithRegex(content: string): RubyParsed {
     requires: parseRequires(content),
     routes: parseRoutes(content),
     constants,
+    activeRecordMacros: parseActiveRecordMacros(content),
     source: "regex"
   };
 }
@@ -363,6 +413,17 @@ function underscore(input: string): string {
     .replace(/([a-z\d])([A-Z])/g, "$1_$2")
     .replace(/-/g, "_")
     .toLowerCase();
+}
+
+function singularize(input: string): string {
+  if (input.endsWith("ies")) {
+    return `${input.slice(0, -3)}y`;
+  }
+  return input.endsWith("s") ? input.slice(0, -1) : input;
+}
+
+function railsModelPathForName(name: string): string {
+  return `app/models/${singularize(name)}.rb`;
 }
 
 function railsPathForConstant(constant: string): string | undefined {
@@ -521,6 +582,58 @@ export class RubyLanguageAdapter implements LanguageAdapter {
           confidence: 0.58,
           provenance: prov(0.58, parsed.source, "rails zeitwerk constant heuristic"),
           metadata: { constant: constant.name, owner: constant.owner, line: constant.line }
+        });
+      }
+    }
+
+    for (const macro of parsed.activeRecordMacros) {
+      const macroUid = buildUid("constant", filePath, `${macro.owner}.${macro.kind}.${macro.name}`);
+      addEntity({
+        uid: macroUid,
+        kind: "constant",
+        name: macro.name,
+        path: filePath,
+        language: "ruby",
+        startLine: macro.line,
+        endLine: macro.line,
+        confidence: 0.76,
+        provenance: prov(0.76, "regex", `active_record ${macro.macro}`),
+        metadata: { railsKind: macro.kind, macro: macro.macro, owner: macro.owner },
+        createdAt: now,
+        updatedAt: now
+      });
+      relations.push({
+        from: buildUid("class", filePath, macro.owner),
+        to: macroUid,
+        kind: "contains",
+        confidence: 0.88,
+        provenance: prov(0.88, "regex", `class contains ${macro.kind}`)
+      });
+      if (macro.kind === "association") {
+        relations.push({
+          from: buildUid("class", filePath, macro.owner),
+          to: buildUid("file", railsModelPathForName(macro.name)),
+          kind: "depends_on",
+          reason: `${macro.macro} :${macro.name}`,
+          confidence: 0.72,
+          provenance: prov(0.72, "regex", "active_record association")
+        });
+      }
+      if (macro.kind === "scope") {
+        const scopeUid = buildUid("method", filePath, `${macro.owner}.${macro.name}`);
+        addEntity({
+          uid: scopeUid,
+          kind: "method",
+          name: macro.name,
+          path: filePath,
+          language: "ruby",
+          startLine: macro.line,
+          endLine: macro.line,
+          confidence: 0.78,
+          provenance: prov(0.78, "regex", "active_record scope"),
+          metadata: { railsKind: "scope", owner: macro.owner, classMethod: true, public: true },
+          createdAt: now,
+          updatedAt: now
         });
       }
     }

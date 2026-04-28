@@ -86,6 +86,29 @@ end
     ).toBe(true);
   });
 
+  it("indexes ActiveRecord associations, validations, scopes, callbacks and enums", async () => {
+    const adapter = new RubyLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "app/models/order.rb",
+      `
+class Order < ApplicationRecord
+  belongs_to :user
+  has_many :line_items
+  validates :total_cents, presence: true
+  scope :paid, -> { where(paid: true) }
+  before_save :normalize_total
+  enum :status, { pending: 0, paid: 1 }
+end
+`
+    );
+    const entities = adapter.extractEntities(parsed);
+    const relations = adapter.extractRelations(parsed, entities);
+    expect(entities.some((entity) => entity.kind === "constant" && entity.metadata?.railsKind === "association")).toBe(true);
+    expect(entities.some((entity) => entity.kind === "method" && entity.metadata?.railsKind === "scope")).toBe(true);
+    expect(relations.some((relation) => relation.kind === "depends_on" && relation.to === "file:app/models/user.rb")).toBe(true);
+    expect(relations.some((relation) => relation.kind === "depends_on" && relation.to === "file:app/models/line_item.rb")).toBe(true);
+  });
+
   it("maps Rails routes to controller action methods", async () => {
     const adapter = new RubyLanguageAdapter();
     const parsed = await adapter.parseFile(

@@ -151,3 +151,11 @@ Status: done
 - Detect `#[derive(...)]` attributes before structs and enums.
 - Add external Rust trait interface entities for derived traits.
 - Add `implements` relations from derived types to those trait entities without creating dangling graph edges.
+
+## 20. Index ActiveRecord domain macros
+
+Status: done
+
+- Extract Rails model associations, validations, scopes, callbacks, and enums.
+- Add domain macro entities and class containment relations.
+- Add `depends_on` relations from model classes to associated model files.
