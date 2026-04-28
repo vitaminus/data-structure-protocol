@@ -1,6 +1,6 @@
 import path from "node:path";
 import { createHash } from "node:crypto";
-import type { EntityKind } from "./types.ts";
+import type { EntityKind, EntityUid, FileUid } from "./types.ts";
 
 export function normalizePath(inputPath: string): string {
   return inputPath
@@ -16,6 +16,22 @@ export function buildUid(kind: EntityKind, filePath: string, symbol?: string): s
     return `${kind}:${normalized}`;
   }
   return `${kind}:${normalized}#${symbol}`;
+}
+
+export function asEntityUid<K extends EntityKind = EntityKind>(uid: string): EntityUid<K> {
+  return uid as EntityUid<K>;
+}
+
+export function buildEntityUid<K extends EntityKind>(
+  kind: K,
+  filePath: string,
+  symbol?: string
+): EntityUid<K> {
+  return asEntityUid<K>(buildUid(kind, filePath, symbol));
+}
+
+export function buildFileUid(filePath: string): FileUid {
+  return buildEntityUid("file", filePath);
 }
 
 export function contentHash(content: string): string {

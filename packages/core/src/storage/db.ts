@@ -12,6 +12,8 @@ import type {
 import { mergeProvenance, topSourcePriority } from "../graph/provenance.ts";
 import { ensureDir } from "../util/fs.ts";
 
+const SCHEMA_VERSION = 2;
+
 function toJson(value: unknown): string {
   return JSON.stringify(value ?? null);
 }
@@ -52,10 +54,34 @@ function writeProtocolDescription(target: string, entity: Entity, protocolUid: s
   fs.writeFileSync(target, `${lines.join("\n")}\n`, "utf8");
 }
 
+function searchableText(value: string | undefined): string {
+  return (value ?? "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[^a-zA-Z0-9]+/g, " ")
+    .toLowerCase();
+}
+
 export type GraphSnapshot = {
   entities: Entity[];
   relations: Relation[];
   unresolvedReferences: UnresolvedReference[];
+};
+
+export type EmbeddingStats = {
+  total: number;
+  byProvider: Record<string, number>;
+};
+
+export type StoredEmbedding = {
+  uid: string;
+  hash: string;
+  vector: number[];
+  provider: string;
+};
+
+export type EntitySearchCandidates = {
+  uids: string[];
+  candidatesScanned: number;
 };
 
 export class DSPDatabase {
@@ -73,6 +99,11 @@ export class DSPDatabase {
 
   initialize(): void {
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS schema_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS entities (
         uid TEXT PRIMARY KEY,
         kind TEXT NOT NULL,
@@ -162,6 +193,9 @@ export class DSPDatabase {
         created_at TEXT NOT NULL
       );
 
+      CREATE VIRTUAL TABLE IF NOT EXISTS entity_fts
+      USING fts5(uid UNINDEXED, name, path, description, docstring, tags);
+
       CREATE INDEX IF NOT EXISTS idx_entities_path ON entities(path);
       CREATE INDEX IF NOT EXISTS idx_entities_kind_path ON entities(kind, path);
       CREATE INDEX IF NOT EXISTS idx_relations_from_uid ON relations(from_uid);
@@ -169,6 +203,36 @@ export class DSPDatabase {
       CREATE INDEX IF NOT EXISTS idx_relations_kind ON relations(kind);
       CREATE INDEX IF NOT EXISTS idx_unresolved_references_path ON unresolved_references(path);
     `);
+    this.migrate();
+  }
+
+  private schemaVersion(): number {
+    const row = this.db
+      .prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'")
+      .get() as { value: string } | undefined;
+    return row ? Number(row.value) : 0;
+  }
+
+  private setSchemaVersion(version: number): void {
+    this.db
+      .prepare(
+        `
+        INSERT INTO schema_meta(key, value)
+        VALUES ('schema_version', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        `
+      )
+      .run(String(version));
+  }
+
+  private migrate(): void {
+    const current = this.schemaVersion();
+    if (current < 2) {
+      this.rebuildEntityFts();
+    }
+    if (current < SCHEMA_VERSION) {
+      this.setSchemaVersion(SCHEMA_VERSION);
+    }
   }
 
   close(): void {
@@ -248,9 +312,95 @@ export class DSPDatabase {
     return rows.map((row) => this.rowToEntity(row));
   }
 
+  entityCount(): number {
+    return (this.db.prepare("SELECT COUNT(*) AS count FROM entities").get() as { count: number }).count;
+  }
+
+  getEntitiesByUid(uids: string[]): Entity[] {
+    if (uids.length === 0) {
+      return [];
+    }
+    const placeholders = uids.map(() => "?").join(", ");
+    const rows = this.db.prepare(`SELECT * FROM entities WHERE uid IN (${placeholders})`).all(...uids) as Record<
+      string,
+      unknown
+    >[];
+    const byUid = new Map(rows.map((row) => [String(row.uid), this.rowToEntity(row)]));
+    return uids.map((uid) => byUid.get(uid)).filter((entity): entity is Entity => Boolean(entity));
+  }
+
+  searchEntityUids(query: string, limit = 500): string[] {
+    return this.searchEntityCandidates(query, limit).uids;
+  }
+
+  searchEntityCandidates(query: string, limit = 500): EntitySearchCandidates {
+    const tokens = searchableText(query)
+      .split(/\s+/)
+      .filter(Boolean);
+    if (tokens.length === 0) {
+      const uids = this.getEntities(limit).map((entity) => entity.uid);
+      return { uids, candidatesScanned: uids.length };
+    }
+    const match = tokens.map((token) => `"${token.replaceAll('"', '""')}"`).join(" OR ");
+    const rows = this.db
+      .prepare(
+        `
+        SELECT uid
+        FROM entity_fts
+        WHERE entity_fts MATCH ?
+        ORDER BY bm25(entity_fts)
+        LIMIT ?
+        `
+      )
+      .all(match, limit) as { uid: string }[];
+    return {
+      uids: rows.map((row) => row.uid),
+      candidatesScanned: rows.length
+    };
+  }
+
   getRelations(limit = 50000): Relation[] {
     const rows = this.db
       .prepare("SELECT * FROM relations ORDER BY from_uid, to_uid, kind LIMIT ?")
+      .all(limit) as Record<string, unknown>[];
+    return rows.map((row) => this.rowToRelation(row));
+  }
+
+  getFileEntities(limit = 300000): Entity[] {
+    const rows = this.db
+      .prepare("SELECT * FROM entities WHERE kind = 'file' ORDER BY uid LIMIT ?")
+      .all(limit) as Record<string, unknown>[];
+    return rows.map((row) => this.rowToEntity(row));
+  }
+
+  getDanglingRelations(limit = 600000): Relation[] {
+    const rows = this.db
+      .prepare(
+        `
+        SELECT relations.*
+        FROM relations
+        LEFT JOIN entities from_entities ON from_entities.uid = relations.from_uid
+        LEFT JOIN entities to_entities ON to_entities.uid = relations.to_uid
+        WHERE from_entities.uid IS NULL OR to_entities.uid IS NULL
+        ORDER BY relations.from_uid, relations.to_uid, relations.kind
+        LIMIT ?
+        `
+      )
+      .all(limit) as Record<string, unknown>[];
+    return rows.map((row) => this.rowToRelation(row));
+  }
+
+  getLowConfidenceCriticalRelations(limit = 600000): Relation[] {
+    const rows = this.db
+      .prepare(
+        `
+        SELECT *
+        FROM relations
+        WHERE kind IN ('imports', 'depends_on', 'calls') AND confidence < 0.35
+        ORDER BY from_uid, to_uid, kind
+        LIMIT ?
+        `
+      )
       .all(limit) as Record<string, unknown>[];
     return rows.map((row) => this.rowToRelation(row));
   }
@@ -267,6 +417,35 @@ export class DSPDatabase {
       .prepare("SELECT * FROM relations WHERE to_uid = ? ORDER BY from_uid")
       .all(uid) as Record<string, unknown>[];
     return rows.map((row) => this.rowToRelation(row));
+  }
+
+  getRelationsTouching(uids: string[], limit: number | null = 5000): Relation[] {
+    if (uids.length === 0) {
+      return [];
+    }
+    const rows: Record<string, unknown>[] = [];
+    const uniqueUids = [...new Set(uids)];
+    const chunkSize = 400;
+    for (let index = 0; index < uniqueUids.length; index += chunkSize) {
+      if (limit !== null && rows.length >= limit) {
+        break;
+      }
+      const chunk = uniqueUids.slice(index, index + chunkSize);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const remainingLimit = limit === null ? null : limit - rows.length;
+      const sql = `
+        SELECT *
+        FROM relations
+        WHERE from_uid IN (${placeholders}) OR to_uid IN (${placeholders})
+        ORDER BY from_uid, to_uid, kind
+        ${remainingLimit === null ? "" : "LIMIT ?"}
+        `;
+      const params = remainingLimit === null ? [...chunk, ...chunk] : [...chunk, ...chunk, remainingLimit];
+      rows.push(...(this.db.prepare(sql).all(...params) as Record<string, unknown>[]));
+    }
+    return rows
+      .map((row) => this.rowToRelation(row))
+      .sort((a, b) => `${a.from}\0${a.to}\0${a.kind}`.localeCompare(`${b.from}\0${b.to}\0${b.kind}`));
   }
 
   deleteRelation(fromUid: string, toUid: string, kind?: RelationKind): number {
@@ -286,6 +465,7 @@ export class DSPDatabase {
     const result = this.db.transaction(() => {
       this.db.prepare("DELETE FROM relations WHERE from_uid = ? OR to_uid = ?").run(uid, uid);
       this.db.prepare("DELETE FROM embeddings WHERE uid = ?").run(uid);
+      this.db.prepare("DELETE FROM entity_fts WHERE uid = ?").run(uid);
       return this.db.prepare("DELETE FROM entities WHERE uid = ?").run(uid).changes;
     })();
     return result > 0;
@@ -353,6 +533,33 @@ export class DSPDatabase {
         mergedEntity.createdAt,
         mergedEntity.updatedAt
       );
+    this.upsertEntityFts(mergedEntity);
+  }
+
+  private upsertEntityFts(entity: Entity): void {
+    this.db.prepare("DELETE FROM entity_fts WHERE uid = ?").run(entity.uid);
+    this.db
+      .prepare(
+        `
+        INSERT INTO entity_fts(uid, name, path, description, docstring, tags)
+        VALUES (?, ?, ?, ?, ?, ?)
+        `
+      )
+      .run(
+        entity.uid,
+        [entity.name, searchableText(entity.name), entity.signature ?? ""].join(" "),
+        [entity.path ?? "", searchableText(entity.path)].join(" "),
+        [entity.description ?? "", searchableText(entity.description)].join(" "),
+        [entity.docstring ?? "", searchableText(entity.docstring)].join(" "),
+        [...(entity.tags ?? []), searchableText((entity.tags ?? []).join(" "))].join(" ")
+      );
+  }
+
+  rebuildEntityFts(): void {
+    this.db.prepare("DELETE FROM entity_fts").run();
+    for (const entity of this.getEntities(500000)) {
+      this.upsertEntityFts(entity);
+    }
   }
 
   upsertRelation(relation: Relation): void {
@@ -480,6 +687,7 @@ export class DSPDatabase {
       ...uids,
       ...uids
     );
+    this.db.prepare(`DELETE FROM entity_fts WHERE uid IN (${placeholders})`).run(...uids);
     this.db.prepare(`DELETE FROM entities WHERE uid IN (${placeholders})`).run(...uids);
     this.clearUnresolvedForPath(filePath);
   }
@@ -652,6 +860,31 @@ export class DSPDatabase {
     return { hash: row.content_hash, vector: fromJson<number[]>(row.vector_json), provider: row.provider };
   }
 
+  getEmbeddingsByProvider(provider: string, limit = 200000): StoredEmbedding[] {
+    const rows = this.db
+      .prepare(
+        `
+        SELECT uid, content_hash, vector_json, provider
+        FROM embeddings
+        WHERE provider = ?
+        ORDER BY uid
+        LIMIT ?
+        `
+      )
+      .all(provider, limit) as {
+      uid: string;
+      content_hash: string;
+      vector_json: string;
+      provider: string;
+    }[];
+    return rows.map((row) => ({
+      uid: row.uid,
+      hash: row.content_hash,
+      vector: fromJson<number[]>(row.vector_json),
+      provider: row.provider
+    }));
+  }
+
   cacheStats(): {
     fileHashes: number;
     embeddings: number;
@@ -667,6 +900,23 @@ export class DSPDatabase {
       }
     ).count;
     return { fileHashes, embeddings, unresolvedReferences };
+  }
+
+  embeddingStats(): EmbeddingStats {
+    const rows = this.db
+      .prepare(
+        `
+        SELECT provider, COUNT(*) AS count
+        FROM embeddings
+        GROUP BY provider
+        ORDER BY provider
+        `
+      )
+      .all() as { provider: string; count: number }[];
+    return {
+      total: rows.reduce((sum, row) => sum + row.count, 0),
+      byProvider: Object.fromEntries(rows.map((row) => [row.provider, row.count]))
+    };
   }
 
   clearCache(): void {

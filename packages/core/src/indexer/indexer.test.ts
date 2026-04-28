@@ -2,7 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execSync } from "node:child_process";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { LanguageAdapter, ParseResult } from "../graph/types.ts";
 import { DEFAULT_CONFIG } from "../config/types.ts";
 import { DSPDatabase } from "../storage/db.ts";
@@ -151,6 +152,121 @@ describe("indexer", () => {
     expect(first.filesIndexed).toBeGreaterThan(0);
     expect(second.filesIndexed).toBe(0);
     expect(second.filesSkipped).toBeGreaterThan(0);
+  });
+
+  it("produces the same graph snapshot with serial and parallel parsing", async () => {
+    const makeFixture = () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "dsp-indexer-parallel-snapshot-"));
+      fs.mkdirSync(path.join(root, "src"), { recursive: true });
+      fs.writeFileSync(path.join(root, "src", "a.ts"), "export const a = 1;\n", "utf8");
+      fs.writeFileSync(path.join(root, "src", "b.ts"), "export const b = 1;\n", "utf8");
+      fs.writeFileSync(path.join(root, "src", "c.ts"), "export const c = 1;\n", "utf8");
+      return root;
+    };
+    const indexFixture = async (parallelism: number) => {
+      const root = makeFixture();
+      const fixtureDb = new DSPDatabase(root);
+      try {
+        await indexRepository(
+          fixtureDb,
+          [new MockAdapter()],
+          { rootDir: root, full: true },
+          {
+            ...DEFAULT_CONFIG,
+            performance: { ...DEFAULT_CONFIG.performance, parallelism }
+          }
+        );
+        return fixtureDb.getSnapshot();
+      } finally {
+        fixtureDb.close();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    };
+
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2024-01-01T00:00:00.000Z"));
+    try {
+      const serial = await indexFixture(1);
+      const parallel = await indexFixture(4);
+
+      expect(JSON.stringify(parallel)).toBe(JSON.stringify(serial));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("limits parse concurrency with performance.parallelism", async () => {
+    for (const name of ["b", "c", "d", "e", "f"]) {
+      fs.writeFileSync(path.join(tempDir, "src", `${name}.ts`), `export const ${name} = 1;\n`, "utf8");
+    }
+    class SlowAdapter extends MockAdapter {
+      inFlight = 0;
+      maxInFlight = 0;
+
+      override async parseFile(filePath: string): Promise<ParseResult> {
+        this.inFlight += 1;
+        this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        this.inFlight -= 1;
+        return super.parseFile(filePath);
+      }
+    }
+    const adapter = new SlowAdapter();
+
+    await indexRepository(
+      db,
+      [adapter],
+      { rootDir: tempDir, full: true },
+      {
+        ...DEFAULT_CONFIG,
+        performance: { ...DEFAULT_CONFIG.performance, parallelism: 4 }
+      }
+    );
+
+    expect(adapter.maxInFlight).toBeGreaterThan(1);
+    expect(adapter.maxInFlight).toBeLessThanOrEqual(4);
+  });
+
+  it("marks the index run failed when a parallel parse fails without refreshing existing file data", async () => {
+    fs.writeFileSync(path.join(tempDir, "src", "b.ts"), "export const b = 1;\n", "utf8");
+    await indexRepository(db, [new MockAdapter()], { rootDir: tempDir, full: true }, DEFAULT_CONFIG);
+    const oldHashA = db.getFileHash("src/a.ts");
+    const oldHashB = db.getFileHash("src/b.ts");
+
+    fs.writeFileSync(path.join(tempDir, "src", "a.ts"), "export const a = 2;\n", "utf8");
+    fs.writeFileSync(path.join(tempDir, "src", "b.ts"), "export const b = 2;\n", "utf8");
+    class FailingAdapter extends MockAdapter {
+      override async parseFile(filePath: string): Promise<ParseResult> {
+        if (filePath === "src/b.ts") {
+          throw new Error("boom");
+        }
+        return super.parseFile(filePath);
+      }
+    }
+
+    await expect(
+      indexRepository(
+        db,
+        [new FailingAdapter()],
+        { rootDir: tempDir, full: true },
+        {
+          ...DEFAULT_CONFIG,
+          performance: { ...DEFAULT_CONFIG.performance, parallelism: 4 }
+        }
+      )
+    ).rejects.toThrow("boom");
+
+    const sqlite = new Database(db.dbPath, { readonly: true });
+    const latestRun = sqlite
+      .prepare("SELECT status FROM index_runs ORDER BY id DESC LIMIT 1")
+      .get() as { status: string };
+    sqlite.close();
+
+    expect(latestRun.status).toBe("failed");
+    expect(db.getFileHash("src/a.ts")).toBe(oldHashA);
+    expect(db.getFileHash("src/b.ts")).toBe(oldHashB);
+    expect(db.getEntity(buildUid("function", "src/a.ts", "demo"))).toBeDefined();
+    expect(db.getEntity(buildUid("function", "src/b.ts", "demo"))).toBeDefined();
   });
 
   it("does not fall back to a full scan when changedOnly has an empty git diff", async () => {

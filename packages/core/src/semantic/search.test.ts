@@ -5,6 +5,35 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DSPDatabase } from "../storage/db.ts";
 import { buildUid, stableNowIso } from "../graph/uid.ts";
 import { semanticSearch } from "./search.ts";
+import type { EmbeddingProvider } from "../graph/types.ts";
+
+class CountingProvider implements EmbeddingProvider {
+  calls = 0;
+  constructor(private readonly key: string) {}
+
+  cacheKey(): string {
+    return this.key;
+  }
+
+  async embed(text: string): Promise<number[]> {
+    this.calls += 1;
+    return [text.length, this.key.length];
+  }
+}
+
+class SynonymProvider implements EmbeddingProvider {
+  cacheKey(): string {
+    return "synonym-test";
+  }
+
+  async embed(text: string): Promise<number[]> {
+    const normalized = text.toLowerCase();
+    if (normalized.includes("signin") || normalized.includes("login")) {
+      return [1, 0];
+    }
+    return [0, 1];
+  }
+}
 
 describe("semantic search", () => {
   let tempDir: string;
@@ -86,5 +115,69 @@ describe("semantic search", () => {
 
     expect(results.map((result) => result.uid)).toContain(login);
     expect(results.find((result) => result.uid === login)?.explanation).toContain("neighbors=");
+  });
+
+  it("invalidates cached embeddings when the provider cache key changes", async () => {
+    const now = stableNowIso();
+    const uid = buildUid("function", "src/auth.ts", "login");
+    db.upsertEntity({
+      uid,
+      kind: "function",
+      name: "login",
+      path: "src/auth.ts",
+      description: "auth token validation",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+
+    const first = new CountingProvider("mock:v1");
+    await semanticSearch(db, "auth token", { embeddingsEnabled: true, provider: first });
+    expect(db.getEmbedding(uid)?.provider).toBe("mock:v1");
+
+    const second = new CountingProvider("mock:v2");
+    await semanticSearch(db, "auth token", { embeddingsEnabled: true, provider: second });
+
+    expect(second.calls).toBeGreaterThan(1);
+    expect(db.getEmbedding(uid)?.provider).toBe("mock:v2");
+  });
+
+  it("finds embedding-only matches when lexical FTS has no candidates", async () => {
+    const now = stableNowIso();
+    const loginUid = buildUid("function", "src/auth.ts", "login");
+    const billingUid = buildUid("function", "src/billing.ts", "chargeCard");
+    db.upsertEntity({
+      uid: loginUid,
+      kind: "function",
+      name: "login",
+      path: "src/auth.ts",
+      description: "password session entrypoint",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+    db.upsertEntity({
+      uid: billingUid,
+      kind: "function",
+      name: "chargeCard",
+      path: "src/billing.ts",
+      description: "payment capture",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+
+    expect(db.searchEntityUids("signin", 10)).toEqual([]);
+
+    const results = await semanticSearch(db, "signin", {
+      topK: 2,
+      embeddingsEnabled: true,
+      provider: new SynonymProvider()
+    });
+
+    expect(results[0]?.uid).toBe(loginUid);
   });
 });

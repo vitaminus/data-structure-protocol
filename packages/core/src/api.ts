@@ -6,24 +6,28 @@ import type {
   FileIndexRequest,
   ImpactResult,
   IndexSummary,
+  EmbeddingProvider,
   LanguageAdapter,
   SearchResult,
   ValidationResult
 } from "./graph/types.ts";
 import { DSPDatabase } from "./storage/db.ts";
 import { loadConfig, writeDefaultConfig } from "./config/config.ts";
+import type { DSPConfig } from "./config/types.ts";
 import { buildContextPack } from "./graph/context-pack.ts";
 import { indexRepository, bootstrapRepository, changedFiles } from "./indexer/indexer.ts";
 import { semanticSearch } from "./semantic/search.ts";
 import { analyzeImpact } from "./impact/impact.ts";
 import { validateGraph } from "./validate/validate.ts";
 import { insertSourceMarkers } from "./markers/markers.ts";
-import { MockEmbeddingProvider } from "./semantic/providers.ts";
+import { createEmbeddingProvider, MockEmbeddingProvider } from "./semantic/providers.ts";
 import { contentHash } from "./graph/uid.ts";
 
 export type DSPServices = {
   rootDir: string;
   db: DSPDatabase;
+  config: DSPConfig;
+  embeddingProvider?: EmbeddingProvider;
   adapters: LanguageAdapter[];
 };
 
@@ -47,9 +51,12 @@ export function initDSP(rootDir: string): { rootDir: string; dbPath: string; cre
 
 export function openDSP(rootDir: string, adapters: LanguageAdapter[]): DSPServices {
   const resolved = path.resolve(rootDir);
+  const config = loadConfig(resolved);
   return {
     rootDir: resolved,
     db: new DSPDatabase(resolved),
+    config,
+    embeddingProvider: createEmbeddingProvider(config),
     adapters
   };
 }
@@ -58,8 +65,7 @@ export async function runIndex(
   services: DSPServices,
   request: FileIndexRequest
 ): Promise<IndexSummary> {
-  const config = loadConfig(services.rootDir);
-  return indexRepository(services.db, services.adapters, request, config);
+  return indexRepository(services.db, services.adapters, request, services.config);
 }
 
 export async function runBootstrap(
@@ -71,8 +77,7 @@ export async function runBootstrap(
     largeRepo?: boolean;
   }
 ): Promise<IndexSummary> {
-  const config = loadConfig(services.rootDir);
-  return bootstrapRepository(services.db, services.adapters, services.rootDir, config, options);
+  return bootstrapRepository(services.db, services.adapters, services.rootDir, services.config, options);
 }
 
 export function runChanged(services: DSPServices): string[] {
@@ -84,9 +89,11 @@ export async function runSearch(
   query: string,
   opts: { topK?: number; embeddingsEnabled?: boolean } = {}
 ): Promise<SearchResult[]> {
+  const embeddingsEnabled = opts.embeddingsEnabled ?? false;
   return semanticSearch(services.db, query, {
     topK: opts.topK,
-    embeddingsEnabled: opts.embeddingsEnabled ?? false
+    embeddingsEnabled,
+    provider: embeddingsEnabled ? services.embeddingProvider : undefined
   });
 }
 
@@ -102,7 +109,7 @@ export async function runContextPack(
   services: DSPServices,
   request: ContextPackRequest
 ): Promise<ContextPackResponse> {
-  return buildContextPack(services.db, request);
+  return buildContextPack(services, request);
 }
 
 export function runExport(
@@ -146,7 +153,8 @@ export async function runEmbeddingsUpdate(
   services: DSPServices,
   options: { changedOnly?: boolean } = {}
 ): Promise<{ updated: number; skipped: number; provider: string }> {
-  const provider = new MockEmbeddingProvider();
+  const provider = services.embeddingProvider ?? new MockEmbeddingProvider();
+  const providerKey = provider.cacheKey?.() ?? provider.constructor.name;
   const entities = services.db.getEntities(200000);
   let updated = 0;
   let skipped = 0;
@@ -160,13 +168,13 @@ export async function runEmbeddingsUpdate(
     ].join("\n");
     const hash = contentHash(semanticText);
     const existing = services.db.getEmbedding(entity.uid);
-    if (options.changedOnly && existing?.hash === hash) {
+    if (options.changedOnly && existing?.hash === hash && existing.provider === providerKey) {
       skipped += 1;
       continue;
     }
     const vector = await provider.embed(semanticText);
-    services.db.setEmbedding(entity.uid, hash, vector, "mock", now);
+    services.db.setEmbedding(entity.uid, hash, vector, providerKey, now);
     updated += 1;
   }
-  return { updated, skipped, provider: "mock" };
+  return { updated, skipped, provider: providerKey };
 }

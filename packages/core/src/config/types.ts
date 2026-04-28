@@ -12,6 +12,9 @@ export type DSPConfig = {
   embeddings: {
     enabled: boolean;
     provider: "mock" | "openai-compatible";
+    baseUrl?: string;
+    apiKeyEnv?: string;
+    model?: string;
   };
 };
 
@@ -35,6 +38,7 @@ export const DEFAULT_CONFIG: DSPConfig = {
   },
   embeddings: {
     enabled: false,
-    provider: "mock"
+    provider: "mock",
+    apiKeyEnv: "DSP_EMBEDDINGS_API_KEY"
   }
 };

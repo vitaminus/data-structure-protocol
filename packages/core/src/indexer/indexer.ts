@@ -270,6 +270,123 @@ function canonicalizeFileRelations(relations: Relation[], availableFiles: Set<st
   });
 }
 
+type ParseOneResult =
+  | {
+      kind: "unsupported";
+      relPath: string;
+    }
+  | {
+      kind: "skipped";
+      relPath: string;
+      language: string;
+    }
+  | {
+      kind: "parsed";
+      relPath: string;
+      language: string;
+      hash: string;
+      nowIso: string;
+      entities: Entity[];
+      relations: Relation[];
+      unresolved: UnresolvedReference[];
+    };
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const workerCount = Math.max(1, Math.min(items.length, Math.floor(concurrency) || 1));
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
+
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        results[currentIndex] = await mapper(items[currentIndex]!, currentIndex);
+      }
+    })
+  );
+
+  return results;
+}
+
+async function parseOne(
+  absPath: string,
+  scanRoot: string,
+  db: DSPDatabase,
+  adapters: LanguageAdapter[],
+  availableRelPaths: Set<string>,
+  full: boolean
+): Promise<ParseOneResult> {
+  const relPath = normalizePath(path.relative(scanRoot, absPath));
+  const language = languageFromFile(relPath);
+  if (!language) {
+    return { kind: "unsupported", relPath };
+  }
+  const adapter = adapters.find((candidate) => candidate.canHandle(relPath));
+  if (!adapter) {
+    return { kind: "unsupported", relPath };
+  }
+
+  const content = readFileSync(absPath, "utf8");
+  const hash = contentHash(content);
+  const oldHash = db.getFileHash(relPath);
+  if (!full && oldHash === hash) {
+    return { kind: "skipped", relPath, language: adapter.language };
+  }
+
+  const parsed = await adapter.parseFile(relPath, content);
+  const parsedEntities = adapter.extractEntities(parsed);
+  const parsedRelations = adapter.extractRelations(parsed, parsedEntities);
+  const extracted = applyStableMarkers(content, parsedEntities, parsedRelations);
+  const extractedEntities = extracted.entities;
+  const extractedRelations = canonicalizeFileRelations(extracted.relations, availableRelPaths);
+  const unresolved = parsed.unresolvedReferences ?? [];
+  const nowIso = stableNowIso();
+
+  const fileNode = fileEntity(relPath, adapter.language, nowIso);
+  const testNode = testEntityForFile(relPath, nowIso);
+  const directories = dirEntitiesForFile(relPath, nowIso);
+  const allEntities = [fileNode, ...directories, ...(testNode ? [testNode] : []), ...extractedEntities];
+  const allRelations = [
+    ...containsRelations(fileNode.uid, allEntities, nowIso),
+    ...extractedRelations,
+    ...(testNode
+      ? [
+          {
+            from: testNode.uid,
+            to: fileNode.uid,
+            kind: "tests" as const,
+            confidence: 0.85,
+            provenance: [
+              {
+                source: "test" as const,
+                tool: "dsp-indexer",
+                confidence: 0.85,
+                timestamp: nowIso,
+                evidence: "test file relation"
+              }
+            ]
+          }
+        ]
+      : [])
+  ];
+
+  return {
+    kind: "parsed",
+    relPath,
+    language: adapter.language,
+    hash,
+    nowIso,
+    entities: allEntities,
+    relations: allRelations,
+    unresolved
+  };
+}
+
 export async function indexRepository(
   db: DSPDatabase,
   adapters: LanguageAdapter[],
@@ -354,90 +471,54 @@ export async function indexRepository(
       selectedFiles = [...new Set(selectedFiles)];
     }
 
-    for (const absPath of selectedFiles) {
-      const relPath = normalizePath(path.relative(scanRoot, absPath));
-      const language = languageFromFile(relPath);
-      if (!language) {
+    const parsedResults = await mapWithConcurrency(
+      selectedFiles,
+      config.performance.parallelism,
+      (absPath) =>
+        parseOne(
+          absPath,
+          scanRoot,
+          db,
+          adapters,
+          availableRelPaths,
+          request.full ?? false
+        )
+    );
+
+    for (const result of parsedResults) {
+      if (result.kind === "unsupported") {
         filesSkipped += 1;
         continue;
       }
-      const adapter = adapters.find((candidate) => candidate.canHandle(relPath));
-      if (!adapter) {
+      languageSet.add(result.language);
+      if (result.kind === "skipped") {
         filesSkipped += 1;
         continue;
       }
-      languageSet.add(adapter.language);
-      const content = readFileSync(absPath, "utf8");
-      const hash = contentHash(content);
-      const oldHash = db.getFileHash(relPath);
-      if (!request.full && oldHash === hash) {
-        filesSkipped += 1;
-        continue;
-      }
-
-      const parsed = await adapter.parseFile(relPath, content);
-      const extracted = applyStableMarkers(
-        content,
-        adapter.extractEntities(parsed),
-        adapter.extractRelations(parsed, adapter.extractEntities(parsed))
-      );
-      const extractedEntities = extracted.entities;
-      const extractedRelations = canonicalizeFileRelations(extracted.relations, availableRelPaths);
-      const unresolved = parsed.unresolvedReferences ?? [];
-      const nowIso = stableNowIso();
-
-      const fileNode = fileEntity(relPath, adapter.language, nowIso);
-      const testNode = testEntityForFile(relPath, nowIso);
-      const directories = dirEntitiesForFile(relPath, nowIso);
-      const allEntities = [fileNode, ...directories, ...(testNode ? [testNode] : []), ...extractedEntities];
-      const allRelations = [
-        ...containsRelations(fileNode.uid, allEntities, nowIso),
-        ...extractedRelations,
-        ...(testNode
-          ? [
-              {
-                from: testNode.uid,
-                to: fileNode.uid,
-                kind: "tests" as const,
-                confidence: 0.85,
-                provenance: [
-                  {
-                    source: "test" as const,
-                    tool: "dsp-indexer",
-                    confidence: 0.85,
-                    timestamp: nowIso,
-                    evidence: "test file relation"
-                  }
-                ]
-              }
-            ]
-          : [])
-      ];
-
       db.transaction(() => {
-        db.clearAstDataForPath(relPath);
-        for (const entity of allEntities) {
+        db.clearAstDataForPath(result.relPath);
+        for (const entity of result.entities) {
           db.upsertEntity(entity);
         }
-        for (const relation of allRelations) {
+        for (const relation of result.relations) {
           db.upsertRelation(relation);
         }
-        for (const ref of unresolved) {
-          db.upsertUnresolvedReference(ref, nowIso);
+        for (const ref of result.unresolved) {
+          db.upsertUnresolvedReference(ref, result.nowIso);
         }
-        db.markFileHash(relPath, hash, nowIso);
+        db.markFileHash(result.relPath, result.hash, result.nowIso);
       });
 
-      for (const relation of allRelations) {
+      for (const relation of result.relations) {
         if (relation.confidence < 0.4) {
           lowConfidenceCount += 1;
         }
       }
 
       filesIndexed += 1;
-      entityCount += allEntities.length;
-      relationCount += allRelations.length;
-      unresolvedCount += unresolved.length;
+      entityCount += result.entities.length;
+      relationCount += result.relations.length;
+      unresolvedCount += result.unresolved.length;
     }
 
     const allFiles = filesIndexed + filesSkipped;

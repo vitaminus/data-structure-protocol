@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r run lint
+      - run: pnpm -r run test
+      - run: pnpm -r run build
+
+  integration-smoke:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec vitest run tests/integration/contract.test.ts
+
+  coverage:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r run test
+        env:
+          NODE_V8_COVERAGE: ${{ github.workspace }}/.coverage/v8
+      - run: pnpm coverage:summary .coverage/v8
+        env:
+          DSP_COVERAGE_MIN_FUNCTIONS: "0.35"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v8-coverage
+          path: .coverage
+
+  bench-smoke:
+    runs-on: ubuntu-latest
+    needs: test
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm bench:smoke > bench-results.json
+        env:
+          DSP_BENCH_CASES: tiny
+          DSP_BENCH_PARALLELISM: "1,4"
+      - run: pnpm bench:compare bench-results.json bench/baselines/ci-smoke.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-results.json

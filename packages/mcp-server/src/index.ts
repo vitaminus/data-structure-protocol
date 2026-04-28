@@ -14,108 +14,61 @@ import {
   runSearch,
   runValidate
 } from "@dsp/core";
+import {
+  CONTEXT_PACK_INPUT_SCHEMA,
+  EMPTY_INPUT_SCHEMA,
+  IMPACT_INPUT_SCHEMA,
+  NEIGHBORS_INPUT_SCHEMA,
+  PATH_INPUT_SCHEMA,
+  SEARCH_INPUT_SCHEMA,
+  UID_INPUT_SCHEMA
+} from "./schemas.ts";
 
 export const TOOLS: Tool[] = [
   {
     name: "dsp.search",
     description: "Lexical graph search",
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: { type: "string" },
-        topK: { type: "number" }
-      },
-      required: ["query"]
-    }
+    inputSchema: SEARCH_INPUT_SCHEMA
   },
   {
     name: "dsp.semantic_search",
     description: "Semantic + lexical graph search",
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: { type: "string" },
-        topK: { type: "number" }
-      },
-      required: ["query"]
-    }
+    inputSchema: SEARCH_INPUT_SCHEMA
   },
   {
     name: "dsp.get_entity",
     description: "Get entity by uid",
-    inputSchema: {
-      type: "object",
-      properties: {
-        uid: { type: "string" }
-      },
-      required: ["uid"]
-    }
+    inputSchema: UID_INPUT_SCHEMA
   },
   {
     name: "dsp.get_neighbors",
     description: "Get entity neighbors",
-    inputSchema: {
-      type: "object",
-      properties: {
-        uid: { type: "string" },
-        depth: { type: "number" }
-      },
-      required: ["uid"]
-    }
+    inputSchema: NEIGHBORS_INPUT_SCHEMA
   },
   {
     name: "dsp.impact",
     description: "Run impact analysis",
-    inputSchema: {
-      type: "object",
-      properties: { target: { type: "string" } },
-      required: ["target"]
-    }
+    inputSchema: IMPACT_INPUT_SCHEMA
   },
   {
     name: "dsp.validate",
     description: "Validate graph and index",
-    inputSchema: {
-      type: "object",
-      properties: {}
-    }
+    inputSchema: EMPTY_INPUT_SCHEMA
   },
   {
     name: "dsp.explain_path",
     description: "Explain path in graph from one entity to another",
-    inputSchema: {
-      type: "object",
-      properties: {
-        from: { type: "string" },
-        to: { type: "string" }
-      },
-      required: ["from", "to"]
-    }
+    inputSchema: PATH_INPUT_SCHEMA
   },
   {
     name: "dsp.list_changed",
     description: "List changed files in git scope",
-    inputSchema: {
-      type: "object",
-      properties: {}
-    }
+    inputSchema: EMPTY_INPUT_SCHEMA
   },
   {
     name: "dsp.get_context_pack",
     description: "Build bounded context pack for a coding task",
-    inputSchema: {
-      type: "object",
-      properties: {
-        task: { type: "string" },
-        maxTokens: { type: "number" },
-        maxFiles: { type: "number" },
-        maxDepth: { type: "number" },
-        includeCode: { type: "string" },
-        includeTests: { type: "boolean" },
-        strategy: { type: "string" }
-      },
-      required: ["task"]
-    }
+    inputSchema: CONTEXT_PACK_INPUT_SCHEMA
   }
 ];
 

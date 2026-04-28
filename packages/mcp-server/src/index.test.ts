@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDSP } from "@dsp/core";
 import { buildUid, stableNowIso } from "@dsp/core";
-import { dispatchToolCall } from "./index.ts";
+import { dispatchToolCall, TOOLS } from "./index.ts";
 
 describe("mcp tool dispatcher", () => {
   let tempDir: string;
@@ -46,5 +46,155 @@ describe("mcp tool dispatcher", () => {
     });
     expect(contextResponse.content[0]?.text.includes("estimatedTokens")).toBe(true);
     services.db.close();
+  });
+
+  it("keeps tool schemas stable", () => {
+    expect(TOOLS.map((tool) => ({ name: tool.name, inputSchema: tool.inputSchema }))).toMatchInlineSnapshot(`
+      [
+        {
+          "inputSchema": {
+            "properties": {
+              "query": {
+                "type": "string",
+              },
+              "topK": {
+                "type": "number",
+              },
+            },
+            "required": [
+              "query",
+            ],
+            "type": "object",
+          },
+          "name": "dsp.search",
+        },
+        {
+          "inputSchema": {
+            "properties": {
+              "query": {
+                "type": "string",
+              },
+              "topK": {
+                "type": "number",
+              },
+            },
+            "required": [
+              "query",
+            ],
+            "type": "object",
+          },
+          "name": "dsp.semantic_search",
+        },
+        {
+          "inputSchema": {
+            "properties": {
+              "uid": {
+                "type": "string",
+              },
+            },
+            "required": [
+              "uid",
+            ],
+            "type": "object",
+          },
+          "name": "dsp.get_entity",
+        },
+        {
+          "inputSchema": {
+            "properties": {
+              "depth": {
+                "type": "number",
+              },
+              "uid": {
+                "type": "string",
+              },
+            },
+            "required": [
+              "uid",
+            ],
+            "type": "object",
+          },
+          "name": "dsp.get_neighbors",
+        },
+        {
+          "inputSchema": {
+            "properties": {
+              "target": {
+                "type": "string",
+              },
+            },
+            "required": [
+              "target",
+            ],
+            "type": "object",
+          },
+          "name": "dsp.impact",
+        },
+        {
+          "inputSchema": {
+            "properties": {},
+            "type": "object",
+          },
+          "name": "dsp.validate",
+        },
+        {
+          "inputSchema": {
+            "properties": {
+              "from": {
+                "type": "string",
+              },
+              "to": {
+                "type": "string",
+              },
+            },
+            "required": [
+              "from",
+              "to",
+            ],
+            "type": "object",
+          },
+          "name": "dsp.explain_path",
+        },
+        {
+          "inputSchema": {
+            "properties": {},
+            "type": "object",
+          },
+          "name": "dsp.list_changed",
+        },
+        {
+          "inputSchema": {
+            "properties": {
+              "includeCode": {
+                "type": "string",
+              },
+              "includeTests": {
+                "type": "boolean",
+              },
+              "maxDepth": {
+                "type": "number",
+              },
+              "maxFiles": {
+                "type": "number",
+              },
+              "maxTokens": {
+                "type": "number",
+              },
+              "strategy": {
+                "type": "string",
+              },
+              "task": {
+                "type": "string",
+              },
+            },
+            "required": [
+              "task",
+            ],
+            "type": "object",
+          },
+          "name": "dsp.get_context_pack",
+        },
+      ]
+    `);
   });
 });

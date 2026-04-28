@@ -1,7 +1,12 @@
 import { createHash } from "node:crypto";
 import type { EmbeddingProvider } from "../graph/types.ts";
+import type { DSPConfig } from "../config/types.ts";
 
 export class MockEmbeddingProvider implements EmbeddingProvider {
+  cacheKey(): string {
+    return "mock";
+  }
+
   async embed(text: string): Promise<number[]> {
     const hash = createHash("sha256").update(text).digest();
     const vector: number[] = [];
@@ -24,6 +29,10 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
     this.model = model;
   }
 
+  cacheKey(): string {
+    return `openai-compatible:${this.baseUrl}:${this.model}`;
+  }
+
   async embed(text: string): Promise<number[]> {
     const response = await fetch(`${this.baseUrl}/embeddings`, {
       method: "POST",
@@ -44,4 +53,22 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
     };
     return json.data[0]?.embedding ?? [];
   }
+}
+
+export function createEmbeddingProvider(config: DSPConfig): EmbeddingProvider | undefined {
+  if (!config.embeddings.enabled) {
+    return undefined;
+  }
+  if (config.embeddings.provider === "mock") {
+    return new MockEmbeddingProvider();
+  }
+
+  const apiKeyEnv = config.embeddings.apiKeyEnv ?? "DSP_EMBEDDINGS_API_KEY";
+  const apiKey = process.env[apiKeyEnv] ?? process.env.OPENAI_API_KEY;
+  const baseUrl = config.embeddings.baseUrl ?? process.env.DSP_EMBEDDINGS_BASE_URL;
+  const model = config.embeddings.model ?? process.env.DSP_EMBEDDINGS_MODEL;
+  if (!apiKey || !baseUrl || !model) {
+    return undefined;
+  }
+  return new OpenAICompatibleEmbeddingProvider(baseUrl, apiKey, model);
 }

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import path from "node:path";
 import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import { Command } from "commander";
 import {
@@ -985,7 +986,7 @@ embeddings
   .action((rootDir: string, options: { json: boolean }) => {
     const services = openDSP(path.resolve(rootDir), adapters());
     try {
-      printOutput(services.db.cacheStats(), options.json);
+      printOutput(services.db.embeddingStats(), options.json);
     } finally {
       services.db.close();
     }
@@ -1056,4 +1057,8 @@ ci
     }
   });
 
-program.parseAsync(process.argv);
+export { program };
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  program.parseAsync(process.argv);
+}

@@ -22,3 +22,10 @@
 - `dsp ci context-summary`
 
 Most commands support `--json` for machine output.
+
+## Embeddings
+
+Embeddings are disabled by default in `.dsp/config.json`. When enabled, CLI, MCP semantic search, and context packs share the same provider policy.
+
+- `provider: "mock"` uses deterministic local embeddings for tests and offline workflows.
+- `provider: "openai-compatible"` reads `baseUrl`, `model`, and an API key from `apiKeyEnv` (default `DSP_EMBEDDINGS_API_KEY`) or `OPENAI_API_KEY`.
