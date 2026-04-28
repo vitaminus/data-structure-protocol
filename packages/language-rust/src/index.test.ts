@@ -13,6 +13,33 @@ describe("rust adapter", () => {
     }
   });
 
+  it("extracts Rust web route handlers from attributes and axum routers", async () => {
+    const adapter = new RustLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "src/routes.rs",
+      `
+#[get("/users")]
+async fn list_users() {}
+
+fn router() {
+    Router::new().route("/health", get(health));
+}
+
+fn health() {}
+`
+    );
+    const relations = adapter.extractRelations(parsed, parsed.entities);
+    expect(parsed.entities.some((entity) => entity.kind === "route" && entity.uid === "route:src/routes.rs#GET /users")).toBe(true);
+    expect(
+      relations.some(
+        (relation) => relation.kind === "routes_to" && relation.to === "function:src/routes.rs#list_users"
+      )
+    ).toBe(true);
+    expect(
+      relations.some((relation) => relation.kind === "routes_to" && relation.to === "function:src/routes.rs#health")
+    ).toBe(true);
+  });
+
   it("links Cargo integration tests, examples, benches and bins to crate root", async () => {
     const adapter = new RustLanguageAdapter();
     const testParsed = await adapter.parseFile("tests/auth_flow.rs", "#[test]\nfn auth_flow() {}\n");

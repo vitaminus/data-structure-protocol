@@ -223,3 +223,11 @@ Status: done
 - Detect integration tests under `tests/*.rs` and link them to `src/lib.rs` with `tests` relations.
 - Detect examples, benches, and binary targets by Cargo path conventions.
 - Add module entities and crate-root `depends_on` relations for examples, benches, and bins.
+
+## 29. Extract Rust web route handlers
+
+Status: done
+
+- Detect route attributes such as `#[get("/path")]` and framework-qualified variants.
+- Detect simple Axum `Router::route("/path", get(handler))` patterns.
+- Add route entities and `routes_to` relations to handler functions.

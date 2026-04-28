@@ -353,9 +353,15 @@ export class RustLanguageAdapter implements LanguageAdapter {
     let pendingTestAttribute = false;
     let pendingCfgTestAttribute = false;
     let pendingDerives: string[] = [];
+    let pendingRouteAttributes: { method: string; routePath: string; line: number }[] = [];
     for (let index = 0; index < lines.length; index += 1) {
       const raw = lines[index];
       const line = raw.trim();
+      const routeAttrMatch = line.match(/^#\[(?:(?:actix_web|rocket)::)?(get|post|put|delete|patch)\(["']([^"']+)["']/);
+      if (routeAttrMatch) {
+        pendingRouteAttributes.push({ method: routeAttrMatch[1]!.toUpperCase(), routePath: routeAttrMatch[2]!, line: index + 1 });
+        continue;
+      }
       const deriveMatch = line.match(/^#\[derive\(([^\]]+)\)\]/);
       if (deriveMatch) {
         pendingDerives = deriveMatch[1]!
@@ -426,6 +432,34 @@ export class RustLanguageAdapter implements LanguageAdapter {
             provenance: prov(resolvedMod.confidence, "mod file resolution")
           });
         }
+      }
+
+      const axumRouteMatch = line.match(/\.route\(\s*["']([^"']+)["']\s*,\s*(get|post|put|delete|patch)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)/);
+      if (axumRouteMatch) {
+        const routeUid = buildUid("route", filePath, `${axumRouteMatch[2]!.toUpperCase()} ${axumRouteMatch[1]!}`);
+        entities.push({
+          uid: routeUid,
+          kind: "route",
+          name: axumRouteMatch[1]!,
+          path: filePath,
+          language: "rust",
+          startLine: index + 1,
+          endLine: index + 1,
+          confidence: 0.76,
+          provenance: prov(0.76, "axum route"),
+          metadata: { framework: "axum", method: axumRouteMatch[2]!.toUpperCase(), handler: axumRouteMatch[3] },
+          createdAt: now,
+          updatedAt: now
+        });
+        relations.push({ from: fileUid, to: routeUid, kind: "contains", confidence: 1, provenance: prov(1, "file contains route") });
+        relations.push({
+          from: routeUid,
+          to: buildUid("function", filePath, axumRouteMatch[3]!),
+          kind: "routes_to",
+          reason: axumRouteMatch[3],
+          confidence: 0.76,
+          provenance: prov(0.76, "axum route handler")
+        });
       }
 
       const useMatch = line.match(/^use\s+(.+);$/);
@@ -620,6 +654,33 @@ export class RustLanguageAdapter implements LanguageAdapter {
           createdAt: now,
           updatedAt: now
         });
+        for (const route of pendingRouteAttributes) {
+          const routeUid = buildUid("route", filePath, `${route.method} ${route.routePath}`);
+          entities.push({
+            uid: routeUid,
+            kind: "route",
+            name: route.routePath,
+            path: filePath,
+            language: "rust",
+            startLine: route.line,
+            endLine: route.line,
+            confidence: 0.78,
+            provenance: prov(0.78, "rust route attribute"),
+            metadata: { framework: "attribute", method: route.method, handler: name },
+            createdAt: now,
+            updatedAt: now
+          });
+          relations.push({ from: fileUid, to: routeUid, kind: "contains", confidence: 1, provenance: prov(1, "file contains route") });
+          relations.push({
+            from: routeUid,
+            to: uid,
+            kind: "routes_to",
+            reason: name,
+            confidence: 0.78,
+            provenance: prov(0.78, "rust route attribute handler")
+          });
+        }
+        pendingRouteAttributes = [];
         if (isTestFunction) {
           relations.push({
             from: uid,
