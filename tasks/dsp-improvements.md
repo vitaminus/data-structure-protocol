@@ -295,3 +295,11 @@ Status: done
 - Add reusable pre-commit and pre-push hooks with validation, impact, marker drift, and optional protocol export/test steps.
 - Add agent review scripts that generate changed/impact/context/validation reports under `.dsp/reports`.
 - Add hook installers for macOS/Linux and Windows, and wire the main installers to use them.
+
+## 38. Add protocol-compatible navigation CLI commands
+
+Status: done
+
+- Add upstream-style commands: `get-entity`, `find-by-source`, `get-children`, `get-parents`, `get-path`, and `read-toc`.
+- Add diagnostic commands: `get-stats`, `detect-cycles`, and `get-orphans`.
+- Implement directed traversal, shortest path, cycle detection, source lookup, and graph stats on top of the SQLite graph.

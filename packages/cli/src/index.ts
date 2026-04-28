@@ -18,7 +18,10 @@ import {
   runIndex,
   runSearch,
   runValidate,
-  type LanguageAdapter
+  type DSPServices,
+  type Entity,
+  type LanguageAdapter,
+  type RelationKind
 } from "@dsp/core";
 import { createTypeScriptLanguageAdapter } from "@dsp/language-typescript";
 import { createPythonLanguageAdapter } from "@dsp/language-python";
@@ -45,6 +48,158 @@ function printOutput(output: unknown, asJson: boolean): void {
     return;
   }
   process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
+}
+
+const TRAVERSAL_KINDS = new Set<RelationKind>([
+  "imports",
+  "depends_on",
+  "calls",
+  "uses",
+  "tests",
+  "routes_to",
+  "extends",
+  "implements",
+  "exports"
+]);
+
+function requireEntity(services: DSPServices, uidOrPath: string): Entity {
+  const entity = findEntityByUidOrPath(services.db, uidOrPath);
+  if (!entity) {
+    throw new Error(`Entity not found: ${uidOrPath}`);
+  }
+  return entity;
+}
+
+function relationKey(from: string, kind: string, to: string): string {
+  return `${from}\0${kind}\0${to}`;
+}
+
+function directedTree(
+  services: DSPServices,
+  root: Entity,
+  depth: number,
+  direction: "children" | "parents"
+): unknown {
+  const visited = new Set<string>();
+  const walk = (entity: Entity, remaining: number): unknown => {
+    if (remaining <= 0 || visited.has(entity.uid)) {
+      return { entity, relations: [], [direction]: [] };
+    }
+    visited.add(entity.uid);
+    const relations = (direction === "children"
+      ? services.db.getRelationsFrom(entity.uid)
+      : services.db.getRelationsTo(entity.uid)
+    ).filter((relation) => TRAVERSAL_KINDS.has(relation.kind));
+    const nodes = relations
+      .map((relation) => services.db.getEntity(direction === "children" ? relation.to : relation.from))
+      .filter(Boolean) as Entity[];
+    return {
+      entity,
+      relations,
+      [direction]: nodes.map((node) => walk(node, remaining - 1))
+    };
+  };
+  return walk(root, depth);
+}
+
+function graphStats(services: DSPServices): unknown {
+  const entities = services.db.getEntities(300000);
+  const relations = services.db.getRelations(600000);
+  const byKind = Object.fromEntries(
+    [...new Set(entities.map((entity) => entity.kind))]
+      .sort()
+      .map((kind) => [kind, entities.filter((entity) => entity.kind === kind).length])
+  );
+  const byLanguage = Object.fromEntries(
+    [...new Set(entities.map((entity) => entity.language).filter(Boolean) as string[])]
+      .sort()
+      .map((language) => [language, entities.filter((entity) => entity.language === language).length])
+  );
+  return {
+    entities: entities.length,
+    relations: relations.length,
+    unresolvedReferences: services.db.getUnresolvedReferences().length,
+    byKind,
+    byLanguage,
+    cache: services.db.cacheStats()
+  };
+}
+
+function findSourceEntities(services: DSPServices, sourcePath: string): Entity[] {
+  const normalized = sourcePath.replaceAll("\\", "/").replace(/^\.\//, "");
+  return services.db
+    .getEntities(300000)
+    .filter((entity) => entity.path === normalized || entity.path?.endsWith(`/${normalized}`));
+}
+
+function shortestPath(services: DSPServices, fromUid: string, toUid: string): string[] | undefined {
+  const queue: string[][] = [[fromUid]];
+  const visited = new Set<string>([fromUid]);
+  while (queue.length > 0) {
+    const pathSoFar = queue.shift()!;
+    const current = pathSoFar.at(-1)!;
+    if (current === toUid) {
+      return pathSoFar;
+    }
+    for (const relation of services.db.getRelationsFrom(current).filter((rel) => TRAVERSAL_KINDS.has(rel.kind))) {
+      if (!visited.has(relation.to)) {
+        visited.add(relation.to);
+        queue.push([...pathSoFar, relation.to]);
+      }
+    }
+  }
+  return undefined;
+}
+
+function detectCycles(services: DSPServices): string[][] {
+  const cycles: string[][] = [];
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const stack: string[] = [];
+  const entities = services.db.getEntities(300000);
+  const seenCycles = new Set<string>();
+
+  const dfs = (uid: string): void => {
+    if (visiting.has(uid)) {
+      const start = stack.indexOf(uid);
+      const cycle = [...stack.slice(start), uid];
+      const key = cycle.join("->");
+      if (!seenCycles.has(key)) {
+        seenCycles.add(key);
+        cycles.push(cycle);
+      }
+      return;
+    }
+    if (visited.has(uid)) {
+      return;
+    }
+    visiting.add(uid);
+    stack.push(uid);
+    for (const relation of services.db.getRelationsFrom(uid).filter((rel) => TRAVERSAL_KINDS.has(rel.kind))) {
+      dfs(relation.to);
+    }
+    stack.pop();
+    visiting.delete(uid);
+    visited.add(uid);
+  };
+
+  for (const entity of entities) {
+    dfs(entity.uid);
+  }
+  return cycles;
+}
+
+function orphans(services: DSPServices): Entity[] {
+  const entities = services.db.getEntities(300000);
+  return entities.filter((entity) => {
+    if (["repository", "directory", "file"].includes(entity.kind)) {
+      return false;
+    }
+    return services.db
+      .getRelationsTo(entity.uid)
+      .filter((relation) => relation.kind !== "contains")
+      .length === 0;
+  });
 }
 
 const program = new Command();
@@ -203,6 +358,152 @@ program
       }
     }
   );
+
+program
+  .command("get-entity")
+  .argument("<uidOrPath>", "entity uid or path")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--json", "machine-readable output", false)
+  .action((uidOrPath: string, rootDir: string, options: { json: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      const entity = findEntityByUidOrPath(services.db, uidOrPath);
+      printOutput(entity ? { found: true, entity } : { found: false, uidOrPath }, options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
+  .command("find-by-source")
+  .argument("<sourcePath>", "repo-relative source path")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--json", "machine-readable output", false)
+  .action((sourcePath: string, rootDir: string, options: { json: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      const entities = findSourceEntities(services, sourcePath);
+      printOutput({ sourcePath, entities }, options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
+  .command("get-children")
+  .argument("<uidOrPath>", "entity uid or path")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--depth <number>", "traversal depth", "1")
+  .option("--json", "machine-readable output", false)
+  .action((uidOrPath: string, rootDir: string, options: { depth: string; json: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      const root = requireEntity(services, uidOrPath);
+      printOutput(directedTree(services, root, Number(options.depth), "children"), options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
+  .command("get-parents")
+  .argument("<uidOrPath>", "entity uid or path")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--depth <number>", "traversal depth", "1")
+  .option("--json", "machine-readable output", false)
+  .action((uidOrPath: string, rootDir: string, options: { depth: string; json: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      const root = requireEntity(services, uidOrPath);
+      printOutput(directedTree(services, root, Number(options.depth), "parents"), options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
+  .command("get-path")
+  .argument("<fromUidOrPath>", "source entity uid or path")
+  .argument("<toUidOrPath>", "target entity uid or path")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--json", "machine-readable output", false)
+  .action((fromUidOrPath: string, toUidOrPath: string, rootDir: string, options: { json: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      const from = requireEntity(services, fromUidOrPath);
+      const to = requireEntity(services, toUidOrPath);
+      const pathResult = shortestPath(services, from.uid, to.uid);
+      printOutput({ found: Boolean(pathResult), from: from.uid, to: to.uid, path: pathResult ?? [] }, options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
+  .command("read-toc")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--protocol", "read .dsp/protocol/TOC if present", false)
+  .option("--json", "machine-readable output", false)
+  .action((rootDir: string, options: { protocol: boolean; json: boolean }) => {
+    const resolvedRoot = path.resolve(rootDir);
+    if (options.protocol) {
+      const tocPath = path.join(resolvedRoot, ".dsp", "protocol", "TOC");
+      const toc = fs.existsSync(tocPath)
+        ? fs.readFileSync(tocPath, "utf8").split("\n").map((line) => line.trim()).filter(Boolean)
+        : [];
+      printOutput({ protocol: true, toc }, options.json);
+      return;
+    }
+    const services = openDSP(resolvedRoot, adapters());
+    try {
+      const toc = services.db.getEntities(300000).map((entity) => entity.uid);
+      printOutput({ protocol: false, toc }, options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
+  .command("get-stats")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--json", "machine-readable output", false)
+  .action((rootDir: string, options: { json: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      printOutput(graphStats(services), options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
+  .command("detect-cycles")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--json", "machine-readable output", false)
+  .action((rootDir: string, options: { json: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      const cycles = detectCycles(services);
+      printOutput({ cycles, count: cycles.length }, options.json);
+      process.exitCode = cycles.length > 0 ? 1 : 0;
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
+  .command("get-orphans")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--json", "machine-readable output", false)
+  .action((rootDir: string, options: { json: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      const result = orphans(services);
+      printOutput({ orphans: result, count: result.length }, options.json);
+    } finally {
+      services.db.close();
+    }
+  });
 
 program
   .command("search")
