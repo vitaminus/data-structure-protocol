@@ -66,6 +66,34 @@ use crate::user::User as CrateUser;
     }
   });
 
+  it("expands grouped use trees before resolving module files", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "dsp-rust-use-tree-"));
+    cleanupDirs.push(tempDir);
+    const oldCwd = process.cwd();
+    fs.mkdirSync(path.join(tempDir, "src", "db"), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, "src", "db", "mod.rs"), "pub struct Repo;\n", "utf8");
+    fs.writeFileSync(path.join(tempDir, "src", "user.rs"), "pub struct User;\n", "utf8");
+
+    try {
+      process.chdir(tempDir);
+      const adapter = new RustLanguageAdapter();
+      const parsed = await adapter.parseFile(
+        "src/lib.rs",
+        `
+use crate::{db::Repo, user::User};
+`
+      );
+      const imports = adapter
+        .extractRelations(parsed, parsed.entities)
+        .filter((relation) => relation.kind === "imports")
+        .map((relation) => relation.to);
+      expect(imports).toContain("file:src/db/mod.rs");
+      expect(imports).toContain("file:src/user.rs");
+    } finally {
+      process.chdir(oldCwd);
+    }
+  });
+
   it("tracks impl scope with braces and Rust visibility modifiers", async () => {
     const adapter = new RustLanguageAdapter();
     const parsed = await adapter.parseFile(

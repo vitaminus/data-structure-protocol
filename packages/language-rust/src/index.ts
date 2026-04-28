@@ -30,10 +30,61 @@ function resolveModDeclaration(filePath: string, name: string): { path: string; 
   return { path: firstExisting(candidates) ?? candidates[0]!, confidence: firstExisting(candidates) ? 0.92 : 0.76 };
 }
 
+function splitTopLevel(input: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index];
+    if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+    } else if (char === "," && depth === 0) {
+      parts.push(input.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  parts.push(input.slice(start).trim());
+  return parts.filter(Boolean);
+}
+
+function expandUseSpecs(spec: string): string[] {
+  const cleaned = spec.replace(/;+$/, "").trim();
+  const openIndex = cleaned.indexOf("{");
+  if (openIndex === -1) {
+    return [cleaned];
+  }
+
+  let depth = 0;
+  let closeIndex = -1;
+  for (let index = openIndex; index < cleaned.length; index += 1) {
+    const char = cleaned[index];
+    if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        closeIndex = index;
+        break;
+      }
+    }
+  }
+  if (closeIndex === -1) {
+    return [cleaned];
+  }
+
+  const prefix = cleaned.slice(0, openIndex).replace(/::$/, "");
+  const suffix = cleaned.slice(closeIndex + 1);
+  return splitTopLevel(cleaned.slice(openIndex + 1, closeIndex)).flatMap((part) => {
+    const expanded = prefix ? `${prefix}::${part}${suffix}` : `${part}${suffix}`;
+    return expandUseSpecs(expanded);
+  });
+}
+
 function cleanUseSpec(spec: string): string {
   return spec
     .replace(/\s+as\s+.+$/, "")
-    .replace(/\{.*$/, "")
     .replace(/::\*$/, "")
     .replace(/;+$/, "")
     .trim();
@@ -161,26 +212,27 @@ export class RustLanguageAdapter implements LanguageAdapter {
 
       const useMatch = line.match(/^use\s+(.+);$/);
       if (useMatch) {
-        const spec = useMatch[1].trim();
-        const resolvedUse = resolveUsePath(filePath, spec);
-        if (resolvedUse) {
-          relations.push({
-            from: fileUid,
-            to: buildUid("file", resolvedUse.path),
-            kind: "imports",
-            reason: spec,
-            confidence: resolvedUse.confidence,
-            provenance: prov(resolvedUse.confidence, "use import resolution")
-          });
-        } else {
-          unresolvedReferences.push({
-            path: filePath,
-            fromUid: fileUid,
-            symbol: spec,
-            kind: "use",
-            reason: "external crate or unresolved path",
-            confidence: 0.68
-          });
+        for (const spec of expandUseSpecs(useMatch[1]!.trim())) {
+          const resolvedUse = resolveUsePath(filePath, spec);
+          if (resolvedUse) {
+            relations.push({
+              from: fileUid,
+              to: buildUid("file", resolvedUse.path),
+              kind: "imports",
+              reason: spec,
+              confidence: resolvedUse.confidence,
+              provenance: prov(resolvedUse.confidence, "use import resolution")
+            });
+          } else {
+            unresolvedReferences.push({
+              path: filePath,
+              fromUid: fileUid,
+              symbol: spec,
+              kind: "use",
+              reason: "external crate or unresolved path",
+              confidence: 0.68
+            });
+          }
         }
       }
 

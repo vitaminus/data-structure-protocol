@@ -119,3 +119,11 @@ Status: done
 - Track impl blocks with brace depth so nested function bodies do not pop impl context early.
 - Support generic impl headers and Rust visibility modifiers such as `pub(crate)`.
 - Add type-to-method `contains` relations for methods declared inside impl blocks.
+
+## 16. Resolve Rust grouped use trees
+
+Status: done
+
+- Expand grouped imports such as `use crate::{db::Repo, user::User};` before resolution.
+- Preserve per-expanded import provenance and unresolved reference reporting.
+- Add coverage for grouped imports resolving to both `mod.rs` and sibling module files.
