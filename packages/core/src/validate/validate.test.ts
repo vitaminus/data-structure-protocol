@@ -2,9 +2,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { DSPDatabase } from "../storage/db.js";
-import { validateGraph } from "./validate.js";
-import { buildUid, contentHash, stableNowIso } from "../graph/uid.js";
+import { DSPDatabase } from "../storage/db.ts";
+import { validateGraph } from "./validate.ts";
+import { buildUid, contentHash, stableNowIso } from "../graph/uid.ts";
 
 describe("validation", () => {
   let tempDir: string;

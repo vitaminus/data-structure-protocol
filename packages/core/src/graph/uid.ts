@@ -1,6 +1,6 @@
 import path from "node:path";
 import { createHash } from "node:crypto";
-import type { EntityKind } from "./types.js";
+import type { EntityKind } from "./types.ts";
 
 export function normalizePath(inputPath: string): string {
   return inputPath

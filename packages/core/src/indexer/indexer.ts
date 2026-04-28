@@ -7,12 +7,12 @@ import type {
   LanguageAdapter,
   Relation,
   UnresolvedReference
-} from "../graph/types.js";
-import { buildUid, contentHash, normalizePath, stableNowIso } from "../graph/uid.js";
-import { discoverFiles, findRepoRoot } from "../util/fs.js";
-import { changedFileEntriesFromGit, changedFilesFromGit } from "../util/git.js";
-import type { DSPDatabase } from "../storage/db.js";
-import type { DSPConfig } from "../config/types.js";
+} from "../graph/types.ts";
+import { buildUid, contentHash, normalizePath, stableNowIso } from "../graph/uid.ts";
+import { discoverFiles, findRepoRoot } from "../util/fs.ts";
+import { changedFileEntriesFromGit, changedFilesFromGit } from "../util/git.ts";
+import type { DSPDatabase } from "../storage/db.ts";
+import type { DSPConfig } from "../config/types.ts";
 
 function languageFromFile(filePath: string): string | undefined {
   const ext = path.extname(filePath).toLowerCase();

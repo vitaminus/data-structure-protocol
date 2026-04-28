@@ -1,6 +1,6 @@
-import type { DSPDatabase } from "../storage/db.js";
-import type { Entity, Relation } from "./types.js";
-import { buildUid, normalizePath } from "./uid.js";
+import type { DSPDatabase } from "../storage/db.ts";
+import type { Entity, Relation } from "./types.ts";
+import { buildUid, normalizePath } from "./uid.ts";
 
 export function findEntityByUidOrPath(db: DSPDatabase, uidOrPath: string): Entity | undefined {
   if (uidOrPath.includes(":") || /^(?:obj|func)-[0-9a-fA-F]{8}$/.test(uidOrPath)) {

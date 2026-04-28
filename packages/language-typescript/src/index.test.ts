@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { TypeScriptLanguageAdapter } from "./index.js";
+import { TypeScriptLanguageAdapter } from "./index.ts";
 
 describe("typescript adapter", () => {
   const cleanupDirs: string[] = [];

@@ -2,9 +2,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { DSPDatabase } from "../storage/db.js";
-import { buildUid, stableNowIso } from "./uid.js";
-import { getNeighbors } from "./query.js";
+import { DSPDatabase } from "../storage/db.ts";
+import { buildUid, stableNowIso } from "./uid.ts";
+import { getNeighbors } from "./query.ts";
 
 describe("graph query", () => {
   let tempDir: string;

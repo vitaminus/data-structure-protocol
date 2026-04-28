@@ -9,17 +9,17 @@ import type {
   LanguageAdapter,
   SearchResult,
   ValidationResult
-} from "./graph/types.js";
-import { DSPDatabase } from "./storage/db.js";
-import { loadConfig, writeDefaultConfig } from "./config/config.js";
-import { buildContextPack } from "./graph/context-pack.js";
-import { indexRepository, bootstrapRepository, changedFiles } from "./indexer/indexer.js";
-import { semanticSearch } from "./semantic/search.js";
-import { analyzeImpact } from "./impact/impact.js";
-import { validateGraph } from "./validate/validate.js";
-import { insertSourceMarkers } from "./markers/markers.js";
-import { MockEmbeddingProvider } from "./semantic/providers.js";
-import { contentHash } from "./graph/uid.js";
+} from "./graph/types.ts";
+import { DSPDatabase } from "./storage/db.ts";
+import { loadConfig, writeDefaultConfig } from "./config/config.ts";
+import { buildContextPack } from "./graph/context-pack.ts";
+import { indexRepository, bootstrapRepository, changedFiles } from "./indexer/indexer.ts";
+import { semanticSearch } from "./semantic/search.ts";
+import { analyzeImpact } from "./impact/impact.ts";
+import { validateGraph } from "./validate/validate.ts";
+import { insertSourceMarkers } from "./markers/markers.ts";
+import { MockEmbeddingProvider } from "./semantic/providers.ts";
+import { contentHash } from "./graph/uid.ts";
 
 export type DSPServices = {
   rootDir: string;

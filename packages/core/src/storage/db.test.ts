@@ -3,8 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { DSPDatabase } from "./db.js";
-import { buildUid, stableNowIso } from "../graph/uid.js";
+import { DSPDatabase } from "./db.ts";
+import { buildUid, stableNowIso } from "../graph/uid.ts";
 
 describe("DSPDatabase", () => {
   let tempDir: string;

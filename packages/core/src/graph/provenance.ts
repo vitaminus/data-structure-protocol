@@ -1,4 +1,4 @@
-import type { Provenance, ProvenanceSource } from "./types.js";
+import type { Provenance, ProvenanceSource } from "./types.ts";
 
 const SOURCE_PRIORITY: Record<ProvenanceSource, number> = {
   human: 100,

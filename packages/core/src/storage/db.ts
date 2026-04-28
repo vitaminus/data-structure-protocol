@@ -8,9 +8,9 @@ import type {
   Relation,
   RelationKind,
   UnresolvedReference
-} from "../graph/types.js";
-import { mergeProvenance, topSourcePriority } from "../graph/provenance.js";
-import { ensureDir } from "../util/fs.js";
+} from "../graph/types.ts";
+import { mergeProvenance, topSourcePriority } from "../graph/provenance.ts";
+import { ensureDir } from "../util/fs.ts";
 
 function toJson(value: unknown): string {
   return JSON.stringify(value ?? null);

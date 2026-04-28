@@ -1,6 +1,6 @@
-import type { DSPDatabase } from "../storage/db.js";
-import type { ImpactResult, RelationKind } from "../graph/types.js";
-import { buildUid, normalizePath } from "../graph/uid.js";
+import type { DSPDatabase } from "../storage/db.ts";
+import type { ImpactResult, RelationKind } from "../graph/types.ts";
+import { buildUid, normalizePath } from "../graph/uid.ts";
 
 const IMPACT_KINDS: Set<RelationKind> = new Set([
   "imports",
