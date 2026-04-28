@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDSP } from "@dsp/core";
 import { buildUid, stableNowIso } from "@dsp/core";
-import { dispatchToolCall } from "./index.js";
+import { dispatchToolCall } from "./index.ts";
 
 describe("mcp tool dispatcher", () => {
   let tempDir: string;

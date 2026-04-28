@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { ContextPackRequest, ContextPackResponse, Entity, Relation } from "./types.js";
-import type { DSPDatabase } from "../storage/db.js";
-import { semanticSearch } from "../semantic/search.js";
+import type { ContextPackRequest, ContextPackResponse, Entity, Relation } from "./types.ts";
+import type { DSPDatabase } from "../storage/db.ts";
+import { semanticSearch } from "../semantic/search.ts";
 
 type StrategyDefaults = {
   maxFiles: number;

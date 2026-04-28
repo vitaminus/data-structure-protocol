@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildUid, normalizePath } from "./uid.js";
+import { buildUid, normalizePath } from "./uid.ts";
 
 describe("uid generation", () => {
   it("is deterministic for file and symbol", () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { RubyLanguageAdapter } from "./index.js";
+import { RubyLanguageAdapter } from "./index.ts";
 
 describe("ruby adapter", () => {
   it("extracts classes/modules/methods and routes", async () => {

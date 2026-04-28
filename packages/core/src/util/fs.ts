@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
-import { DEFAULT_EXCLUDES } from "../config/types.js";
+import { DEFAULT_EXCLUDES } from "../config/types.ts";
 
 const require = createRequire(import.meta.url);
 const ignore = require("ignore") as typeof import("ignore").default;

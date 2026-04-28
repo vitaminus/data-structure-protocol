@@ -1,8 +1,8 @@
 import path from "node:path";
 import { readFileSync } from "node:fs";
-import type { DSPDatabase } from "../storage/db.js";
-import type { ValidationIssue, ValidationResult, ValidationSeverity } from "../graph/types.js";
-import { contentHash } from "../graph/uid.js";
+import type { DSPDatabase } from "../storage/db.ts";
+import type { ValidationIssue, ValidationResult, ValidationSeverity } from "../graph/types.ts";
+import { contentHash } from "../graph/uid.ts";
 
 function severityForIssue(kind: ValidationIssue["kind"]): ValidationSeverity {
   switch (kind) {

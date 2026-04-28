@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import type { DSPDatabase } from "../storage/db.js";
-import type { Entity } from "../graph/types.js";
+import type { DSPDatabase } from "../storage/db.ts";
+import type { Entity } from "../graph/types.ts";
 
 function markerPrefix(kind: Entity["kind"]): "obj" | "func" {
   return ["function", "method", "route", "test"].includes(kind) ? "func" : "obj";

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PythonLanguageAdapter } from "./index.js";
+import { PythonLanguageAdapter } from "./index.ts";
 
 describe("python adapter", () => {
   it("extracts imports and symbols", async () => {

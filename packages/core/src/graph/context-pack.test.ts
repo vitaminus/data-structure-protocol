@@ -2,9 +2,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { DSPDatabase } from "../storage/db.js";
-import { buildUid, stableNowIso } from "./uid.js";
-import { buildContextPack } from "./context-pack.js";
+import { DSPDatabase } from "../storage/db.ts";
+import { buildUid, stableNowIso } from "./uid.ts";
+import { buildContextPack } from "./context-pack.ts";
 
 describe("context pack", () => {
   let tempDir: string;

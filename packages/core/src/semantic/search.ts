@@ -1,6 +1,6 @@
-import type { DSPDatabase } from "../storage/db.js";
-import type { EmbeddingProvider, SearchResult } from "../graph/types.js";
-import { contentHash } from "../graph/uid.js";
+import type { DSPDatabase } from "../storage/db.ts";
+import type { EmbeddingProvider, SearchResult } from "../graph/types.ts";
+import { contentHash } from "../graph/uid.ts";
 
 function cosineSimilarity(a: number[], b: number[]): number {
   if (a.length === 0 || b.length === 0 || a.length !== b.length) {

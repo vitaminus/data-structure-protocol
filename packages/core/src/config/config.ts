@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { DEFAULT_CONFIG, type DSPConfig } from "./types.js";
+import { DEFAULT_CONFIG, type DSPConfig } from "./types.ts";
 
 export function configPath(rootDir: string): string {
   return path.join(rootDir, ".dsp", "config.json");

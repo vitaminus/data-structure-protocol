@@ -3,11 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { execSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { LanguageAdapter, ParseResult } from "../graph/types.js";
-import { DEFAULT_CONFIG } from "../config/types.js";
-import { DSPDatabase } from "../storage/db.js";
-import { indexRepository } from "./indexer.js";
-import { buildUid, stableNowIso } from "../graph/uid.js";
+import type { LanguageAdapter, ParseResult } from "../graph/types.ts";
+import { DEFAULT_CONFIG } from "../config/types.ts";
+import { DSPDatabase } from "../storage/db.ts";
+import { indexRepository } from "./indexer.ts";
+import { buildUid, stableNowIso } from "../graph/uid.ts";
 
 class MockAdapter implements LanguageAdapter {
   language = "typescript";

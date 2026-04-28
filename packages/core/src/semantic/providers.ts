@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { EmbeddingProvider } from "../graph/types.js";
+import type { EmbeddingProvider } from "../graph/types.ts";
 
 export class MockEmbeddingProvider implements EmbeddingProvider {
   async embed(text: string): Promise<number[]> {
