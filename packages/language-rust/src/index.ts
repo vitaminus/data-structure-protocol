@@ -125,6 +125,37 @@ type CargoManifest = {
   dependencies: CargoDependency[];
 };
 
+function rustCrateRootForPath(filePath: string): string | undefined {
+  const normalized = normalizePath(filePath);
+  if (/^tests\/[^/]+\.rs$/.test(normalized)) {
+    return "src/lib.rs";
+  }
+  if (/^benches\/[^/]+\.rs$/.test(normalized) || /^examples\/[^/]+\.rs$/.test(normalized)) {
+    return "src/lib.rs";
+  }
+  if (/^src\/bin\/[^/]+\.rs$/.test(normalized)) {
+    return "src/lib.rs";
+  }
+  return undefined;
+}
+
+function rustFileRole(filePath: string): "integration-test" | "bench" | "example" | "bin" | undefined {
+  const normalized = normalizePath(filePath);
+  if (/^tests\/[^/]+\.rs$/.test(normalized)) {
+    return "integration-test";
+  }
+  if (/^benches\/[^/]+\.rs$/.test(normalized)) {
+    return "bench";
+  }
+  if (/^examples\/[^/]+\.rs$/.test(normalized)) {
+    return "example";
+  }
+  if (/^src\/bin\/[^/]+\.rs$/.test(normalized)) {
+    return "bin";
+  }
+  return undefined;
+}
+
 function parseCargoManifest(content: string): CargoManifest {
   let section = "";
   let packageName: string | undefined;
@@ -285,6 +316,33 @@ export class RustLanguageAdapter implements LanguageAdapter {
         });
       }
       return { entities, relations, unresolvedReferences };
+    }
+
+    const role = rustFileRole(filePath);
+    const crateRoot = rustCrateRootForPath(filePath);
+    if (role && crateRoot) {
+      const uid = buildUid(role === "integration-test" ? "test" : "module", filePath);
+      entities.push({
+        uid,
+        kind: role === "integration-test" ? "test" : "module",
+        name: path.basename(filePath),
+        path: filePath,
+        language: "rust",
+        confidence: 0.84,
+        provenance: prov(0.84, `cargo ${role} path convention`),
+        metadata: { rustKind: role, crateRoot },
+        createdAt: now,
+        updatedAt: now
+      });
+      relations.push({ from: fileUid, to: uid, kind: "contains", confidence: 1, provenance: prov(1, `cargo ${role} file`) });
+      relations.push({
+        from: uid,
+        to: buildUid("file", crateRoot),
+        kind: role === "integration-test" ? "tests" : "depends_on",
+        reason: `cargo ${role} path convention`,
+        confidence: 0.82,
+        provenance: prov(0.82, `cargo ${role} path convention`)
+      });
     }
 
     const lines = content.split("\n");

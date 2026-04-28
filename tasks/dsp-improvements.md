@@ -215,3 +215,11 @@ Status: done
 - Include `Cargo.toml` in Rust repository indexing.
 - Extract package crates, workspace members, and Cargo dependencies.
 - Add external crate dependency entities and `depends_on` relations from manifests.
+
+## 28. Link Cargo target files to crate roots
+
+Status: done
+
+- Detect integration tests under `tests/*.rs` and link them to `src/lib.rs` with `tests` relations.
+- Detect examples, benches, and binary targets by Cargo path conventions.
+- Add module entities and crate-root `depends_on` relations for examples, benches, and bins.

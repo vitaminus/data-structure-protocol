@@ -13,6 +13,16 @@ describe("rust adapter", () => {
     }
   });
 
+  it("links Cargo integration tests, examples, benches and bins to crate root", async () => {
+    const adapter = new RustLanguageAdapter();
+    const testParsed = await adapter.parseFile("tests/auth_flow.rs", "#[test]\nfn auth_flow() {}\n");
+    const exampleParsed = await adapter.parseFile("examples/demo.rs", "fn main() {}\n");
+    expect(testParsed.entities.some((entity) => entity.kind === "test" && entity.uid === "test:tests/auth_flow.rs")).toBe(true);
+    expect(testParsed.relations.some((relation) => relation.kind === "tests" && relation.to === "file:src/lib.rs")).toBe(true);
+    expect(exampleParsed.entities.some((entity) => entity.kind === "module" && entity.metadata?.rustKind === "example")).toBe(true);
+    expect(exampleParsed.relations.some((relation) => relation.kind === "depends_on" && relation.to === "file:src/lib.rs")).toBe(true);
+  });
+
   it("indexes Cargo manifests with crates, workspace members and dependencies", async () => {
     const adapter = new RustLanguageAdapter();
     const parsed = await adapter.parseFile(
