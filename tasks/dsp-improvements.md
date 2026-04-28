@@ -239,3 +239,11 @@ Status: done
 - Detect `#[cfg(feature = "...")]` and `#[cfg_attr(feature = "...", ...)]` attributes.
 - Attach feature-gate metadata to the next Rust item entity.
 - Add coverage for cfg-gated structs and functions.
+
+## 31. Index Rust macro_rules declarations
+
+Status: done
+
+- Detect `macro_rules! name` declarations as Rust callable entities.
+- Mark macro entities with `rustKind: macro_rules` metadata.
+- Reuse same-file call heuristics to connect macro invocations to macro declarations.

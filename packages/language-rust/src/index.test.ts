@@ -13,6 +13,31 @@ describe("rust adapter", () => {
     }
   });
 
+  it("extracts macro_rules declarations and same-file macro calls", async () => {
+    const adapter = new RustLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "src/lib.rs",
+      `
+macro_rules! make_user { () => {} }
+
+fn create() {
+    make_user!();
+}
+`
+    );
+    const entities = adapter.extractEntities(parsed);
+    const relations = adapter.extractRelations(parsed, entities);
+    expect(entities.some((entity) => entity.uid === "function:src/lib.rs#make_user" && entity.metadata?.rustKind === "macro_rules")).toBe(true);
+    expect(
+      relations.some(
+        (relation) =>
+          relation.kind === "calls" &&
+          relation.from === "function:src/lib.rs#create" &&
+          relation.to === "function:src/lib.rs#make_user"
+      )
+    ).toBe(true);
+  });
+
   it("records cfg feature metadata on Rust items", async () => {
     const adapter = new RustLanguageAdapter();
     const parsed = await adapter.parseFile(

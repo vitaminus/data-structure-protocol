@@ -475,6 +475,25 @@ export class RustLanguageAdapter implements LanguageAdapter {
         });
       }
 
+      const macroRulesMatch = line.match(/^macro_rules!\s+([A-Za-z_][A-Za-z0-9_]*)/);
+      if (macroRulesMatch) {
+        const name = macroRulesMatch[1]!;
+        entities.push({
+          uid: buildUid("function", filePath, name),
+          kind: "function",
+          name,
+          path: filePath,
+          language: "rust",
+          startLine: index + 1,
+          endLine: index + 1,
+          confidence: 0.82,
+          provenance: prov(0.82, "macro_rules declaration"),
+          metadata: { rustKind: "macro_rules", public: false },
+          createdAt: now,
+          updatedAt: now
+        });
+      }
+
       const useMatch = line.match(/^use\s+(.+);$/);
       if (useMatch) {
         for (const spec of expandUseSpecs(useMatch[1]!.trim())) {
