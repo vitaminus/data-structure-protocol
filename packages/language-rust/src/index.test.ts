@@ -13,6 +13,40 @@ describe("rust adapter", () => {
     }
   });
 
+  it("adds imported function call relations from use paths", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "dsp-rust-imported-call-"));
+    cleanupDirs.push(tempDir);
+    const oldCwd = process.cwd();
+    fs.mkdirSync(path.join(tempDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, "src", "crypto.rs"), "pub fn hash_password() {}\n", "utf8");
+
+    try {
+      process.chdir(tempDir);
+      const adapter = new RustLanguageAdapter();
+      const parsed = await adapter.parseFile(
+        "src/auth.rs",
+        `
+use crate::crypto::hash_password;
+
+pub fn create_user() {
+    hash_password();
+}
+`
+      );
+      const relations = adapter.extractRelations(parsed, parsed.entities);
+      expect(
+        relations.some(
+          (relation) =>
+            relation.kind === "calls" &&
+            relation.from === "function:src/auth.rs#create_user" &&
+            relation.to === "function:src/crypto.rs#hash_password"
+        )
+      ).toBe(true);
+    } finally {
+      process.chdir(oldCwd);
+    }
+  });
+
   it("extracts macro_rules declarations and same-file macro calls", async () => {
     const adapter = new RustLanguageAdapter();
     const parsed = await adapter.parseFile(

@@ -247,3 +247,11 @@ Status: done
 - Detect `macro_rules! name` declarations as Rust callable entities.
 - Mark macro entities with `rustKind: macro_rules` metadata.
 - Reuse same-file call heuristics to connect macro invocations to macro declarations.
+
+## 32. Add Rust imported function call relations
+
+Status: done
+
+- Track imported symbols from resolved `use` paths.
+- When a call has no same-file target, link it to the imported module file as a low-confidence function call.
+- Add coverage for `use crate::module::function; function();` cross-file call edges.

@@ -354,6 +354,7 @@ export class RustLanguageAdapter implements LanguageAdapter {
     const implStack: { target: string; trait?: string; depth: number }[] = [];
     const callableStack: { uid: string; depth: number }[] = [];
     const callEdges: { from: string; name: string; line: number }[] = [];
+    const importedCallTargets = new Map<string, string[]>();
     let braceDepth = 0;
     let pendingTestAttribute = false;
     let pendingCfgTestAttribute = false;
@@ -499,6 +500,12 @@ export class RustLanguageAdapter implements LanguageAdapter {
         for (const spec of expandUseSpecs(useMatch[1]!.trim())) {
           const resolvedUse = resolveUsePath(filePath, spec);
           if (resolvedUse) {
+            const importedName = cleanUseSpec(spec).split("::").filter(Boolean).at(-1);
+            if (importedName && !["self", "super", "crate"].includes(importedName)) {
+              const bucket = importedCallTargets.get(importedName) ?? [];
+              bucket.push(resolvedUse.path);
+              importedCallTargets.set(importedName, [...new Set(bucket)]);
+            }
             relations.push({
               from: fileUid,
               to: buildUid("file", resolvedUse.path),
@@ -765,16 +772,28 @@ export class RustLanguageAdapter implements LanguageAdapter {
       callableTargets.set(entity.name, bucket);
     }
     for (const edge of callEdges) {
-      for (const target of callableTargets.get(edge.name) ?? []) {
-        if (target.uid !== edge.from) {
+      const localTargets = (callableTargets.get(edge.name) ?? []).filter((target) => target.uid !== edge.from);
+      for (const target of localTargets) {
+        relations.push({
+          from: edge.from,
+          to: target.uid,
+          kind: "calls",
+          reason: `${edge.name}()`,
+          confidence: 0.62,
+          provenance: prov(0.62, "same-file call heuristic"),
+          metadata: { line: edge.line }
+        });
+      }
+      if (localTargets.length === 0) {
+        for (const targetPath of importedCallTargets.get(edge.name) ?? []) {
           relations.push({
             from: edge.from,
-            to: target.uid,
+            to: buildUid("function", targetPath, edge.name),
             kind: "calls",
             reason: `${edge.name}()`,
-            confidence: 0.62,
-            provenance: prov(0.62, "same-file call heuristic"),
-            metadata: { line: edge.line }
+            confidence: 0.54,
+            provenance: prov(0.54, "imported function call heuristic"),
+            metadata: { line: edge.line, targetPath }
           });
         }
       }
