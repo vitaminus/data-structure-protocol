@@ -111,3 +111,11 @@ Status: done
 - Extract `to: "controller#action"` route targets and basic `resources :name` routes.
 - Create `routes_to` relations from route entities to conventional controller action method UIDs.
 - Add coverage for explicit HTTP routes and resource routes.
+
+## 15. Improve Rust impl and visibility parsing
+
+Status: done
+
+- Track impl blocks with brace depth so nested function bodies do not pop impl context early.
+- Support generic impl headers and Rust visibility modifiers such as `pub(crate)`.
+- Add type-to-method `contains` relations for methods declared inside impl blocks.

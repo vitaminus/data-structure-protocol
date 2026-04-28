@@ -65,4 +65,37 @@ use crate::user::User as CrateUser;
       process.chdir(oldCwd);
     }
   });
+
+  it("tracks impl scope with braces and Rust visibility modifiers", async () => {
+    const adapter = new RustLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "src/user.rs",
+      `
+pub(crate) struct User {}
+
+impl<T> User where T: Clone {
+    pub(crate) async fn create() -> User {
+        if true { User {} } else { User {} }
+    }
+
+    fn private_name(&self) -> String {
+        String::new()
+    }
+}
+
+pub fn top_level() {}
+`
+    );
+    const entities = adapter.extractEntities(parsed);
+    const relations = adapter.extractRelations(parsed, entities);
+    expect(entities.find((entity) => entity.name === "User")?.metadata?.visibility).toBe("pub(crate)");
+    expect(entities.some((entity) => entity.kind === "method" && entity.uid === "method:src/user.rs#User.create")).toBe(true);
+    expect(entities.some((entity) => entity.kind === "method" && entity.uid === "method:src/user.rs#User.private_name")).toBe(true);
+    expect(entities.some((entity) => entity.kind === "function" && entity.uid === "function:src/user.rs#top_level")).toBe(true);
+    expect(
+      relations.some(
+        (relation) => relation.kind === "contains" && relation.from === "type:src/user.rs#User" && relation.to === "method:src/user.rs#User.create"
+      )
+    ).toBe(true);
+  });
 });

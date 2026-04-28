@@ -39,6 +39,26 @@ function cleanUseSpec(spec: string): string {
     .trim();
 }
 
+function visibilityFromPrefix(prefix: string | undefined): { public: boolean; visibility?: string } {
+  if (!prefix) {
+    return { public: false };
+  }
+  const visibility = prefix.trim();
+  return { public: visibility === "pub", visibility };
+}
+
+function stripGenerics(input: string): string {
+  return input.replace(/<[^<>]*>/g, "").trim();
+}
+
+function countBraces(line: string): { open: number; close: number } {
+  const withoutStrings = line.replace(/"(?:\\.|[^"])*"/g, "");
+  return {
+    open: [...withoutStrings].filter((char) => char === "{").length,
+    close: [...withoutStrings].filter((char) => char === "}").length
+  };
+}
+
 function resolveUsePath(filePath: string, spec: string): { path: string; confidence: number } | undefined {
   const clean = cleanUseSpec(spec);
   if (!clean) {
@@ -94,12 +114,16 @@ export class RustLanguageAdapter implements LanguageAdapter {
     const fileUid = buildUid("file", filePath);
 
     const lines = content.split("\n");
-    const implStack: string[] = [];
+    const implStack: { target: string; trait?: string; depth: number }[] = [];
+    let braceDepth = 0;
     for (let index = 0; index < lines.length; index += 1) {
       const raw = lines[index];
       const line = raw.trim();
+      while (implStack.length > 0 && braceDepth < implStack.at(-1)!.depth) {
+        implStack.pop();
+      }
 
-      const modMatch = line.match(/^(pub\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;?$/);
+      const modMatch = line.match(/^(pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;?$/);
       if (modMatch) {
         const name = modMatch[2];
         const resolvedMod = resolveModDeclaration(filePath, name);
@@ -112,7 +136,7 @@ export class RustLanguageAdapter implements LanguageAdapter {
           language: "rust",
           startLine: index + 1,
           endLine: index + 1,
-          metadata: { rustKind: "module", modulePath: resolvedMod.path, public: Boolean(modMatch[1]) },
+          metadata: { rustKind: "module", modulePath: resolvedMod.path, ...visibilityFromPrefix(modMatch[1]) },
           confidence: 0.93,
           provenance: prov(0.93, "mod declaration"),
           createdAt: now,
@@ -160,7 +184,7 @@ export class RustLanguageAdapter implements LanguageAdapter {
         }
       }
 
-      const structMatch = line.match(/^(pub\s+)?struct\s+([A-Za-z_][A-Za-z0-9_]*)/);
+      const structMatch = line.match(/^(pub(?:\([^)]*\))?\s+)?struct\s+([A-Za-z_][A-Za-z0-9_]*)/);
       if (structMatch) {
         const name = structMatch[2];
         entities.push({
@@ -171,7 +195,7 @@ export class RustLanguageAdapter implements LanguageAdapter {
           language: "rust",
           startLine: index + 1,
           endLine: index + 1,
-          metadata: { rustKind: "struct", public: Boolean(structMatch[1]) },
+          metadata: { rustKind: "struct", ...visibilityFromPrefix(structMatch[1]) },
           confidence: 0.94,
           provenance: prov(0.94, "struct declaration"),
           createdAt: now,
@@ -179,7 +203,7 @@ export class RustLanguageAdapter implements LanguageAdapter {
         });
       }
 
-      const enumMatch = line.match(/^(pub\s+)?enum\s+([A-Za-z_][A-Za-z0-9_]*)/);
+      const enumMatch = line.match(/^(pub(?:\([^)]*\))?\s+)?enum\s+([A-Za-z_][A-Za-z0-9_]*)/);
       if (enumMatch) {
         const name = enumMatch[2];
         entities.push({
@@ -190,7 +214,7 @@ export class RustLanguageAdapter implements LanguageAdapter {
           language: "rust",
           startLine: index + 1,
           endLine: index + 1,
-          metadata: { rustKind: "enum", public: Boolean(enumMatch[1]) },
+          metadata: { rustKind: "enum", ...visibilityFromPrefix(enumMatch[1]) },
           confidence: 0.94,
           provenance: prov(0.94, "enum declaration"),
           createdAt: now,
@@ -198,7 +222,7 @@ export class RustLanguageAdapter implements LanguageAdapter {
         });
       }
 
-      const traitMatch = line.match(/^(pub\s+)?trait\s+([A-Za-z_][A-Za-z0-9_]*)/);
+      const traitMatch = line.match(/^(pub(?:\([^)]*\))?\s+)?trait\s+([A-Za-z_][A-Za-z0-9_]*)/);
       if (traitMatch) {
         const name = traitMatch[2];
         entities.push({
@@ -209,7 +233,7 @@ export class RustLanguageAdapter implements LanguageAdapter {
           language: "rust",
           startLine: index + 1,
           endLine: index + 1,
-          metadata: { rustKind: "trait", public: Boolean(traitMatch[1]) },
+          metadata: { rustKind: "trait", ...visibilityFromPrefix(traitMatch[1]) },
           confidence: 0.94,
           provenance: prov(0.94, "trait declaration"),
           createdAt: now,
@@ -217,11 +241,13 @@ export class RustLanguageAdapter implements LanguageAdapter {
         });
       }
 
-      const implMatch = line.match(/^impl(?:\s+([A-Za-z_][A-Za-z0-9_]*))?\s*(?:for\s+)?([A-Za-z_][A-Za-z0-9_]*)/);
+      const implMatch = line.match(/^impl(?:\s*<[^>]+>)?\s+(.+?)\s*\{/);
       if (implMatch) {
-        const maybeTrait = implMatch[1];
-        const target = implMatch[2];
-        implStack.push(target);
+        const implHead = stripGenerics(implMatch[1]!.replace(/\s+where\s+.*$/, ""));
+        const forMatch = implHead.match(/^(.+?)\s+for\s+(.+)$/);
+        const maybeTrait = forMatch ? stripGenerics(forMatch[1]!).split(/\s+/).pop() : undefined;
+        const target = stripGenerics(forMatch ? forMatch[2]! : implHead).split(/\s+/).pop()!;
+        implStack.push({ target, trait: maybeTrait, depth: braceDepth + 1 });
         const implName = maybeTrait ? `impl ${maybeTrait} for ${target}` : `impl ${target}`;
         const implUid = buildUid("unknown", filePath, implName);
         entities.push({
@@ -249,10 +275,10 @@ export class RustLanguageAdapter implements LanguageAdapter {
         }
       }
 
-      const fnMatch = line.match(/^(pub\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)/);
+      const fnMatch = line.match(/^(pub(?:\([^)]*\))?\s+)?(?:(?:async|const|unsafe)\s+)*(?:extern\s+"[^"]+"\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)/);
       if (fnMatch) {
         const name = fnMatch[2];
-        const owner = implStack.at(-1);
+        const owner = implStack.at(-1)?.target;
         const isMethod = Boolean(owner);
         const uid = isMethod
           ? buildUid("method", filePath, `${owner}.${name}`)
@@ -265,17 +291,25 @@ export class RustLanguageAdapter implements LanguageAdapter {
           language: "rust",
           startLine: index + 1,
           endLine: index + 1,
-          metadata: { public: Boolean(fnMatch[1]), owner },
+          metadata: { ...visibilityFromPrefix(fnMatch[1]), owner },
           confidence: 0.93,
           provenance: prov(0.93, isMethod ? "impl method" : "function declaration"),
           createdAt: now,
           updatedAt: now
         });
+        if (owner) {
+          relations.push({
+            from: buildUid("type", filePath, owner),
+            to: uid,
+            kind: "contains",
+            confidence: 0.95,
+            provenance: prov(0.95, "impl contains method")
+          });
+        }
       }
 
-      if (line.startsWith("}")) {
-        implStack.pop();
-      }
+      const braces = countBraces(line);
+      braceDepth += braces.open - braces.close;
     }
 
     for (const entity of entities) {
