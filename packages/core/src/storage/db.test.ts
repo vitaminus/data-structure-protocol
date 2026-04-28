@@ -68,7 +68,7 @@ describe("DSPDatabase", () => {
   it("exports a protocol-compatible plain text graph", () => {
     const now = stableNowIso();
     const fileUid = buildUid("file", "src/auth.ts");
-    const fnUid = buildUid("function", "src/auth.ts", "login");
+    const fnUid = "func-1234abcd";
     db.upsertEntity({
       uid: fileUid,
       kind: "file",
@@ -102,7 +102,7 @@ describe("DSPDatabase", () => {
     const protocolDir = path.join(tempDir, ".dsp", "protocol");
     const uidMap = JSON.parse(fs.readFileSync(path.join(protocolDir, "uid-map.json"), "utf8")) as Record<string, string>;
     expect(uidMap[fileUid]).toMatch(/^obj-/);
-    expect(uidMap[fnUid]).toMatch(/^func-/);
+    expect(uidMap[fnUid]).toBe(fnUid);
     expect(fs.existsSync(path.join(protocolDir, uidMap[fileUid]!, "description"))).toBe(true);
     expect(fs.readFileSync(path.join(protocolDir, "TOC"), "utf8")).toContain(uidMap[fileUid]!);
   });

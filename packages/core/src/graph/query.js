@@ -1,6 +1,6 @@
 import { buildUid, normalizePath } from "./uid.js";
 export function findEntityByUidOrPath(db, uidOrPath) {
-    if (uidOrPath.includes(":")) {
+    if (uidOrPath.includes(":") || /^(?:obj|func)-[0-9a-fA-F]{8}$/.test(uidOrPath)) {
         return db.getEntity(uidOrPath);
     }
     return db.getEntity(buildUid("file", normalizePath(uidOrPath)));

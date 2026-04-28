@@ -118,6 +118,76 @@ function dirEntitiesForFile(relPath: string, nowIso: string): Entity[] {
   return entities;
 }
 
+function stableMarkerPrefix(kind: Entity["kind"]): "obj" | "func" {
+  return ["function", "method", "route", "test"].includes(kind) ? "func" : "obj";
+}
+
+function stableMarkersFromContent(content: string): { uid: string; line: number }[] {
+  return content
+    .split("\n")
+    .flatMap((line, index) => {
+      const match = line.match(/@dsp\s+((?:obj|func)-[0-9a-fA-F]{8})\b/);
+      return match ? [{ uid: match[1]!, line: index + 1 }] : [];
+    });
+}
+
+function applyStableMarkers(
+  content: string,
+  entities: Entity[],
+  relations: Relation[]
+): { entities: Entity[]; relations: Relation[] } {
+  const markers = stableMarkersFromContent(content);
+  if (markers.length === 0) {
+    return { entities, relations };
+  }
+
+  const sortedEntities = [...entities]
+    .filter((entity) => entity.startLine !== undefined)
+    .sort((a, b) => (a.startLine ?? 0) - (b.startLine ?? 0));
+  const usedEntityUids = new Set<string>();
+  const uidMap = new Map<string, string>();
+
+  for (const marker of markers) {
+    const expectedPrefix = marker.uid.startsWith("func-") ? "func" : "obj";
+    const entity = sortedEntities.find(
+      (candidate) =>
+        !usedEntityUids.has(candidate.uid) &&
+        (candidate.startLine ?? 0) > marker.line &&
+        stableMarkerPrefix(candidate.kind) === expectedPrefix
+    );
+    if (!entity) {
+      continue;
+    }
+    usedEntityUids.add(entity.uid);
+    uidMap.set(entity.uid, marker.uid);
+  }
+
+  if (uidMap.size === 0) {
+    return { entities, relations };
+  }
+
+  return {
+    entities: entities.map((entity) =>
+      uidMap.has(entity.uid)
+        ? {
+            ...entity,
+            uid: uidMap.get(entity.uid)!,
+            metadata: {
+              ...(entity.metadata ?? {}),
+              structuralUid: entity.uid,
+              stableUidSource: "source-marker"
+            }
+          }
+        : entity
+    ),
+    relations: relations.map((relation) => ({
+      ...relation,
+      from: uidMap.get(relation.from) ?? relation.from,
+      to: uidMap.get(relation.to) ?? relation.to
+    }))
+  };
+}
+
 function containsRelations(fileUid: string, entities: Entity[], nowIso: string): Relation[] {
   return entities
     .filter((entity) => entity.uid !== fileUid)
@@ -306,11 +376,13 @@ export async function indexRepository(
       }
 
       const parsed = await adapter.parseFile(relPath, content);
-      const extractedEntities = adapter.extractEntities(parsed);
-      const extractedRelations = canonicalizeFileRelations(
-        adapter.extractRelations(parsed, extractedEntities),
-        availableRelPaths
+      const extracted = applyStableMarkers(
+        content,
+        adapter.extractEntities(parsed),
+        adapter.extractRelations(parsed, adapter.extractEntities(parsed))
       );
+      const extractedEntities = extracted.entities;
+      const extractedRelations = canonicalizeFileRelations(extracted.relations, availableRelPaths);
       const unresolved = parsed.unresolvedReferences ?? [];
       const nowIso = stableNowIso();
 

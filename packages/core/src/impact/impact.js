@@ -9,7 +9,7 @@ const IMPACT_KINDS = new Set([
     "exports"
 ]);
 export function resolveTargetUid(target) {
-    if (target.includes(":")) {
+    if (target.includes(":") || /^(?:obj|func)-[0-9a-fA-F]{8}$/.test(target)) {
         return target;
     }
     return buildUid("file", normalizePath(target));

@@ -61,6 +61,42 @@ describe("indexer", () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
+  it("uses @dsp source markers as stable canonical entity UIDs", async () => {
+    fs.writeFileSync(
+      path.join(tempDir, "src", "a.ts"),
+      "// @dsp func-1234abcd\nexport function demo() {}\n",
+      "utf8"
+    );
+    class MarkedAdapter extends MockAdapter {
+      override async parseFile(filePath: string): Promise<ParseResult> {
+        const now = stableNowIso();
+        return {
+          entities: [
+            {
+              uid: buildUid("function", filePath, "demo"),
+              kind: "function",
+              name: "demo",
+              path: filePath,
+              language: "typescript",
+              startLine: 2,
+              confidence: 1,
+              provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+              createdAt: now,
+              updatedAt: now
+            }
+          ],
+          relations: [],
+          unresolvedReferences: []
+        };
+      }
+    }
+
+    await indexRepository(db, [new MarkedAdapter()], { rootDir: tempDir, full: true }, DEFAULT_CONFIG);
+    expect(db.getEntity("func-1234abcd")?.metadata?.structuralUid).toBe(buildUid("function", "src/a.ts", "demo"));
+    expect(db.getEntity(buildUid("function", "src/a.ts", "demo"))).toBeUndefined();
+    expect(db.getRelationsFrom(buildUid("file", "src/a.ts")).some((relation) => relation.to === "func-1234abcd")).toBe(true);
+  });
+
   it("includes Rust Cargo manifests in repository indexing", async () => {
     fs.writeFileSync(path.join(tempDir, "Cargo.toml"), "[package]\nname = 'demo'\n", "utf8");
     class CargoAdapter extends MockAdapter {

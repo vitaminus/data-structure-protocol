@@ -3,7 +3,7 @@ import type { Entity, Relation } from "./types.js";
 import { buildUid, normalizePath } from "./uid.js";
 
 export function findEntityByUidOrPath(db: DSPDatabase, uidOrPath: string): Entity | undefined {
-  if (uidOrPath.includes(":")) {
+  if (uidOrPath.includes(":") || /^(?:obj|func)-[0-9a-fA-F]{8}$/.test(uidOrPath)) {
     return db.getEntity(uidOrPath);
   }
   return db.getEntity(buildUid("file", normalizePath(uidOrPath)));

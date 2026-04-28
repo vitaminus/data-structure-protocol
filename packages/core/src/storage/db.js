@@ -11,6 +11,9 @@ function fromJson(value) {
     return value ? JSON.parse(value) : null;
 }
 function protocolUidForEntity(entity) {
+    if (/^(?:obj|func)-[0-9a-fA-F]{8}$/.test(entity.uid)) {
+        return entity.uid;
+    }
     const prefix = ["function", "method", "route", "test"].includes(entity.kind) ? "func" : "obj";
     const hash = createHash("sha1").update(entity.uid).digest("hex").slice(0, 8);
     return `${prefix}-${hash}`;

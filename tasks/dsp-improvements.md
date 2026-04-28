@@ -271,3 +271,11 @@ Status: done
 - Add macOS/Linux and Windows installers with dependency install, build, DSP init, and optional pre-commit hook setup.
 - Install Codex, Claude, and Cursor agent guidance files at project or global scope.
 - Add reusable integration templates and README install instructions.
+
+## 35. Support stable source marker UIDs
+
+Status: done
+
+- Detect optional `@dsp obj-xxxxxxxx` / `@dsp func-xxxxxxxx` source markers during indexing.
+- Promote marked entities to stable canonical UIDs and rewrite extracted relation endpoints.
+- Teach query/impact/protocol export paths to accept protocol-style stable UIDs directly.
