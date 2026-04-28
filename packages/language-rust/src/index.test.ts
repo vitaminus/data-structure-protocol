@@ -13,6 +13,36 @@ describe("rust adapter", () => {
     }
   });
 
+  it("indexes Cargo manifests with crates, workspace members and dependencies", async () => {
+    const adapter = new RustLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "Cargo.toml",
+      `
+[package]
+name = "demo-crate"
+version = "0.1.0"
+
+[workspace]
+members = ["crates/api", "crates/core"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tokio = "1"
+
+[dev-dependencies]
+pretty_assertions = "1"
+`
+    );
+    expect(parsed.entities.some((entity) => entity.uid === "module:Cargo.toml#demo-crate")).toBe(true);
+    expect(parsed.entities.some((entity) => entity.uid === "module:crates/api")).toBe(true);
+    expect(parsed.entities.some((entity) => entity.uid === "unknown:external/rust-crates#serde")).toBe(true);
+    expect(
+      parsed.relations.some(
+        (relation) => relation.kind === "depends_on" && relation.to === "unknown:external/rust-crates#pretty_assertions"
+      )
+    ).toBe(true);
+  });
+
   it("extracts rust entities and use imports", async () => {
     const adapter = new RustLanguageAdapter();
     const parsed = await adapter.parseFile(

@@ -112,6 +112,64 @@ function countBraces(line: string): { open: number; close: number } {
   };
 }
 
+type CargoDependency = {
+  name: string;
+  requirement?: string;
+  section: string;
+  line: number;
+};
+
+type CargoManifest = {
+  packageName?: string;
+  workspaceMembers: { path: string; line: number }[];
+  dependencies: CargoDependency[];
+};
+
+function parseCargoManifest(content: string): CargoManifest {
+  let section = "";
+  let packageName: string | undefined;
+  const dependencies: CargoDependency[] = [];
+  const workspaceMembers: { path: string; line: number }[] = [];
+  const lines = content.split("\n");
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!.trim();
+    const sectionMatch = line.match(/^\[([^\]]+)\]/);
+    if (sectionMatch) {
+      section = sectionMatch[1]!;
+      continue;
+    }
+    if (section === "package") {
+      const nameMatch = line.match(/^name\s*=\s*["']([^"']+)["']/);
+      if (nameMatch) {
+        packageName = nameMatch[1];
+      }
+    }
+    if (section === "workspace") {
+      const membersMatch = line.match(/^members\s*=\s*\[(.*)\]/);
+      if (membersMatch) {
+        for (const member of membersMatch[1]!.split(",").map((item) => item.trim().replace(/^['\"]|['\"]$/g, "")).filter(Boolean)) {
+          workspaceMembers.push({ path: member, line: index + 1 });
+        }
+      }
+    }
+    if (["dependencies", "dev-dependencies", "build-dependencies"].includes(section)) {
+      const depMatch = line.match(/^([A-Za-z0-9_-]+)\s*=\s*(.+)$/);
+      if (depMatch) {
+        const rawRequirement = depMatch[2]!.trim();
+        const quoted = rawRequirement.match(/^["']([^"']+)["']/);
+        const version = rawRequirement.match(/version\s*=\s*["']([^"']+)["']/);
+        dependencies.push({
+          name: depMatch[1]!,
+          requirement: quoted?.[1] ?? version?.[1] ?? rawRequirement,
+          section,
+          line: index + 1
+        });
+      }
+    }
+  }
+  return { packageName, workspaceMembers, dependencies };
+}
+
 function resolveUsePath(filePath: string, spec: string): { path: string; confidence: number } | undefined {
   const clean = cleanUseSpec(spec);
   if (!clean) {
@@ -156,7 +214,7 @@ export class RustLanguageAdapter implements LanguageAdapter {
   language = "rust";
 
   canHandle(filePath: string): boolean {
-    return path.extname(filePath).toLowerCase() === ".rs";
+    return path.extname(filePath).toLowerCase() === ".rs" || path.basename(filePath) === "Cargo.toml";
   }
 
   async parseFile(filePath: string, content: string): Promise<ParseResult> {
@@ -165,6 +223,69 @@ export class RustLanguageAdapter implements LanguageAdapter {
     const relations: Relation[] = [];
     const unresolvedReferences: UnresolvedReference[] = [];
     const fileUid = buildUid("file", filePath);
+
+    if (path.basename(filePath) === "Cargo.toml") {
+      const manifest = parseCargoManifest(content);
+      if (manifest.packageName) {
+        const crateUid = buildUid("module", filePath, manifest.packageName);
+        entities.push({
+          uid: crateUid,
+          kind: "module",
+          name: manifest.packageName,
+          path: filePath,
+          language: "rust",
+          confidence: 0.92,
+          provenance: prov(0.92, "cargo package"),
+          metadata: { rustKind: "crate", cargo: true },
+          createdAt: now,
+          updatedAt: now
+        });
+        relations.push({ from: fileUid, to: crateUid, kind: "contains", confidence: 1, provenance: prov(1, "cargo contains package") });
+      }
+      for (const member of manifest.workspaceMembers) {
+        const uid = buildUid("module", member.path);
+        entities.push({
+          uid,
+          kind: "module",
+          name: member.path,
+          path: member.path,
+          language: "rust",
+          startLine: member.line,
+          endLine: member.line,
+          confidence: 0.86,
+          provenance: prov(0.86, "cargo workspace member"),
+          metadata: { rustKind: "workspace-member" },
+          createdAt: now,
+          updatedAt: now
+        });
+        relations.push({ from: fileUid, to: uid, kind: "contains", confidence: 0.86, provenance: prov(0.86, "cargo workspace member") });
+      }
+      for (const dep of manifest.dependencies) {
+        const uid = buildUid("unknown", "external/rust-crates", dep.name);
+        entities.push({
+          uid,
+          kind: "unknown",
+          name: dep.name,
+          language: "rust",
+          startLine: dep.line,
+          endLine: dep.line,
+          confidence: 0.9,
+          provenance: prov(0.9, "cargo dependency"),
+          metadata: { rustKind: "crate-dependency", requirement: dep.requirement, section: dep.section, external: true },
+          createdAt: now,
+          updatedAt: now
+        });
+        relations.push({
+          from: fileUid,
+          to: uid,
+          kind: "depends_on",
+          reason: `${dep.section} ${dep.name}${dep.requirement ? ` ${dep.requirement}` : ""}`,
+          confidence: 0.9,
+          provenance: prov(0.9, "cargo dependency")
+        });
+      }
+      return { entities, relations, unresolvedReferences };
+    }
 
     const lines = content.split("\n");
     const implStack: { target: string; trait?: string; depth: number }[] = [];

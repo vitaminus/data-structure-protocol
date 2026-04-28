@@ -23,7 +23,7 @@ function languageFromFile(filePath: string): string | undefined {
   if (ext === ".py") {
     return "python";
   }
-  if (ext === ".rs") {
+  if (ext === ".rs" || basename === "Cargo.toml") {
     return "rust";
   }
   if (ext === ".rb" || basename === "Gemfile" || basename === "Gemfile.lock") {

@@ -207,3 +207,11 @@ Status: done
 - Detect `.test.ts`, `.spec.ts`, `.test.tsx`, `.spec.tsx`, and `__tests__` path conventions.
 - Add TypeScript `test` entities from adapter-level parsing.
 - Add `tests` relations from test files to conventional implementation files.
+
+## 27. Add Cargo manifest awareness
+
+Status: done
+
+- Include `Cargo.toml` in Rust repository indexing.
+- Extract package crates, workspace members, and Cargo dependencies.
+- Add external crate dependency entities and `depends_on` relations from manifests.

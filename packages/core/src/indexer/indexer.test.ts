@@ -61,6 +61,20 @@ describe("indexer", () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
+  it("includes Rust Cargo manifests in repository indexing", async () => {
+    fs.writeFileSync(path.join(tempDir, "Cargo.toml"), "[package]\nname = 'demo'\n", "utf8");
+    class CargoAdapter extends MockAdapter {
+      override language = "rust";
+      override canHandle(filePath: string): boolean {
+        return filePath === "Cargo.toml";
+      }
+    }
+
+    const summary = await indexRepository(db, [new CargoAdapter()], { rootDir: tempDir }, DEFAULT_CONFIG);
+    expect(summary.languages).toContain("rust");
+    expect(db.getEntity(buildUid("file", "Cargo.toml"))).toBeDefined();
+  });
+
   it("includes Ruby Bundler files in repository indexing", async () => {
     fs.writeFileSync(path.join(tempDir, "Gemfile"), "gem 'rails'\n", "utf8");
     class GemfileAdapter extends MockAdapter {
