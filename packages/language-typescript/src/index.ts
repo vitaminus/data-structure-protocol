@@ -98,6 +98,7 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
     const entities: Entity[] = [];
     const relations: Relation[] = [];
     const unresolvedReferences: UnresolvedReference[] = [];
+    const callEdges: { from: string; name: string; line: number }[] = [];
     const fileUid = buildUid("file", filePath);
     const lang = inferKindFromFile(filePath);
 
@@ -110,6 +111,31 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
         confidence: 1,
         provenance: withProv(1, "file contains symbol")
       });
+    };
+
+    const collectCalls = (node: ts.Node | undefined, fromUid: string): void => {
+      if (!node) {
+        return;
+      }
+      const scan = (candidate: ts.Node): void => {
+        if (ts.isCallExpression(candidate)) {
+          const expression = candidate.expression;
+          const name = ts.isIdentifier(expression)
+            ? expression.text
+            : ts.isPropertyAccessExpression(expression)
+              ? expression.name.text
+              : undefined;
+          if (name) {
+            callEdges.push({
+              from: fromUid,
+              name,
+              line: source.getLineAndCharacterOfPosition(candidate.getStart()).line + 1
+            });
+          }
+        }
+        ts.forEachChild(candidate, scan);
+      };
+      scan(node);
     };
 
     const visit = (node: ts.Node): void => {
@@ -157,6 +183,7 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
           createdAt: now,
           updatedAt: now
         });
+        collectCalls(node.body, uid);
       }
 
       if (ts.isVariableStatement(node)) {
@@ -168,8 +195,9 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
           const name = declaration.name.text;
           const initializer = declaration.initializer;
           const isCallable = Boolean(initializer && (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer)));
+          const uid = buildUid(isCallable ? "function" : "constant", filePath, name);
           addEntity({
-            uid: buildUid(isCallable ? "function" : "constant", filePath, name),
+            uid,
             kind: isCallable ? "function" : "constant",
             name,
             path: filePath,
@@ -186,6 +214,9 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
             createdAt: now,
             updatedAt: now
           });
+          if (isCallable && initializer && (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer))) {
+            collectCalls(initializer.body, uid);
+          }
         }
       }
 
@@ -259,6 +290,7 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
               createdAt: now,
               updatedAt: now
             });
+            collectCalls(member.body, methodUid);
             relations.push({
               from: classUid,
               to: methodUid,
@@ -356,6 +388,35 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
           reason: `export ${entity.name}`,
           confidence: 0.98,
           provenance: withProv(0.98, "export declaration")
+        });
+      }
+    }
+
+    const callableTargets = new Map<string, Entity[]>();
+    for (const entity of entities.filter((candidate) => candidate.kind === "function" || candidate.kind === "method")) {
+      const bucket = callableTargets.get(entity.name) ?? [];
+      bucket.push(entity);
+      callableTargets.set(entity.name, bucket);
+    }
+    const callRelationKeys = new Set<string>();
+    for (const edge of callEdges) {
+      for (const target of callableTargets.get(edge.name) ?? []) {
+        if (target.uid === edge.from) {
+          continue;
+        }
+        const key = `${edge.from}\0${target.uid}\0${edge.line}`;
+        if (callRelationKeys.has(key)) {
+          continue;
+        }
+        callRelationKeys.add(key);
+        relations.push({
+          from: edge.from,
+          to: target.uid,
+          kind: "calls",
+          reason: `${edge.name}()`,
+          confidence: 0.68,
+          provenance: withProv(0.68, "same-file call heuristic"),
+          metadata: { line: edge.line }
         });
       }
     }

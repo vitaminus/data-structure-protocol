@@ -191,3 +191,11 @@ Status: done
 - Add `extends` relations for classes and interfaces.
 - Add `implements` relations for classes implementing interfaces.
 - Add coverage for class inheritance, class interface implementation, and interface inheritance.
+
+## 25. Add TypeScript same-file call relations
+
+Status: done
+
+- Track calls inside function declarations, arrow/function expressions, and class methods.
+- Add low-confidence same-file `calls` relations to matching function/method entities.
+- Add coverage for arrow functions and class methods calling a same-file function.

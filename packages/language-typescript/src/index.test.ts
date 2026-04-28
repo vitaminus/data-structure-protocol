@@ -34,6 +34,37 @@ describe("typescript adapter", () => {
     expect(relations.some((relation) => relation.kind === "exports")).toBe(true);
   });
 
+  it("adds same-file call relations for TypeScript callables", async () => {
+    const adapter = new TypeScriptLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "src/auth.ts",
+      `
+function hashPassword() { return "x"; }
+export const createUser = () => hashPassword();
+class AuthService {
+  login() { hashPassword(); }
+}
+`
+    );
+    const relations = adapter.extractRelations(parsed, parsed.entities);
+    expect(
+      relations.some(
+        (relation) =>
+          relation.kind === "calls" &&
+          relation.from === "function:src/auth.ts#createUser" &&
+          relation.to === "function:src/auth.ts#hashPassword"
+      )
+    ).toBe(true);
+    expect(
+      relations.some(
+        (relation) =>
+          relation.kind === "calls" &&
+          relation.from === "method:src/auth.ts#AuthService.login" &&
+          relation.to === "function:src/auth.ts#hashPassword"
+      )
+    ).toBe(true);
+  });
+
   it("extracts TypeScript extends and implements relations", async () => {
     const adapter = new TypeScriptLanguageAdapter();
     const parsed = await adapter.parseFile(
