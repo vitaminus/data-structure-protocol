@@ -231,3 +231,11 @@ Status: done
 - Detect route attributes such as `#[get("/path")]` and framework-qualified variants.
 - Detect simple Axum `Router::route("/path", get(handler))` patterns.
 - Add route entities and `routes_to` relations to handler functions.
+
+## 30. Capture Rust cfg feature metadata
+
+Status: done
+
+- Detect `#[cfg(feature = "...")]` and `#[cfg_attr(feature = "...", ...)]` attributes.
+- Attach feature-gate metadata to the next Rust item entity.
+- Add coverage for cfg-gated structs and functions.

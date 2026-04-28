@@ -90,6 +90,11 @@ function cleanUseSpec(spec: string): string {
     .trim();
 }
 
+function cfgFeaturesFromAttribute(line: string): string[] {
+  const features = [...line.matchAll(/feature\s*=\s*["']([^"']+)["']/g)].map((match) => match[1]!);
+  return [...new Set(features)];
+}
+
 function visibilityFromPrefix(prefix: string | undefined): { public: boolean; visibility?: string } {
   if (!prefix) {
     return { public: false };
@@ -353,10 +358,16 @@ export class RustLanguageAdapter implements LanguageAdapter {
     let pendingTestAttribute = false;
     let pendingCfgTestAttribute = false;
     let pendingDerives: string[] = [];
+    let pendingCfgFeatures: string[] = [];
     let pendingRouteAttributes: { method: string; routePath: string; line: number }[] = [];
     for (let index = 0; index < lines.length; index += 1) {
       const raw = lines[index];
       const line = raw.trim();
+      const cfgFeatures = cfgFeaturesFromAttribute(line);
+      if (cfgFeatures.length > 0) {
+        pendingCfgFeatures = [...new Set([...pendingCfgFeatures, ...cfgFeatures])];
+        continue;
+      }
       const routeAttrMatch = line.match(/^#\[(?:(?:actix_web|rocket)::)?(get|post|put|delete|patch)\(["']([^"']+)["']/);
       if (routeAttrMatch) {
         pendingRouteAttributes.push({ method: routeAttrMatch[1]!.toUpperCase(), routePath: routeAttrMatch[2]!, line: index + 1 });
@@ -390,7 +401,9 @@ export class RustLanguageAdapter implements LanguageAdapter {
         const name = modMatch[2];
         const resolvedMod = resolveModDeclaration(filePath, name);
         const isCfgTestModule = pendingCfgTestAttribute;
+        const cfgFeatures = pendingCfgFeatures;
         pendingCfgTestAttribute = false;
+        pendingCfgFeatures = [];
         const uid = buildUid(isCfgTestModule ? "test" : "module", filePath, name);
         entities.push({
           uid,
@@ -400,7 +413,7 @@ export class RustLanguageAdapter implements LanguageAdapter {
           language: "rust",
           startLine: index + 1,
           endLine: index + 1,
-          metadata: { rustKind: "module", modulePath: resolvedMod.path, cfgTest: isCfgTestModule, ...visibilityFromPrefix(modMatch[1]) },
+          metadata: { rustKind: "module", modulePath: resolvedMod.path, cfgTest: isCfgTestModule, cfgFeatures, ...visibilityFromPrefix(modMatch[1]) },
           confidence: 0.93,
           provenance: prov(0.93, "mod declaration"),
           createdAt: now,
@@ -491,6 +504,8 @@ export class RustLanguageAdapter implements LanguageAdapter {
       const structMatch = line.match(/^(pub(?:\([^)]*\))?\s+)?struct\s+([A-Za-z_][A-Za-z0-9_]*)/);
       if (structMatch) {
         const name = structMatch[2];
+        const cfgFeatures = pendingCfgFeatures;
+        pendingCfgFeatures = [];
         const typeUid = buildUid("type", filePath, name);
         entities.push({
           uid: typeUid,
@@ -500,7 +515,7 @@ export class RustLanguageAdapter implements LanguageAdapter {
           language: "rust",
           startLine: index + 1,
           endLine: index + 1,
-          metadata: { rustKind: "struct", ...visibilityFromPrefix(structMatch[1]) },
+          metadata: { rustKind: "struct", cfgFeatures, ...visibilityFromPrefix(structMatch[1]) },
           confidence: 0.94,
           provenance: prov(0.94, "struct declaration"),
           createdAt: now,
@@ -534,6 +549,8 @@ export class RustLanguageAdapter implements LanguageAdapter {
       const enumMatch = line.match(/^(pub(?:\([^)]*\))?\s+)?enum\s+([A-Za-z_][A-Za-z0-9_]*)/);
       if (enumMatch) {
         const name = enumMatch[2];
+        const cfgFeatures = pendingCfgFeatures;
+        pendingCfgFeatures = [];
         const typeUid = buildUid("type", filePath, name);
         entities.push({
           uid: typeUid,
@@ -543,7 +560,7 @@ export class RustLanguageAdapter implements LanguageAdapter {
           language: "rust",
           startLine: index + 1,
           endLine: index + 1,
-          metadata: { rustKind: "enum", ...visibilityFromPrefix(enumMatch[1]) },
+          metadata: { rustKind: "enum", cfgFeatures, ...visibilityFromPrefix(enumMatch[1]) },
           confidence: 0.94,
           provenance: prov(0.94, "enum declaration"),
           createdAt: now,
@@ -577,6 +594,8 @@ export class RustLanguageAdapter implements LanguageAdapter {
       const traitMatch = line.match(/^(pub(?:\([^)]*\))?\s+)?trait\s+([A-Za-z_][A-Za-z0-9_]*)/);
       if (traitMatch) {
         const name = traitMatch[2];
+        const cfgFeatures = pendingCfgFeatures;
+        pendingCfgFeatures = [];
         entities.push({
           uid: buildUid("interface", filePath, name),
           kind: "interface",
@@ -585,7 +604,7 @@ export class RustLanguageAdapter implements LanguageAdapter {
           language: "rust",
           startLine: index + 1,
           endLine: index + 1,
-          metadata: { rustKind: "trait", ...visibilityFromPrefix(traitMatch[1]) },
+          metadata: { rustKind: "trait", cfgFeatures, ...visibilityFromPrefix(traitMatch[1]) },
           confidence: 0.94,
           provenance: prov(0.94, "trait declaration"),
           createdAt: now,
@@ -633,7 +652,9 @@ export class RustLanguageAdapter implements LanguageAdapter {
         const owner = implStack.at(-1)?.target;
         const isMethod = Boolean(owner);
         const isTestFunction = pendingTestAttribute;
+        const cfgFeatures = pendingCfgFeatures;
         pendingTestAttribute = false;
+        pendingCfgFeatures = [];
         const entityKind = isTestFunction ? "test" : isMethod ? "method" : "function";
         const uid = isTestFunction
           ? buildUid("test", filePath, name)
@@ -648,7 +669,7 @@ export class RustLanguageAdapter implements LanguageAdapter {
           language: "rust",
           startLine: index + 1,
           endLine: index + 1,
-          metadata: { ...visibilityFromPrefix(fnMatch[1]), owner, rustTest: isTestFunction },
+          metadata: { ...visibilityFromPrefix(fnMatch[1]), owner, rustTest: isTestFunction, cfgFeatures },
           confidence: 0.93,
           provenance: prov(0.93, isMethod ? "impl method" : "function declaration"),
           createdAt: now,

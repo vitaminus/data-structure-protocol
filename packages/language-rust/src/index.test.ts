@@ -13,6 +13,23 @@ describe("rust adapter", () => {
     }
   });
 
+  it("records cfg feature metadata on Rust items", async () => {
+    const adapter = new RustLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "src/lib.rs",
+      `
+#[cfg(feature = "postgres")]
+pub struct PgStore {}
+
+#[cfg_attr(feature = "metrics", derive(Debug))]
+pub fn record_metric() {}
+`
+    );
+    const entities = adapter.extractEntities(parsed);
+    expect(entities.find((entity) => entity.name === "PgStore")?.metadata?.cfgFeatures).toEqual(["postgres"]);
+    expect(entities.find((entity) => entity.name === "record_metric")?.metadata?.cfgFeatures).toEqual(["metrics"]);
+  });
+
   it("extracts Rust web route handlers from attributes and axum routers", async () => {
     const adapter = new RustLanguageAdapter();
     const parsed = await adapter.parseFile(
