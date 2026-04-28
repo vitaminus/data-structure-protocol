@@ -16,6 +16,22 @@ It builds a deterministic structural-semantic graph of a repository, keeps it in
 - DSP v2 is deterministic first (AST/parser graph), then optional semantic ranking.
 - Every claim stores provenance and confidence.
 
+## Install
+
+macOS/Linux:
+
+```bash
+./install.sh --agent all --with-hooks
+```
+
+Windows PowerShell:
+
+```powershell
+.\install.ps1 -Agent all -WithHooks
+```
+
+Installers can also write only one agent integration (`--agent cursor|claude|codex`) or user-level guidance (`--global`).
+
 ## 5-minute start
 
 ```bash
@@ -30,6 +46,7 @@ pnpm dsp search "user authentication"
 pnpm dsp impact src/auth/AuthService.ts
 pnpm dsp validate
 pnpm dsp export --format dsp
+pnpm dsp export --format protocol
 ```
 
 ## Core capabilities

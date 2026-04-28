@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=dsp-hook-lib.sh
+source "$SCRIPT_DIR/dsp-hook-lib.sh"
+
+if [[ "${DSP_HOOK_SKIP:-0}" == "1" ]]; then
+  echo "DSP: hook skipped via DSP_HOOK_SKIP=1"
+  exit 0
+fi
+
+echo "DSP: running pre-push validation"
+_dsp_cmd validate "$DSP_ROOT" --json > "$DSP_JSON_DIR/validate-pre-push.json"
+errors=$(_dsp_validation_error_count "$DSP_JSON_DIR/validate-pre-push.json")
+if [[ "$errors" != "0" ]]; then
+  echo "DSP: pre-push validation failed with $errors error(s)" >&2
+  _dsp_json_pretty_print "$DSP_JSON_DIR/validate-pre-push.json"
+  exit 1
+fi
+
+if [[ "${DSP_HOOK_EXPORT_PROTOCOL:-1}" == "1" ]]; then
+  echo "DSP: refreshing plain-text protocol export"
+  _dsp_cmd export "$DSP_ROOT" --format protocol --json > "$DSP_JSON_DIR/export-protocol.json"
+fi
+
+if [[ "${DSP_HOOK_RUN_TESTS:-0}" == "1" ]]; then
+  echo "DSP: running test suite via pnpm test"
+  (cd "$DSP_ROOT" && pnpm test)
+fi
+
+echo "DSP: pre-push passed"

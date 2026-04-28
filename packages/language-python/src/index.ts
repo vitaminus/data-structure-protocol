@@ -35,7 +35,7 @@ class Visitor(ast.NodeVisitor):
             imports.append(alias.name)
         self.generic_visit(node)
     def visit_ImportFrom(self, node):
-        mod = node.module or ""
+        mod = "." * node.level + (node.module or "")
         imports.append(mod)
         self.generic_visit(node)
     def visit_FunctionDef(self, node):

@@ -1,7 +1,161 @@
-import { describe, expect, it } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import { RustLanguageAdapter } from "./index.js";
 
 describe("rust adapter", () => {
+  const cleanupDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of cleanupDirs.splice(0)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("adds imported function call relations from use paths", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "dsp-rust-imported-call-"));
+    cleanupDirs.push(tempDir);
+    const oldCwd = process.cwd();
+    fs.mkdirSync(path.join(tempDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, "src", "crypto.rs"), "pub fn hash_password() {}\n", "utf8");
+
+    try {
+      process.chdir(tempDir);
+      const adapter = new RustLanguageAdapter();
+      const parsed = await adapter.parseFile(
+        "src/auth.rs",
+        `
+use crate::crypto::hash_password;
+
+pub fn create_user() {
+    hash_password();
+}
+`
+      );
+      const relations = adapter.extractRelations(parsed, parsed.entities);
+      expect(
+        relations.some(
+          (relation) =>
+            relation.kind === "calls" &&
+            relation.from === "function:src/auth.rs#create_user" &&
+            relation.to === "function:src/crypto.rs#hash_password"
+        )
+      ).toBe(true);
+    } finally {
+      process.chdir(oldCwd);
+    }
+  });
+
+  it("extracts macro_rules declarations and same-file macro calls", async () => {
+    const adapter = new RustLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "src/lib.rs",
+      `
+macro_rules! make_user { () => {} }
+
+fn create() {
+    make_user!();
+}
+`
+    );
+    const entities = adapter.extractEntities(parsed);
+    const relations = adapter.extractRelations(parsed, entities);
+    expect(entities.some((entity) => entity.uid === "function:src/lib.rs#make_user" && entity.metadata?.rustKind === "macro_rules")).toBe(true);
+    expect(
+      relations.some(
+        (relation) =>
+          relation.kind === "calls" &&
+          relation.from === "function:src/lib.rs#create" &&
+          relation.to === "function:src/lib.rs#make_user"
+      )
+    ).toBe(true);
+  });
+
+  it("records cfg feature metadata on Rust items", async () => {
+    const adapter = new RustLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "src/lib.rs",
+      `
+#[cfg(feature = "postgres")]
+pub struct PgStore {}
+
+#[cfg_attr(feature = "metrics", derive(Debug))]
+pub fn record_metric() {}
+`
+    );
+    const entities = adapter.extractEntities(parsed);
+    expect(entities.find((entity) => entity.name === "PgStore")?.metadata?.cfgFeatures).toEqual(["postgres"]);
+    expect(entities.find((entity) => entity.name === "record_metric")?.metadata?.cfgFeatures).toEqual(["metrics"]);
+  });
+
+  it("extracts Rust web route handlers from attributes and axum routers", async () => {
+    const adapter = new RustLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "src/routes.rs",
+      `
+#[get("/users")]
+async fn list_users() {}
+
+fn router() {
+    Router::new().route("/health", get(health));
+}
+
+fn health() {}
+`
+    );
+    const relations = adapter.extractRelations(parsed, parsed.entities);
+    expect(parsed.entities.some((entity) => entity.kind === "route" && entity.uid === "route:src/routes.rs#GET /users")).toBe(true);
+    expect(
+      relations.some(
+        (relation) => relation.kind === "routes_to" && relation.to === "function:src/routes.rs#list_users"
+      )
+    ).toBe(true);
+    expect(
+      relations.some((relation) => relation.kind === "routes_to" && relation.to === "function:src/routes.rs#health")
+    ).toBe(true);
+  });
+
+  it("links Cargo integration tests, examples, benches and bins to crate root", async () => {
+    const adapter = new RustLanguageAdapter();
+    const testParsed = await adapter.parseFile("tests/auth_flow.rs", "#[test]\nfn auth_flow() {}\n");
+    const exampleParsed = await adapter.parseFile("examples/demo.rs", "fn main() {}\n");
+    expect(testParsed.entities.some((entity) => entity.kind === "test" && entity.uid === "test:tests/auth_flow.rs")).toBe(true);
+    expect(testParsed.relations.some((relation) => relation.kind === "tests" && relation.to === "file:src/lib.rs")).toBe(true);
+    expect(exampleParsed.entities.some((entity) => entity.kind === "module" && entity.metadata?.rustKind === "example")).toBe(true);
+    expect(exampleParsed.relations.some((relation) => relation.kind === "depends_on" && relation.to === "file:src/lib.rs")).toBe(true);
+  });
+
+  it("indexes Cargo manifests with crates, workspace members and dependencies", async () => {
+    const adapter = new RustLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "Cargo.toml",
+      `
+[package]
+name = "demo-crate"
+version = "0.1.0"
+
+[workspace]
+members = ["crates/api", "crates/core"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tokio = "1"
+
+[dev-dependencies]
+pretty_assertions = "1"
+`
+    );
+    expect(parsed.entities.some((entity) => entity.uid === "module:Cargo.toml#demo-crate")).toBe(true);
+    expect(parsed.entities.some((entity) => entity.uid === "module:crates/api")).toBe(true);
+    expect(parsed.entities.some((entity) => entity.uid === "unknown:external/rust-crates#serde")).toBe(true);
+    expect(
+      parsed.relations.some(
+        (relation) => relation.kind === "depends_on" && relation.to === "unknown:external/rust-crates#pretty_assertions"
+      )
+    ).toBe(true);
+  });
+
   it("extracts rust entities and use imports", async () => {
     const adapter = new RustLanguageAdapter();
     const parsed = await adapter.parseFile(
@@ -26,5 +180,163 @@ use crate::db::repo;
     expect(entities.some((entity) => entity.kind === "method")).toBe(true);
     expect(relations.some((relation) => relation.kind === "imports")).toBe(true);
     expect(relations.some((relation) => relation.kind === "implements")).toBe(true);
+  });
+
+  it("resolves sibling modules and crate uses to existing Rust files", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "dsp-rust-adapter-"));
+    cleanupDirs.push(tempDir);
+    const oldCwd = process.cwd();
+    fs.mkdirSync(path.join(tempDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, "src", "user.rs"), "pub struct User;\n", "utf8");
+
+    try {
+      process.chdir(tempDir);
+      const adapter = new RustLanguageAdapter();
+      const parsed = await adapter.parseFile(
+        "src/lib.rs",
+        `
+pub mod user;
+use user::User;
+use crate::user::User as CrateUser;
+`
+      );
+      const relations = adapter.extractRelations(parsed, parsed.entities);
+      const imports = relations.filter((relation) => relation.kind === "imports").map((relation) => relation.to);
+      expect(imports).toContain("file:src/user.rs");
+      expect(parsed.unresolvedReferences ?? []).toHaveLength(0);
+    } finally {
+      process.chdir(oldCwd);
+    }
+  });
+
+  it("expands grouped use trees before resolving module files", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "dsp-rust-use-tree-"));
+    cleanupDirs.push(tempDir);
+    const oldCwd = process.cwd();
+    fs.mkdirSync(path.join(tempDir, "src", "db"), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, "src", "db", "mod.rs"), "pub struct Repo;\n", "utf8");
+    fs.writeFileSync(path.join(tempDir, "src", "user.rs"), "pub struct User;\n", "utf8");
+
+    try {
+      process.chdir(tempDir);
+      const adapter = new RustLanguageAdapter();
+      const parsed = await adapter.parseFile(
+        "src/lib.rs",
+        `
+use crate::{db::Repo, user::User};
+`
+      );
+      const imports = adapter
+        .extractRelations(parsed, parsed.entities)
+        .filter((relation) => relation.kind === "imports")
+        .map((relation) => relation.to);
+      expect(imports).toContain("file:src/db/mod.rs");
+      expect(imports).toContain("file:src/user.rs");
+    } finally {
+      process.chdir(oldCwd);
+    }
+  });
+
+  it("maps derive attributes to implemented external traits", async () => {
+    const adapter = new RustLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "src/user.rs",
+      `
+#[derive(Debug, Clone)]
+pub struct User {}
+`
+    );
+    const entities = adapter.extractEntities(parsed);
+    const relations = adapter.extractRelations(parsed, entities);
+    expect(entities.some((entity) => entity.kind === "interface" && entity.uid === "interface:external/rust#Debug")).toBe(true);
+    expect(
+      relations.some(
+        (relation) =>
+          relation.kind === "implements" &&
+          relation.from === "type:src/user.rs#User" &&
+          relation.to === "interface:external/rust#Clone"
+      )
+    ).toBe(true);
+  });
+
+  it("adds same-file call relations for Rust functions", async () => {
+    const adapter = new RustLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "src/lib.rs",
+      `
+fn hash_password() -> String {
+    String::new()
+}
+
+pub fn create_user() {
+    hash_password();
+}
+`
+    );
+    const relations = adapter.extractRelations(parsed, parsed.entities);
+    expect(
+      relations.some(
+        (relation) =>
+          relation.kind === "calls" &&
+          relation.from === "function:src/lib.rs#create_user" &&
+          relation.to === "function:src/lib.rs#hash_password"
+      )
+    ).toBe(true);
+  });
+
+  it("extracts Rust unit tests and cfg test modules", async () => {
+    const adapter = new RustLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "src/lib.rs",
+      `
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn creates_user() {}
+
+    #[tokio::test]
+    async fn async_case() {}
+}
+`
+    );
+    const entities = adapter.extractEntities(parsed);
+    const relations = adapter.extractRelations(parsed, entities);
+    expect(entities.some((entity) => entity.kind === "test" && entity.uid === "test:src/lib.rs#tests")).toBe(true);
+    expect(entities.some((entity) => entity.kind === "test" && entity.uid === "test:src/lib.rs#creates_user")).toBe(true);
+    expect(entities.some((entity) => entity.kind === "test" && entity.uid === "test:src/lib.rs#async_case")).toBe(true);
+    expect(relations.filter((relation) => relation.kind === "tests").length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("tracks impl scope with braces and Rust visibility modifiers", async () => {
+    const adapter = new RustLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "src/user.rs",
+      `
+pub(crate) struct User {}
+
+impl<T> User where T: Clone {
+    pub(crate) async fn create() -> User {
+        if true { User {} } else { User {} }
+    }
+
+    fn private_name(&self) -> String {
+        String::new()
+    }
+}
+
+pub fn top_level() {}
+`
+    );
+    const entities = adapter.extractEntities(parsed);
+    const relations = adapter.extractRelations(parsed, entities);
+    expect(entities.find((entity) => entity.name === "User")?.metadata?.visibility).toBe("pub(crate)");
+    expect(entities.some((entity) => entity.kind === "method" && entity.uid === "method:src/user.rs#User.create")).toBe(true);
+    expect(entities.some((entity) => entity.kind === "method" && entity.uid === "method:src/user.rs#User.private_name")).toBe(true);
+    expect(entities.some((entity) => entity.kind === "function" && entity.uid === "function:src/user.rs#top_level")).toBe(true);
+    expect(
+      relations.some(
+        (relation) => relation.kind === "contains" && relation.from === "type:src/user.rs#User" && relation.to === "method:src/user.rs#User.create"
+      )
+    ).toBe(true);
   });
 });

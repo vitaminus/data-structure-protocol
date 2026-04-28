@@ -1,5 +1,5 @@
 import path from "node:path";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import type {
   Entity,
   FileIndexRequest,
@@ -10,22 +10,23 @@ import type {
 } from "../graph/types.js";
 import { buildUid, contentHash, normalizePath, stableNowIso } from "../graph/uid.js";
 import { discoverFiles, findRepoRoot } from "../util/fs.js";
-import { changedFilesFromGit } from "../util/git.js";
+import { changedFileEntriesFromGit, changedFilesFromGit } from "../util/git.js";
 import type { DSPDatabase } from "../storage/db.js";
 import type { DSPConfig } from "../config/types.js";
 
 function languageFromFile(filePath: string): string | undefined {
   const ext = path.extname(filePath).toLowerCase();
+  const basename = path.basename(filePath);
   if ([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"].includes(ext)) {
     return "typescript";
   }
   if (ext === ".py") {
     return "python";
   }
-  if (ext === ".rs") {
+  if (ext === ".rs" || basename === "Cargo.toml") {
     return "rust";
   }
-  if (ext === ".rb") {
+  if (ext === ".rb" || basename === "Gemfile" || basename === "Gemfile.lock") {
     return "ruby";
   }
   return undefined;
@@ -117,6 +118,76 @@ function dirEntitiesForFile(relPath: string, nowIso: string): Entity[] {
   return entities;
 }
 
+function stableMarkerPrefix(kind: Entity["kind"]): "obj" | "func" {
+  return ["function", "method", "route", "test"].includes(kind) ? "func" : "obj";
+}
+
+function stableMarkersFromContent(content: string): { uid: string; line: number }[] {
+  return content
+    .split("\n")
+    .flatMap((line, index) => {
+      const match = line.match(/@dsp\s+((?:obj|func)-[0-9a-fA-F]{8})\b/);
+      return match ? [{ uid: match[1]!, line: index + 1 }] : [];
+    });
+}
+
+function applyStableMarkers(
+  content: string,
+  entities: Entity[],
+  relations: Relation[]
+): { entities: Entity[]; relations: Relation[] } {
+  const markers = stableMarkersFromContent(content);
+  if (markers.length === 0) {
+    return { entities, relations };
+  }
+
+  const sortedEntities = [...entities]
+    .filter((entity) => entity.startLine !== undefined)
+    .sort((a, b) => (a.startLine ?? 0) - (b.startLine ?? 0));
+  const usedEntityUids = new Set<string>();
+  const uidMap = new Map<string, string>();
+
+  for (const marker of markers) {
+    const expectedPrefix = marker.uid.startsWith("func-") ? "func" : "obj";
+    const entity = sortedEntities.find(
+      (candidate) =>
+        !usedEntityUids.has(candidate.uid) &&
+        (candidate.startLine ?? 0) > marker.line &&
+        stableMarkerPrefix(candidate.kind) === expectedPrefix
+    );
+    if (!entity) {
+      continue;
+    }
+    usedEntityUids.add(entity.uid);
+    uidMap.set(entity.uid, marker.uid);
+  }
+
+  if (uidMap.size === 0) {
+    return { entities, relations };
+  }
+
+  return {
+    entities: entities.map((entity) =>
+      uidMap.has(entity.uid)
+        ? {
+            ...entity,
+            uid: uidMap.get(entity.uid)!,
+            metadata: {
+              ...(entity.metadata ?? {}),
+              structuralUid: entity.uid,
+              stableUidSource: "source-marker"
+            }
+          }
+        : entity
+    ),
+    relations: relations.map((relation) => ({
+      ...relation,
+      from: uidMap.get(relation.from) ?? relation.from,
+      to: uidMap.get(relation.to) ?? relation.to
+    }))
+  };
+}
+
 function containsRelations(fileUid: string, entities: Entity[], nowIso: string): Relation[] {
   return entities
     .filter((entity) => entity.uid !== fileUid)
@@ -134,6 +205,69 @@ function containsRelations(fileUid: string, entities: Entity[], nowIso: string):
         }
       ]
     }));
+}
+
+function filePathFromFileUid(uid: string): string | undefined {
+  if (!uid.startsWith("file:") || uid.includes("#")) {
+    return undefined;
+  }
+  return uid.slice("file:".length);
+}
+
+function pathCandidates(targetRelPath: string, fromRelPath?: string): string[] {
+  const normalizedTarget = normalizePath(targetRelPath);
+  const extensions = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".rb", ".rs"];
+  const candidates: string[] = [];
+  const addVariants = (candidate: string) => {
+    const normalized = normalizePath(path.posix.normalize(candidate));
+    candidates.push(normalized);
+    if (!path.posix.extname(normalized)) {
+      for (const ext of extensions) {
+        candidates.push(`${normalized}${ext}`);
+      }
+      for (const ext of extensions) {
+        candidates.push(`${normalized}/index${ext}`);
+      }
+      candidates.push(`${normalized}/mod.rs`);
+    }
+  };
+
+  addVariants(normalizedTarget);
+  if (fromRelPath && !normalizedTarget.includes("/")) {
+    addVariants(path.posix.join(path.posix.dirname(fromRelPath), normalizedTarget));
+  }
+
+  return [...new Set(candidates)];
+}
+
+function canonicalFilePath(
+  targetRelPath: string,
+  fromRelPath: string | undefined,
+  availableFiles: Set<string>
+): string | undefined {
+  return pathCandidates(targetRelPath, fromRelPath).find((candidate) => availableFiles.has(candidate));
+}
+
+function canonicalizeFileRelations(relations: Relation[], availableFiles: Set<string>): Relation[] {
+  return relations.map((relation) => {
+    const targetRelPath = filePathFromFileUid(relation.to);
+    if (!targetRelPath) {
+      return relation;
+    }
+    const fromRelPath = filePathFromFileUid(relation.from);
+    const resolvedPath = canonicalFilePath(targetRelPath, fromRelPath, availableFiles);
+    if (!resolvedPath || resolvedPath === targetRelPath) {
+      return relation;
+    }
+    return {
+      ...relation,
+      to: buildUid("file", resolvedPath),
+      metadata: {
+        ...(relation.metadata ?? {}),
+        resolvedPath
+      }
+    };
+  });
 }
 
 export async function indexRepository(
@@ -159,22 +293,43 @@ export async function indexRepository(
       excludes: config.performance.exclude,
       maxFileSizeKb: config.performance.maxFileSizeKb
     });
+    const availableRelPaths = new Set(
+      discovered.map((absPath) => normalizePath(path.relative(scanRoot, absPath)))
+    );
     const requestedFiles = request.files?.map((file) => path.resolve(scanRoot, file));
-    const changedFromGit =
+    const changedEntries =
       request.fromGitDiff || request.changedOnly
-        ? changedFilesFromGit(repoRoot).filter((file) => {
-            if (file === scanRoot) {
-              return true;
-            }
-            return file.startsWith(`${scanRoot}${path.sep}`);
+        ? changedFileEntriesFromGit(repoRoot).filter((entry) => {
+            const paths = [entry.path, entry.oldPath].filter(Boolean) as string[];
+            return paths.some((file) => file === scanRoot || file.startsWith(`${scanRoot}${path.sep}`));
           })
         : undefined;
+    const changedFromGit = changedEntries?.map((entry) => entry.path);
+
+    if (changedEntries) {
+      db.transaction(() => {
+        for (const entry of changedEntries) {
+          const stalePaths = [
+            ...(entry.oldPath && entry.oldPath !== entry.path ? [entry.oldPath] : []),
+            ...(!existsSync(entry.path) || entry.status.startsWith("D") ? [entry.path] : [])
+          ];
+          for (const stalePath of stalePaths) {
+            if (stalePath === scanRoot || !stalePath.startsWith(`${scanRoot}${path.sep}`)) {
+              continue;
+            }
+            const relPath = normalizePath(path.relative(scanRoot, stalePath));
+            db.clearAstDataForPath(relPath);
+            db.removeFileHash(relPath);
+          }
+        }
+      });
+    }
 
     let selectedFiles = discovered.filter((absPath) => {
       if (requestedFiles && requestedFiles.length > 0) {
         return requestedFiles.includes(absPath);
       }
-      if (changedFromGit && changedFromGit.length > 0) {
+      if (changedFromGit) {
         return changedFromGit.includes(absPath);
       }
       return true;
@@ -220,10 +375,14 @@ export async function indexRepository(
         continue;
       }
 
-      db.clearAstDataForPath(relPath);
       const parsed = await adapter.parseFile(relPath, content);
-      const extractedEntities = adapter.extractEntities(parsed);
-      const extractedRelations = adapter.extractRelations(parsed, extractedEntities);
+      const extracted = applyStableMarkers(
+        content,
+        adapter.extractEntities(parsed),
+        adapter.extractRelations(parsed, adapter.extractEntities(parsed))
+      );
+      const extractedEntities = extracted.entities;
+      const extractedRelations = canonicalizeFileRelations(extracted.relations, availableRelPaths);
       const unresolved = parsed.unresolvedReferences ?? [];
       const nowIso = stableNowIso();
 
@@ -255,19 +414,25 @@ export async function indexRepository(
           : [])
       ];
 
-      for (const entity of allEntities) {
-        db.upsertEntity(entity);
-      }
+      db.transaction(() => {
+        db.clearAstDataForPath(relPath);
+        for (const entity of allEntities) {
+          db.upsertEntity(entity);
+        }
+        for (const relation of allRelations) {
+          db.upsertRelation(relation);
+        }
+        for (const ref of unresolved) {
+          db.upsertUnresolvedReference(ref, nowIso);
+        }
+        db.markFileHash(relPath, hash, nowIso);
+      });
+
       for (const relation of allRelations) {
-        db.upsertRelation(relation);
         if (relation.confidence < 0.4) {
           lowConfidenceCount += 1;
         }
       }
-      for (const ref of unresolved) {
-        db.upsertUnresolvedReference(ref, nowIso);
-      }
-      db.markFileHash(relPath, hash, nowIso);
 
       filesIndexed += 1;
       entityCount += allEntities.length;

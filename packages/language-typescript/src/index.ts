@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import ts from "typescript";
 import type { Entity, LanguageAdapter, ParseResult, Relation, UnresolvedReference } from "@dsp/core";
@@ -20,12 +21,77 @@ function withProv(confidence: number, evidence: string) {
   ];
 }
 
+function pathForUid(resolvedFileName: string, fromPath: string): string {
+  const normalizedResolved = normalizePath(resolvedFileName);
+  if (!path.isAbsolute(resolvedFileName)) {
+    return normalizedResolved;
+  }
+  if (path.isAbsolute(fromPath)) {
+    return normalizedResolved;
+  }
+  const relativeToCwd = normalizePath(path.relative(process.cwd(), resolvedFileName));
+  return relativeToCwd.startsWith("..") ? normalizedResolved : relativeToCwd;
+}
+
+function compilerOptionsFor(containingFile: string): ts.CompilerOptions {
+  const configPath = ts.findConfigFile(path.dirname(containingFile), ts.sys.fileExists);
+  if (!configPath) {
+    return {
+      allowJs: true,
+      module: ts.ModuleKind.NodeNext,
+      moduleResolution: ts.ModuleResolutionKind.NodeNext,
+      target: ts.ScriptTarget.Latest,
+      jsx: ts.JsxEmit.ReactJSX
+    };
+  }
+  const config = ts.readConfigFile(configPath, ts.sys.readFile);
+  if (config.error) {
+    return {};
+  }
+  return ts.parseJsonConfigFileContent(config.config, ts.sys, path.dirname(configPath)).options;
+}
+
+function implementationPathForTsTest(filePath: string): string | undefined {
+  const normalized = normalizePath(filePath);
+  const match = normalized.match(/^(.*?)(?:\.test|\.spec)(\.[tj]sx?)$/);
+  if (!match) {
+    return undefined;
+  }
+  const base = match[1]!.replace(/\/(__tests__|tests)\//, "/");
+  return `${base}${match[2]}`;
+}
+
 function resolveImport(fromPath: string, specifier: string): string | undefined {
   if (!specifier.startsWith(".")) {
     return undefined;
   }
+
+  const containingFile = path.isAbsolute(fromPath) ? fromPath : path.resolve(fromPath);
+  const resolved = ts.resolveModuleName(
+    specifier,
+    containingFile,
+    compilerOptionsFor(containingFile),
+    ts.sys
+  ).resolvedModule;
+  if (resolved && !resolved.isExternalLibraryImport) {
+    return pathForUid(resolved.resolvedFileName, fromPath);
+  }
+
   const base = path.dirname(fromPath);
   const candidate = normalizePath(path.join(base, specifier));
+  const extensions = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
+  for (const ext of extensions) {
+    const withExtension = `${candidate}${ext}`;
+    if (fs.existsSync(withExtension)) {
+      return normalizePath(withExtension);
+    }
+  }
+  for (const ext of extensions) {
+    const indexFile = normalizePath(path.join(candidate, `index${ext}`));
+    if (fs.existsSync(indexFile)) {
+      return indexFile;
+    }
+  }
   return candidate;
 }
 
@@ -42,6 +108,7 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
     const entities: Entity[] = [];
     const relations: Relation[] = [];
     const unresolvedReferences: UnresolvedReference[] = [];
+    const callEdges: { from: string; name: string; line: number }[] = [];
     const fileUid = buildUid("file", filePath);
     const lang = inferKindFromFile(filePath);
 
@@ -54,6 +121,31 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
         confidence: 1,
         provenance: withProv(1, "file contains symbol")
       });
+    };
+
+    const collectCalls = (node: ts.Node | undefined, fromUid: string): void => {
+      if (!node) {
+        return;
+      }
+      const scan = (candidate: ts.Node): void => {
+        if (ts.isCallExpression(candidate)) {
+          const expression = candidate.expression;
+          const name = ts.isIdentifier(expression)
+            ? expression.text
+            : ts.isPropertyAccessExpression(expression)
+              ? expression.name.text
+              : undefined;
+          if (name) {
+            callEdges.push({
+              from: fromUid,
+              name,
+              line: source.getLineAndCharacterOfPosition(candidate.getStart()).line + 1
+            });
+          }
+        }
+        ts.forEachChild(candidate, scan);
+      };
+      scan(node);
     };
 
     const visit = (node: ts.Node): void => {
@@ -101,6 +193,60 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
           createdAt: now,
           updatedAt: now
         });
+        collectCalls(node.body, uid);
+      }
+
+      if (ts.isVariableStatement(node)) {
+        const isPublic = node.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) ?? false;
+        for (const declaration of node.declarationList.declarations) {
+          if (!ts.isIdentifier(declaration.name)) {
+            continue;
+          }
+          const name = declaration.name.text;
+          const initializer = declaration.initializer;
+          const isCallable = Boolean(initializer && (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer)));
+          const uid = buildUid(isCallable ? "function" : "constant", filePath, name);
+          addEntity({
+            uid,
+            kind: isCallable ? "function" : "constant",
+            name,
+            path: filePath,
+            language: lang,
+            signature: node.getText(source).split("=")[0]?.trim(),
+            startLine: source.getLineAndCharacterOfPosition(declaration.getStart()).line + 1,
+            endLine: source.getLineAndCharacterOfPosition(declaration.getEnd()).line + 1,
+            metadata: {
+              public: isPublic,
+              declarationKind: ts.tokenToString(node.declarationList.flags & ts.NodeFlags.Const ? ts.SyntaxKind.ConstKeyword : ts.SyntaxKind.LetKeyword)
+            },
+            confidence: isCallable ? 0.92 : 0.9,
+            provenance: withProv(isCallable ? 0.92 : 0.9, isCallable ? "function variable declaration" : "constant declaration"),
+            createdAt: now,
+            updatedAt: now
+          });
+          if (isCallable && initializer && (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer))) {
+            collectCalls(initializer.body, uid);
+          }
+        }
+      }
+
+      if (ts.isEnumDeclaration(node)) {
+        const name = node.name.text;
+        addEntity({
+          uid: buildUid("type", filePath, name),
+          kind: "type",
+          name,
+          path: filePath,
+          language: lang,
+          signature: node.name.getText(source),
+          startLine: source.getLineAndCharacterOfPosition(node.getStart()).line + 1,
+          endLine: source.getLineAndCharacterOfPosition(node.getEnd()).line + 1,
+          metadata: { public: node.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) ?? false, tsKind: "enum" },
+          confidence: 0.94,
+          provenance: withProv(0.94, "enum declaration"),
+          createdAt: now,
+          updatedAt: now
+        });
       }
 
       if (ts.isClassDeclaration(node) && node.name) {
@@ -123,6 +269,19 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
           createdAt: now,
           updatedAt: now
         });
+        for (const clause of node.heritageClauses ?? []) {
+          for (const type of clause.types) {
+            const targetName = type.expression.getText(source);
+            relations.push({
+              from: classUid,
+              to: buildUid(clause.token === ts.SyntaxKind.ExtendsKeyword ? "class" : "interface", filePath, targetName),
+              kind: clause.token === ts.SyntaxKind.ExtendsKeyword ? "extends" : "implements",
+              reason: targetName,
+              confidence: 0.86,
+              provenance: withProv(0.86, clause.token === ts.SyntaxKind.ExtendsKeyword ? "class extends" : "class implements")
+            });
+          }
+        }
         for (const member of node.members) {
           if (ts.isMethodDeclaration(member) && member.name && ts.isIdentifier(member.name)) {
             const methodName = member.name.text;
@@ -141,6 +300,7 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
               createdAt: now,
               updatedAt: now
             });
+            collectCalls(member.body, methodUid);
             relations.push({
               from: classUid,
               to: methodUid,
@@ -154,8 +314,9 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
 
       if (ts.isInterfaceDeclaration(node)) {
         const name = node.name.text;
+        const interfaceUid = buildUid("interface", filePath, name);
         addEntity({
-          uid: buildUid("interface", filePath, name),
+          uid: interfaceUid,
           kind: "interface",
           name,
           path: filePath,
@@ -168,6 +329,19 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
           createdAt: now,
           updatedAt: now
         });
+        for (const clause of node.heritageClauses ?? []) {
+          for (const type of clause.types) {
+            const targetName = type.expression.getText(source);
+            relations.push({
+              from: interfaceUid,
+              to: buildUid("interface", filePath, targetName),
+              kind: "extends",
+              reason: targetName,
+              confidence: 0.86,
+              provenance: withProv(0.86, "interface extends")
+            });
+          }
+        }
       }
 
       if (ts.isTypeAliasDeclaration(node)) {
@@ -201,11 +375,18 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
         }
       }
       if (
-        (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) &&
+        (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node) || ts.isEnumDeclaration(node)) &&
         node.name &&
         node.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)
       ) {
         exportNames.add(node.name.text);
+      }
+      if (ts.isVariableStatement(node) && node.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)) {
+        for (const declaration of node.declarationList.declarations) {
+          if (ts.isIdentifier(declaration.name)) {
+            exportNames.add(declaration.name.text);
+          }
+        }
       }
     });
     for (const entity of entities) {
@@ -219,6 +400,60 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
           provenance: withProv(0.98, "export declaration")
         });
       }
+    }
+
+    const callableTargets = new Map<string, Entity[]>();
+    for (const entity of entities.filter((candidate) => candidate.kind === "function" || candidate.kind === "method")) {
+      const bucket = callableTargets.get(entity.name) ?? [];
+      bucket.push(entity);
+      callableTargets.set(entity.name, bucket);
+    }
+    const callRelationKeys = new Set<string>();
+    for (const edge of callEdges) {
+      for (const target of callableTargets.get(edge.name) ?? []) {
+        if (target.uid === edge.from) {
+          continue;
+        }
+        const key = `${edge.from}\0${target.uid}\0${edge.line}`;
+        if (callRelationKeys.has(key)) {
+          continue;
+        }
+        callRelationKeys.add(key);
+        relations.push({
+          from: edge.from,
+          to: target.uid,
+          kind: "calls",
+          reason: `${edge.name}()`,
+          confidence: 0.68,
+          provenance: withProv(0.68, "same-file call heuristic"),
+          metadata: { line: edge.line }
+        });
+      }
+    }
+
+    const testedPath = implementationPathForTsTest(filePath);
+    if (testedPath && testedPath !== filePath) {
+      const testUid = buildUid("test", filePath);
+      addEntity({
+        uid: testUid,
+        kind: "test",
+        name: path.basename(filePath),
+        path: filePath,
+        language: lang,
+        confidence: 0.88,
+        provenance: withProv(0.88, "typescript test path convention"),
+        metadata: { testedPath },
+        createdAt: now,
+        updatedAt: now
+      });
+      relations.push({
+        from: testUid,
+        to: buildUid("file", testedPath),
+        kind: "tests",
+        reason: "typescript test path convention",
+        confidence: 0.88,
+        provenance: withProv(0.88, "typescript test path convention")
+      });
     }
 
     return {

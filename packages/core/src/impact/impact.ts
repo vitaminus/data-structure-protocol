@@ -13,7 +13,7 @@ const IMPACT_KINDS: Set<RelationKind> = new Set([
 ]);
 
 export function resolveTargetUid(target: string): string {
-  if (target.includes(":")) {
+  if (target.includes(":") || /^(?:obj|func)-[0-9a-fA-F]{8}$/.test(target)) {
     return target;
   }
   return buildUid("file", normalizePath(target));

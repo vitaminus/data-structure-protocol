@@ -7,6 +7,7 @@ import { indexRepository, bootstrapRepository, changedFiles } from "./indexer/in
 import { semanticSearch } from "./semantic/search.js";
 import { analyzeImpact } from "./impact/impact.js";
 import { validateGraph } from "./validate/validate.js";
+import { insertSourceMarkers } from "./markers/markers.js";
 import { MockEmbeddingProvider } from "./semantic/providers.js";
 import { contentHash } from "./graph/uid.js";
 export function initDSP(rootDir) {
@@ -66,8 +67,15 @@ export function runExport(services, format, targetPath) {
         services.db.exportJson(finalPath);
         return { format, targetPath: finalPath };
     }
+    if (format === "protocol") {
+        services.db.exportProtocol(services.rootDir);
+        return { format, targetPath: path.join(services.rootDir, ".dsp", "protocol") };
+    }
     services.db.exportDsp(services.rootDir);
     return { format, targetPath: path.join(services.rootDir, ".dsp", "export") };
+}
+export function runMarkersApply(services, options = {}) {
+    return insertSourceMarkers(services.db, services.rootDir, options);
 }
 export function runImport(services, sourcePath) {
     const snapshot = services.db.importJson(sourcePath);

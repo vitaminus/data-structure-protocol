@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import Database from "better-sqlite3";
 import { mergeProvenance, topSourcePriority } from "../graph/provenance.js";
 import { ensureDir } from "../util/fs.js";
@@ -8,6 +9,35 @@ function toJson(value) {
 }
 function fromJson(value) {
     return value ? JSON.parse(value) : null;
+}
+function protocolUidForEntity(entity) {
+    if (/^(?:obj|func)-[0-9a-fA-F]{8}$/.test(entity.uid)) {
+        return entity.uid;
+    }
+    const prefix = ["function", "method", "route", "test"].includes(entity.kind) ? "func" : "obj";
+    const hash = createHash("sha1").update(entity.uid).digest("hex").slice(0, 8);
+    return `${prefix}-${hash}`;
+}
+function protocolKind(entity) {
+    if (entity.metadata?.external) {
+        return "external";
+    }
+    return ["function", "method", "route", "test"].includes(entity.kind) ? "function" : "object";
+}
+function writeProtocolDescription(target, entity, protocolUid) {
+    const purpose = entity.description ?? entity.docstring ?? entity.signature ?? `${entity.kind} ${entity.name}`;
+    const lines = [
+        `source: ${entity.path ?? entity.uid}${entity.uid.includes("#") ? `#${entity.uid.split("#").at(-1)}` : ""}`,
+        `kind: ${protocolKind(entity)}`,
+        `purpose: ${purpose}`,
+        `dsp_uid: ${entity.uid}`,
+        `protocol_uid: ${protocolUid}`,
+        `confidence: ${entity.confidence.toFixed(2)}`
+    ];
+    if (entity.language) {
+        lines.push(`language: ${entity.language}`);
+    }
+    fs.writeFileSync(target, `${lines.join("\n")}\n`, "utf8");
 }
 export class DSPDatabase {
     dbPath;
@@ -110,10 +140,20 @@ export class DSPDatabase {
         metadata_json TEXT,
         created_at TEXT NOT NULL
       );
+
+      CREATE INDEX IF NOT EXISTS idx_entities_path ON entities(path);
+      CREATE INDEX IF NOT EXISTS idx_entities_kind_path ON entities(kind, path);
+      CREATE INDEX IF NOT EXISTS idx_relations_from_uid ON relations(from_uid);
+      CREATE INDEX IF NOT EXISTS idx_relations_to_uid ON relations(to_uid);
+      CREATE INDEX IF NOT EXISTS idx_relations_kind ON relations(kind);
+      CREATE INDEX IF NOT EXISTS idx_unresolved_references_path ON unresolved_references(path);
     `);
     }
     close() {
         this.db.close();
+    }
+    transaction(fn) {
+        return this.db.transaction(fn)();
     }
     beginRun(mode, startedAt) {
         const stmt = this.db.prepare("INSERT INTO index_runs(started_at, mode, status, metadata_json) VALUES (?, ?, 'running', ?)");
@@ -182,6 +222,26 @@ export class DSPDatabase {
             .prepare("SELECT * FROM relations WHERE to_uid = ? ORDER BY from_uid")
             .all(uid);
         return rows.map((row) => this.rowToRelation(row));
+    }
+    deleteRelation(fromUid, toUid, kind) {
+        if (kind) {
+            const result = this.db
+                .prepare("DELETE FROM relations WHERE from_uid = ? AND to_uid = ? AND kind = ?")
+                .run(fromUid, toUid, kind);
+            return result.changes;
+        }
+        const result = this.db
+            .prepare("DELETE FROM relations WHERE from_uid = ? AND to_uid = ?")
+            .run(fromUid, toUid);
+        return result.changes;
+    }
+    deleteEntity(uid) {
+        const result = this.db.transaction(() => {
+            this.db.prepare("DELETE FROM relations WHERE from_uid = ? OR to_uid = ?").run(uid, uid);
+            this.db.prepare("DELETE FROM embeddings WHERE uid = ?").run(uid);
+            return this.db.prepare("DELETE FROM entities WHERE uid = ?").run(uid).changes;
+        })();
+        return result > 0;
     }
     upsertEntity(entity) {
         const existing = this.getEntity(entity.uid);
@@ -268,6 +328,9 @@ export class DSPDatabase {
             .get(filePath);
         return row?.content_hash;
     }
+    removeFileHash(filePath) {
+        this.db.prepare("DELETE FROM file_hashes WHERE path = ?").run(filePath);
+    }
     clearUnresolvedForPath(filePath) {
         this.db.prepare("DELETE FROM unresolved_references WHERE path = ?").run(filePath);
     }
@@ -343,6 +406,46 @@ export class DSPDatabase {
         });
         tx();
         return snapshot;
+    }
+    exportProtocol(targetDir) {
+        const protocolDir = path.join(targetDir, ".dsp", "protocol");
+        fs.rmSync(protocolDir, { recursive: true, force: true });
+        fs.mkdirSync(protocolDir, { recursive: true });
+        const entities = this.getEntities(200000).sort((a, b) => a.uid.localeCompare(b.uid));
+        const relations = this.getRelations(500000);
+        const uidMap = Object.fromEntries(entities.map((entity) => [entity.uid, protocolUidForEntity(entity)]));
+        const entityByUid = new Map(entities.map((entity) => [entity.uid, entity]));
+        for (const entity of entities) {
+            const protocolUid = uidMap[entity.uid];
+            const entityDir = path.join(protocolDir, protocolUid);
+            fs.mkdirSync(path.join(entityDir, "exports"), { recursive: true });
+            writeProtocolDescription(path.join(entityDir, "description"), entity, protocolUid);
+            const outgoing = relations.filter((relation) => relation.from === entity.uid);
+            const importLines = outgoing
+                .filter((relation) => relation.kind !== "contains" && uidMap[relation.to])
+                .map((relation) => `${uidMap[relation.to]} # ${relation.kind}${relation.reason ? `: ${relation.reason}` : ""}`)
+                .sort();
+            fs.writeFileSync(path.join(entityDir, "imports"), `${importLines.join("\n")}${importLines.length ? "\n" : ""}`, "utf8");
+            const sharedLines = outgoing
+                .filter((relation) => ["contains", "exports"].includes(relation.kind) && uidMap[relation.to])
+                .map((relation) => uidMap[relation.to])
+                .sort();
+            fs.writeFileSync(path.join(entityDir, "shared"), `${[...new Set(sharedLines)].join("\n")}${sharedLines.length ? "\n" : ""}`, "utf8");
+        }
+        for (const relation of relations) {
+            const importedUid = uidMap[relation.to];
+            const importerUid = uidMap[relation.from];
+            if (!importedUid || !importerUid || relation.kind === "contains") {
+                continue;
+            }
+            const exportPath = path.join(protocolDir, importedUid, "exports", importerUid);
+            const importer = entityByUid.get(relation.from);
+            const why = relation.reason ?? `${importer?.name ?? relation.from} ${relation.kind} ${entityByUid.get(relation.to)?.name ?? relation.to}`;
+            fs.writeFileSync(exportPath, `${why}\nkind: ${relation.kind}\nconfidence: ${relation.confidence.toFixed(2)}\n`, "utf8");
+        }
+        fs.writeFileSync(path.join(protocolDir, "TOC"), `${entities.map((entity) => uidMap[entity.uid]).join("\n")}\n`, "utf8");
+        fs.writeFileSync(path.join(protocolDir, "uid-map.json"), `${JSON.stringify(uidMap, null, 2)}\n`, "utf8");
+        fs.writeFileSync(path.join(protocolDir, "README.md"), `# DSP protocol export\n\nThis directory is a plain-text, agent-readable export generated from the SQLite DSP graph.\n\n- Entity directories use protocol-compatible \`obj-*\` / \`func-*\` IDs.\n- \`uid-map.json\` maps canonical DSP graph UIDs to protocol export IDs.\n- SQLite remains the canonical store for DSP v2.\n`, "utf8");
     }
     exportDsp(targetDir) {
         const dspDir = path.join(targetDir, ".dsp", "export");

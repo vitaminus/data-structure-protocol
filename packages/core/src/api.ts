@@ -17,6 +17,7 @@ import { indexRepository, bootstrapRepository, changedFiles } from "./indexer/in
 import { semanticSearch } from "./semantic/search.js";
 import { analyzeImpact } from "./impact/impact.js";
 import { validateGraph } from "./validate/validate.js";
+import { insertSourceMarkers } from "./markers/markers.js";
 import { MockEmbeddingProvider } from "./semantic/providers.js";
 import { contentHash } from "./graph/uid.js";
 
@@ -106,16 +107,27 @@ export async function runContextPack(
 
 export function runExport(
   services: DSPServices,
-  format: "json" | "dsp",
+  format: "json" | "dsp" | "protocol",
   targetPath?: string
-): { format: "json" | "dsp"; targetPath: string } {
+): { format: "json" | "dsp" | "protocol"; targetPath: string } {
   if (format === "json") {
     const finalPath = targetPath ?? path.join(services.rootDir, ".dsp", "graph.json");
     services.db.exportJson(finalPath);
     return { format, targetPath: finalPath };
   }
+  if (format === "protocol") {
+    services.db.exportProtocol(services.rootDir);
+    return { format, targetPath: path.join(services.rootDir, ".dsp", "protocol") };
+  }
   services.db.exportDsp(services.rootDir);
   return { format, targetPath: path.join(services.rootDir, ".dsp", "export") };
+}
+
+export function runMarkersApply(
+  services: DSPServices,
+  options: { dryRun?: boolean } = {}
+): { filesChanged: number; markersInserted: number; paths: string[] } {
+  return insertSourceMarkers(services.db, services.rootDir, options);
 }
 
 export function runImport(

@@ -1,6 +1,26 @@
 import path from "node:path";
 import { readFileSync } from "node:fs";
 import { contentHash } from "../graph/uid.js";
+function severityForIssue(kind) {
+    switch (kind) {
+        case "missing_file":
+        case "dangling_relation":
+            return "error";
+        case "stale_hash":
+        case "unresolved_reference":
+        case "low_confidence_critical":
+        case "annotation_conflict":
+            return "warning";
+        default:
+            return "info";
+    }
+}
+function withSeverity(issue) {
+    return {
+        severity: severityForIssue(issue.kind),
+        ...issue
+    };
+}
 export function validateGraph(db, rootDir) {
     const issues = [];
     const entities = db.getEntities(300000);
@@ -15,65 +35,72 @@ export function validateGraph(db, rootDir) {
                 const currentHash = contentHash(content);
                 const indexedHash = db.getFileHash(entity.path);
                 if (indexedHash && indexedHash !== currentHash) {
-                    issues.push({
+                    issues.push(withSeverity({
                         kind: "stale_hash",
                         uid: entity.uid,
                         path: entity.path,
                         message: `File hash changed since last index: ${entity.path}`
-                    });
+                    }));
                 }
             }
             catch {
-                issues.push({
+                issues.push(withSeverity({
                     kind: "missing_file",
                     uid: entity.uid,
                     path: entity.path,
                     message: `Indexed file no longer exists: ${entity.path}`
-                });
+                }));
             }
         }
     }
     for (const relation of relations) {
         if (!entitySet.has(relation.from) || !entitySet.has(relation.to)) {
-            issues.push({
+            issues.push(withSeverity({
                 kind: "dangling_relation",
                 relation: { from: relation.from, to: relation.to, kind: relation.kind },
                 message: `Relation has missing endpoint: ${relation.from} -> ${relation.to}`
-            });
+            }));
         }
         if (["imports", "depends_on", "calls"].includes(relation.kind) && relation.confidence < 0.35) {
-            issues.push({
+            issues.push(withSeverity({
                 kind: "low_confidence_critical",
                 relation: { from: relation.from, to: relation.to, kind: relation.kind },
                 confidence: relation.confidence,
                 message: `Low confidence on critical relation ${relation.kind}: ${relation.from} -> ${relation.to}`
-            });
+            }));
         }
     }
     for (const ref of unresolved) {
-        issues.push({
+        issues.push(withSeverity({
             kind: "unresolved_reference",
             path: ref.path,
             uid: ref.fromUid,
             confidence: ref.confidence,
             message: `Unresolved ${ref.kind}: ${ref.symbol} (${ref.path})`
-        });
+        }));
     }
     const annotationConflicts = entities.filter((entity) => {
         const sources = new Set(entity.provenance.map((provenance) => provenance.source));
         return sources.has("human") && sources.has("ast") && entity.confidence < 0.5;
     });
     for (const entity of annotationConflicts) {
-        issues.push({
+        issues.push(withSeverity({
             kind: "annotation_conflict",
             uid: entity.uid,
             path: entity.path,
             message: `Potential human/AST conflict on ${entity.uid}`
-        });
+        }));
     }
+    const summary = {
+        total: issues.length,
+        errors: issues.filter((issue) => issue.severity === "error").length,
+        warnings: issues.filter((issue) => issue.severity === "warning").length,
+        info: issues.filter((issue) => issue.severity === "info").length
+    };
     return {
         ok: issues.length === 0,
-        issues
+        issues,
+        summary
     };
 }
 //# sourceMappingURL=validate.js.map

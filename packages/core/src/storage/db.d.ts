@@ -10,6 +10,7 @@ export declare class DSPDatabase {
     constructor(rootDir: string);
     initialize(): void;
     close(): void;
+    transaction<T>(fn: () => T): T;
     beginRun(mode: string, startedAt: string): number;
     finishRun(runId: number, status: "ok" | "failed", endedAt: string, meta: unknown): void;
     private rowToEntity;
@@ -19,10 +20,13 @@ export declare class DSPDatabase {
     getRelations(limit?: number): Relation[];
     getRelationsFrom(uid: string): Relation[];
     getRelationsTo(uid: string): Relation[];
+    deleteRelation(fromUid: string, toUid: string, kind?: Relation["kind"]): number;
+    deleteEntity(uid: string): boolean;
     upsertEntity(entity: Entity): void;
     upsertRelation(relation: Relation): void;
     markFileHash(filePath: string, hash: string, indexedAt: string): void;
     getFileHash(filePath: string): string | undefined;
+    removeFileHash(filePath: string): void;
     clearUnresolvedForPath(filePath: string): void;
     upsertUnresolvedReference(ref: UnresolvedReference, createdAt: string): void;
     getUnresolvedReferences(): UnresolvedReference[];
@@ -31,6 +35,7 @@ export declare class DSPDatabase {
     getSnapshot(): GraphSnapshot;
     exportJson(targetPath: string): void;
     importJson(sourcePath: string): GraphSnapshot;
+    exportProtocol(targetDir: string): void;
     exportDsp(targetDir: string): void;
     setEmbedding(uid: string, hash: string, vector: number[], provider: string, updatedAt: string): void;
     getEmbedding(uid: string): {
