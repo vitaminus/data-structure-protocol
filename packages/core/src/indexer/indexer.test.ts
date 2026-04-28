@@ -61,6 +61,39 @@ describe("indexer", () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
+  it("includes Ruby Bundler files in repository indexing", async () => {
+    fs.writeFileSync(path.join(tempDir, "Gemfile"), "gem 'rails'\n", "utf8");
+    class GemfileAdapter extends MockAdapter {
+      override language = "ruby";
+      override canHandle(filePath: string): boolean {
+        return filePath === "Gemfile";
+      }
+      override async parseFile(filePath: string): Promise<ParseResult> {
+        const now = stableNowIso();
+        return {
+          entities: [
+            {
+              uid: buildUid("unknown", "external/ruby-gems", "rails"),
+              kind: "unknown",
+              name: "rails",
+              language: "ruby",
+              confidence: 1,
+              provenance: [{ source: "regex", timestamp: now, confidence: 1 }],
+              createdAt: now,
+              updatedAt: now
+            }
+          ],
+          relations: [],
+          unresolvedReferences: []
+        };
+      }
+    }
+
+    const summary = await indexRepository(db, [new GemfileAdapter()], { rootDir: tempDir }, DEFAULT_CONFIG);
+    expect(summary.languages).toContain("ruby");
+    expect(db.getEntity(buildUid("file", "Gemfile"))).toBeDefined();
+  });
+
   it("skips unchanged files on second run", async () => {
     const adapter = new MockAdapter();
     const first = await indexRepository(db, [adapter], { rootDir: tempDir }, DEFAULT_CONFIG);

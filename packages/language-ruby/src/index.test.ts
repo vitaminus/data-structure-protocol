@@ -86,6 +86,29 @@ end
     ).toBe(true);
   });
 
+  it("indexes Bundler dependencies from Gemfile and Gemfile.lock", async () => {
+    const adapter = new RubyLanguageAdapter();
+    const gemfile = await adapter.parseFile(
+      "Gemfile",
+      `
+source "https://rubygems.org"
+gem "rails", "~> 7.1"
+gem "pg"
+`
+    );
+    const lockfile = await adapter.parseFile(
+      "Gemfile.lock",
+      `
+GEM
+  specs:
+    puma (6.4.0)
+`
+    );
+    expect(gemfile.entities.some((entity) => entity.uid === "unknown:external/ruby-gems#rails")).toBe(true);
+    expect(gemfile.relations.some((relation) => relation.kind === "depends_on" && relation.to === "unknown:external/ruby-gems#pg")).toBe(true);
+    expect(lockfile.entities.some((entity) => entity.uid === "unknown:external/ruby-gems#puma")).toBe(true);
+  });
+
   it("links Ruby spec and test files to implementation files", async () => {
     const adapter = new RubyLanguageAdapter();
     const spec = await adapter.parseFile("spec/models/user_spec.rb", "RSpec.describe User do\nend\n");

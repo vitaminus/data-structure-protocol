@@ -167,3 +167,11 @@ Status: done
 - Map RSpec files under `spec/models`, `spec/controllers`, `spec/services`, jobs, mailers, and lib to matching implementation paths.
 - Map Minitest files under `test/models`, `test/controllers`, services, jobs, mailers, and lib to matching implementation paths.
 - Add `test` entities and `tests` relations for Ruby test path conventions.
+
+## 22. Add Bundler dependency awareness
+
+Status: done
+
+- Include `Gemfile` and `Gemfile.lock` in Ruby indexing.
+- Extract gems as external dependency entities from Gemfile and lockfile formats.
+- Add `depends_on` relations from Bundler files to external gem entities.

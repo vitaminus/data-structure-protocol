@@ -16,6 +16,7 @@ import type { DSPConfig } from "../config/types.js";
 
 function languageFromFile(filePath: string): string | undefined {
   const ext = path.extname(filePath).toLowerCase();
+  const basename = path.basename(filePath);
   if ([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"].includes(ext)) {
     return "typescript";
   }
@@ -25,7 +26,7 @@ function languageFromFile(filePath: string): string | undefined {
   if (ext === ".rs") {
     return "rust";
   }
-  if (ext === ".rb") {
+  if (ext === ".rb" || basename === "Gemfile" || basename === "Gemfile.lock") {
     return "ruby";
   }
   return undefined;

@@ -42,6 +42,12 @@ type ActiveRecordMacro = {
   line: number;
 };
 
+type BundlerDependency = {
+  name: string;
+  version?: string;
+  line: number;
+};
+
 type RubyParsed = {
   symbols: RubySymbol[];
   requires: { spec: string; relative: boolean; line: number }[];
@@ -244,6 +250,30 @@ function parseWithRipper(content: string): RubyParsed | undefined {
     activeRecordMacros: parseActiveRecordMacros(content),
     source: "ast"
   };
+}
+
+function parseBundlerDependencies(content: string): BundlerDependency[] {
+  const gems: BundlerDependency[] = [];
+  for (const [index, raw] of content.split("\n").entries()) {
+    const line = raw.trim();
+    const gemfileMatch = line.match(/^gem\s+["']([^"']+)["'](?:,\s*["']([^"']+)["'])?/);
+    if (gemfileMatch) {
+      gems.push({ name: gemfileMatch[1]!, version: gemfileMatch[2], line: index + 1 });
+      continue;
+    }
+    const lockMatch = raw.match(/^    ([A-Za-z0-9_.-]+)\s*\(([^)]+)\)/);
+    if (lockMatch) {
+      gems.push({ name: lockMatch[1]!, version: lockMatch[2], line: index + 1 });
+    }
+  }
+  const seen = new Set<string>();
+  return gems.filter((gem) => {
+    if (seen.has(gem.name)) {
+      return false;
+    }
+    seen.add(gem.name);
+    return true;
+  });
 }
 
 function parseRequires(content: string): RubyParsed["requires"] {
@@ -506,7 +536,8 @@ export class RubyLanguageAdapter implements LanguageAdapter {
   language = "ruby";
 
   canHandle(filePath: string): boolean {
-    return path.extname(filePath).toLowerCase() === ".rb";
+    const basename = path.basename(filePath);
+    return path.extname(filePath).toLowerCase() === ".rb" || basename === "Gemfile" || basename === "Gemfile.lock";
   }
 
   async parseFile(filePath: string, content: string): Promise<ParseResult> {
@@ -515,9 +546,7 @@ export class RubyLanguageAdapter implements LanguageAdapter {
     const entities: Entity[] = [];
     const relations: Relation[] = [];
     const unresolvedReferences: UnresolvedReference[] = [];
-    const parsed = parseWithRipper(content) ?? parseWithRegex(content);
-    const confidence = parsed.source === "ast" ? 0.9 : 0.72;
-
+    let currentSource: RubySource = "regex";
     const addEntity = (entity: Entity) => {
       entities.push(entity);
       relations.push({
@@ -525,9 +554,44 @@ export class RubyLanguageAdapter implements LanguageAdapter {
         to: entity.uid,
         kind: "contains",
         confidence: 1,
-        provenance: prov(1, parsed.source, "file contains symbol")
+        provenance: prov(1, currentSource, "file contains symbol")
       });
     };
+
+    const bundlerDeps = ["Gemfile", "Gemfile.lock"].includes(path.basename(filePath))
+      ? parseBundlerDependencies(content)
+      : [];
+    if (bundlerDeps.length > 0) {
+      for (const gem of bundlerDeps) {
+        const gemUid = buildUid("unknown", "external/ruby-gems", gem.name);
+        addEntity({
+          uid: gemUid,
+          kind: "unknown",
+          name: gem.name,
+          language: "ruby",
+          startLine: gem.line,
+          endLine: gem.line,
+          confidence: 0.88,
+          provenance: prov(0.88, "regex", "bundler dependency"),
+          metadata: { rubyKind: "gem", version: gem.version, external: true },
+          createdAt: now,
+          updatedAt: now
+        });
+        relations.push({
+          from: fileUid,
+          to: gemUid,
+          kind: "depends_on",
+          reason: gem.version ? `gem ${gem.name} ${gem.version}` : `gem ${gem.name}`,
+          confidence: 0.9,
+          provenance: prov(0.9, "regex", "bundler dependency")
+        });
+      }
+      return { entities, relations, unresolvedReferences };
+    }
+
+    const parsed = parseWithRipper(content) ?? parseWithRegex(content);
+    currentSource = parsed.source;
+    const confidence = parsed.source === "ast" ? 0.9 : 0.72;
 
     for (const symbol of parsed.symbols) {
       if (symbol.kind === "module") {
