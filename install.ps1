@@ -108,21 +108,11 @@ if ($Agent -ne 'none') {
 }
 
 if ($WithHooks) {
-  $gitDir = Join-Path $Root '.git'
-  if (Test-Path $gitDir) {
-    $hook = Join-Path $gitDir 'hooks/pre-commit'
-    $hookText = @'
-#!/usr/bin/env bash
-set -euo pipefail
-if command -v pnpm >/dev/null 2>&1; then
-  pnpm dsp validate . --json >/tmp/dsp-validate.json
-else
-  npm run dsp -- validate . --json >/tmp/dsp-validate.json
-fi
-node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync("/tmp/dsp-validate.json","utf8")); if(r.summary && r.summary.errors>0){ console.error(JSON.stringify(r,null,2)); process.exit(1); }'
-'@
-    Write-TextFile $hook $hookText
-    Write-Host '==> Installed git pre-commit DSP validation hook'
+  $hookInstaller = Join-Path $Root 'hooks/install-hooks.ps1'
+  if (Test-Path $hookInstaller) {
+    & $hookInstaller -Root $Root
+  } elseif (Test-Path (Join-Path $Root '.git')) {
+    throw 'hooks/install-hooks.ps1 not found'
   } else {
     Write-Host '==> Skipping hooks: .git directory not found'
   }

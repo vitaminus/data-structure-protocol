@@ -165,20 +165,11 @@ if [[ "$AGENT" != "none" ]]; then
 fi
 
 if [[ "$WITH_HOOKS" -eq 1 ]]; then
-  if [[ -d "$ROOT/.git" ]]; then
-    mkdir -p "$ROOT/.git/hooks"
-    cat > "$ROOT/.git/hooks/pre-commit" <<'HOOK'
-#!/usr/bin/env bash
-set -euo pipefail
-if command -v pnpm >/dev/null 2>&1; then
-  pnpm dsp validate . --json >/tmp/dsp-validate.json
-else
-  npm run dsp -- validate . --json >/tmp/dsp-validate.json
-fi
-node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync("/tmp/dsp-validate.json","utf8")); if(r.summary && r.summary.errors>0){ console.error(JSON.stringify(r,null,2)); process.exit(1); }'
-HOOK
-    chmod +x "$ROOT/.git/hooks/pre-commit"
-    echo "==> Installed git pre-commit DSP validation hook"
+  if [[ -x "$ROOT/hooks/install-hooks.sh" ]]; then
+    "$ROOT/hooks/install-hooks.sh" "$ROOT"
+  elif [[ -d "$ROOT/.git" ]]; then
+    echo "error: hooks/install-hooks.sh not found" >&2
+    exit 1
   else
     echo "==> Skipping hooks: .git directory not found"
   fi

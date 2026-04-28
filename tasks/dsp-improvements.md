@@ -287,3 +287,11 @@ Status: done
 - Add `dsp markers apply` to insert stable `@dsp` markers before indexed symbols.
 - Support dry-run output for marker insertion.
 - Add coverage for TypeScript marker insertion using generated protocol-style IDs.
+
+## 37. Add richer DSP git hooks
+
+Status: done
+
+- Add reusable pre-commit and pre-push hooks with validation, impact, marker drift, and optional protocol export/test steps.
+- Add agent review scripts that generate changed/impact/context/validation reports under `.dsp/reports`.
+- Add hook installers for macOS/Linux and Windows, and wire the main installers to use them.
