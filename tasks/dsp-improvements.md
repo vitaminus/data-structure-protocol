@@ -263,3 +263,11 @@ Status: done
 - Add a plain-text `.dsp/protocol` export with `obj-*`/`func-*` protocol IDs.
 - Generate per-entity `description`, `imports`, `shared`, reverse `exports`, `TOC`, and `uid-map.json` files.
 - Add CLI/API support for `dsp export --format protocol` while keeping SQLite canonical.
+
+## 34. Add cross-agent installer scripts
+
+Status: done
+
+- Add macOS/Linux and Windows installers with dependency install, build, DSP init, and optional pre-commit hook setup.
+- Install Codex, Claude, and Cursor agent guidance files at project or global scope.
+- Add reusable integration templates and README install instructions.

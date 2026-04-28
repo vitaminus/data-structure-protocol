@@ -1,0 +1,16 @@
+---
+description: DSP v2 structural memory and context compiler
+alwaysApply: true
+---
+
+# DSP v2 project memory
+
+Use DSP before and after structural code changes.
+
+- Search context: `pnpm dsp search "<task>"`
+- Refactor safety: `pnpm dsp impact <file-or-uid>`
+- Update graph: `pnpm dsp update --changed-only`
+- Validate graph: `pnpm dsp validate`
+- Plain-text memory export: `pnpm dsp export --format protocol`
+
+Do not send full repositories to the model when a DSP context pack/search/impact result is sufficient.
