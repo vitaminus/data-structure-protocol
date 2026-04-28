@@ -127,3 +127,11 @@ Status: done
 - Expand grouped imports such as `use crate::{db::Repo, user::User};` before resolution.
 - Preserve per-expanded import provenance and unresolved reference reporting.
 - Add coverage for grouped imports resolving to both `mod.rs` and sibling module files.
+
+## 17. Extract Rust unit test entities
+
+Status: done
+
+- Detect `#[cfg(test)] mod ...` as test entities.
+- Detect `#[test]`, `#[tokio::test]`, and `#[async_std::test]` functions as test entities.
+- Add `tests` relations from Rust test entities back to the source file for impact/context packs.

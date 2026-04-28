@@ -167,27 +167,39 @@ export class RustLanguageAdapter implements LanguageAdapter {
     const lines = content.split("\n");
     const implStack: { target: string; trait?: string; depth: number }[] = [];
     let braceDepth = 0;
+    let pendingTestAttribute = false;
+    let pendingCfgTestAttribute = false;
     for (let index = 0; index < lines.length; index += 1) {
       const raw = lines[index];
       const line = raw.trim();
+      if (line.startsWith("#[test]") || line.startsWith("#[tokio::test]") || line.startsWith("#[async_std::test]")) {
+        pendingTestAttribute = true;
+        continue;
+      }
+      if (line.startsWith("#[cfg(test)]")) {
+        pendingCfgTestAttribute = true;
+        continue;
+      }
       while (implStack.length > 0 && braceDepth < implStack.at(-1)!.depth) {
         implStack.pop();
       }
 
-      const modMatch = line.match(/^(pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;?$/);
+      const modMatch = line.match(/^(pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*;|\s*\{)?$/);
       if (modMatch) {
         const name = modMatch[2];
         const resolvedMod = resolveModDeclaration(filePath, name);
-        const uid = buildUid("module", filePath, name);
+        const isCfgTestModule = pendingCfgTestAttribute;
+        pendingCfgTestAttribute = false;
+        const uid = buildUid(isCfgTestModule ? "test" : "module", filePath, name);
         entities.push({
           uid,
-          kind: "module",
+          kind: isCfgTestModule ? "test" : "module",
           name,
           path: filePath,
           language: "rust",
           startLine: index + 1,
           endLine: index + 1,
-          metadata: { rustKind: "module", modulePath: resolvedMod.path, ...visibilityFromPrefix(modMatch[1]) },
+          metadata: { rustKind: "module", modulePath: resolvedMod.path, cfgTest: isCfgTestModule, ...visibilityFromPrefix(modMatch[1]) },
           confidence: 0.93,
           provenance: prov(0.93, "mod declaration"),
           createdAt: now,
@@ -200,14 +212,25 @@ export class RustLanguageAdapter implements LanguageAdapter {
           confidence: 1,
           provenance: prov(1, "file contains module")
         });
-        relations.push({
-          from: fileUid,
-          to: buildUid("file", resolvedMod.path),
-          kind: "imports",
-          reason: `mod ${name}`,
-          confidence: resolvedMod.confidence,
-          provenance: prov(resolvedMod.confidence, "mod file resolution")
-        });
+        if (isCfgTestModule) {
+          relations.push({
+            from: uid,
+            to: fileUid,
+            kind: "tests",
+            confidence: 0.82,
+            provenance: prov(0.82, "cfg(test) module")
+          });
+        }
+        if (line.endsWith(";")) {
+          relations.push({
+            from: fileUid,
+            to: buildUid("file", resolvedMod.path),
+            kind: "imports",
+            reason: `mod ${name}`,
+            confidence: resolvedMod.confidence,
+            provenance: prov(resolvedMod.confidence, "mod file resolution")
+          });
+        }
       }
 
       const useMatch = line.match(/^use\s+(.+);$/);
@@ -332,24 +355,38 @@ export class RustLanguageAdapter implements LanguageAdapter {
         const name = fnMatch[2];
         const owner = implStack.at(-1)?.target;
         const isMethod = Boolean(owner);
-        const uid = isMethod
-          ? buildUid("method", filePath, `${owner}.${name}`)
-          : buildUid("function", filePath, name);
+        const isTestFunction = pendingTestAttribute;
+        pendingTestAttribute = false;
+        const entityKind = isTestFunction ? "test" : isMethod ? "method" : "function";
+        const uid = isTestFunction
+          ? buildUid("test", filePath, name)
+          : isMethod
+            ? buildUid("method", filePath, `${owner}.${name}`)
+            : buildUid("function", filePath, name);
         entities.push({
           uid,
-          kind: isMethod ? "method" : "function",
+          kind: entityKind,
           name,
           path: filePath,
           language: "rust",
           startLine: index + 1,
           endLine: index + 1,
-          metadata: { ...visibilityFromPrefix(fnMatch[1]), owner },
+          metadata: { ...visibilityFromPrefix(fnMatch[1]), owner, rustTest: isTestFunction },
           confidence: 0.93,
           provenance: prov(0.93, isMethod ? "impl method" : "function declaration"),
           createdAt: now,
           updatedAt: now
         });
-        if (owner) {
+        if (isTestFunction) {
+          relations.push({
+            from: uid,
+            to: fileUid,
+            kind: "tests",
+            confidence: 0.86,
+            provenance: prov(0.86, "rust test attribute")
+          });
+        }
+        if (owner && !isTestFunction) {
           relations.push({
             from: buildUid("type", filePath, owner),
             to: uid,

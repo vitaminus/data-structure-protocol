@@ -94,6 +94,29 @@ use crate::{db::Repo, user::User};
     }
   });
 
+  it("extracts Rust unit tests and cfg test modules", async () => {
+    const adapter = new RustLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "src/lib.rs",
+      `
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn creates_user() {}
+
+    #[tokio::test]
+    async fn async_case() {}
+}
+`
+    );
+    const entities = adapter.extractEntities(parsed);
+    const relations = adapter.extractRelations(parsed, entities);
+    expect(entities.some((entity) => entity.kind === "test" && entity.uid === "test:src/lib.rs#tests")).toBe(true);
+    expect(entities.some((entity) => entity.kind === "test" && entity.uid === "test:src/lib.rs#creates_user")).toBe(true);
+    expect(entities.some((entity) => entity.kind === "test" && entity.uid === "test:src/lib.rs#async_case")).toBe(true);
+    expect(relations.filter((relation) => relation.kind === "tests").length).toBeGreaterThanOrEqual(3);
+  });
+
   it("tracks impl scope with braces and Rust visibility modifiers", async () => {
     const adapter = new RustLanguageAdapter();
     const parsed = await adapter.parseFile(
