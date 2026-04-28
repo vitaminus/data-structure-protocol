@@ -30,6 +30,13 @@ export declare function runExport(services: DSPServices, format: "json" | "dsp" 
     format: "json" | "dsp" | "protocol";
     targetPath: string;
 };
+export declare function runMarkersApply(services: DSPServices, options?: {
+    dryRun?: boolean;
+}): {
+    filesChanged: number;
+    markersInserted: number;
+    paths: string[];
+};
 export declare function runImport(services: DSPServices, sourcePath: string): {
     entities: number;
     relations: number;

@@ -14,6 +14,7 @@ import {
   runExport,
   runImport,
   runImpact,
+  runMarkersApply,
   runIndex,
   runSearch,
   runValidate,
@@ -306,6 +307,22 @@ program
 const ci = program.command("ci").description("CI helpers");
 const cache = program.command("cache").description("Cache utilities");
 const embeddings = program.command("embeddings").description("Embeddings utilities");
+const markers = program.command("markers").description("Stable UID source marker utilities");
+
+markers
+  .command("apply")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--dry-run", "show what would be changed without writing", false)
+  .option("--json", "machine-readable output", false)
+  .action((rootDir: string, options: { dryRun: boolean; json: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      const result = runMarkersApply(services, { dryRun: options.dryRun });
+      printOutput(result, options.json);
+    } finally {
+      services.db.close();
+    }
+  });
 
 cache
   .command("stats")

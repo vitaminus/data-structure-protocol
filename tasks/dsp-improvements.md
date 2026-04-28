@@ -279,3 +279,11 @@ Status: done
 - Detect optional `@dsp obj-xxxxxxxx` / `@dsp func-xxxxxxxx` source markers during indexing.
 - Promote marked entities to stable canonical UIDs and rewrite extracted relation endpoints.
 - Teach query/impact/protocol export paths to accept protocol-style stable UIDs directly.
+
+## 36. Add source marker insertion command
+
+Status: done
+
+- Add `dsp markers apply` to insert stable `@dsp` markers before indexed symbols.
+- Support dry-run output for marker insertion.
+- Add coverage for TypeScript marker insertion using generated protocol-style IDs.

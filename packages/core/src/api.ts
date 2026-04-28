@@ -17,6 +17,7 @@ import { indexRepository, bootstrapRepository, changedFiles } from "./indexer/in
 import { semanticSearch } from "./semantic/search.js";
 import { analyzeImpact } from "./impact/impact.js";
 import { validateGraph } from "./validate/validate.js";
+import { insertSourceMarkers } from "./markers/markers.js";
 import { MockEmbeddingProvider } from "./semantic/providers.js";
 import { contentHash } from "./graph/uid.js";
 
@@ -120,6 +121,13 @@ export function runExport(
   }
   services.db.exportDsp(services.rootDir);
   return { format, targetPath: path.join(services.rootDir, ".dsp", "export") };
+}
+
+export function runMarkersApply(
+  services: DSPServices,
+  options: { dryRun?: boolean } = {}
+): { filesChanged: number; markersInserted: number; paths: string[] } {
+  return insertSourceMarkers(services.db, services.rootDir, options);
 }
 
 export function runImport(
