@@ -251,10 +251,10 @@ program
 program
   .command("export")
   .argument("[rootDir]", "root directory", ".")
-  .option("--format <format>", "json or dsp", "json")
+  .option("--format <format>", "json, dsp, or protocol", "json")
   .option("--output <path>", "output path")
   .option("--json", "machine-readable output", false)
-  .action((rootDir: string, options: { format: "json" | "dsp"; output?: string; json: boolean }) => {
+  .action((rootDir: string, options: { format: "json" | "dsp" | "protocol"; output?: string; json: boolean }) => {
     const services = openDSP(path.resolve(rootDir), adapters());
     try {
       const result = runExport(services, options.format, options.output);

@@ -65,6 +65,48 @@ describe("DSPDatabase", () => {
     fresh.close();
   });
 
+  it("exports a protocol-compatible plain text graph", () => {
+    const now = stableNowIso();
+    const fileUid = buildUid("file", "src/auth.ts");
+    const fnUid = buildUid("function", "src/auth.ts", "login");
+    db.upsertEntity({
+      uid: fileUid,
+      kind: "file",
+      name: "auth.ts",
+      path: "src/auth.ts",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+    db.upsertEntity({
+      uid: fnUid,
+      kind: "function",
+      name: "login",
+      path: "src/auth.ts",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+    db.upsertRelation({
+      from: fileUid,
+      to: fnUid,
+      kind: "exports",
+      reason: "public login API",
+      confidence: 0.9,
+      provenance: [{ source: "ast", timestamp: now, confidence: 0.9 }]
+    });
+
+    db.exportProtocol(tempDir);
+    const protocolDir = path.join(tempDir, ".dsp", "protocol");
+    const uidMap = JSON.parse(fs.readFileSync(path.join(protocolDir, "uid-map.json"), "utf8")) as Record<string, string>;
+    expect(uidMap[fileUid]).toMatch(/^obj-/);
+    expect(uidMap[fnUid]).toMatch(/^func-/);
+    expect(fs.existsSync(path.join(protocolDir, uidMap[fileUid]!, "description"))).toBe(true);
+    expect(fs.readFileSync(path.join(protocolDir, "TOC"), "utf8")).toContain(uidMap[fileUid]!);
+  });
+
   it("creates indexes for common graph lookups", () => {
     const sqlite = new Database(db.dbPath, { readonly: true });
     const rows = sqlite

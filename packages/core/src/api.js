@@ -66,6 +66,10 @@ export function runExport(services, format, targetPath) {
         services.db.exportJson(finalPath);
         return { format, targetPath: finalPath };
     }
+    if (format === "protocol") {
+        services.db.exportProtocol(services.rootDir);
+        return { format, targetPath: path.join(services.rootDir, ".dsp", "protocol") };
+    }
     services.db.exportDsp(services.rootDir);
     return { format, targetPath: path.join(services.rootDir, ".dsp", "export") };
 }

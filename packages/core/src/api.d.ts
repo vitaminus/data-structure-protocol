@@ -26,8 +26,8 @@ export declare function runSearch(services: DSPServices, query: string, opts?: {
 export declare function runImpact(services: DSPServices, target: string): ImpactResult;
 export declare function runValidate(services: DSPServices): ValidationResult;
 export declare function runContextPack(services: DSPServices, request: ContextPackRequest): Promise<ContextPackResponse>;
-export declare function runExport(services: DSPServices, format: "json" | "dsp", targetPath?: string): {
-    format: "json" | "dsp";
+export declare function runExport(services: DSPServices, format: "json" | "dsp" | "protocol", targetPath?: string): {
+    format: "json" | "dsp" | "protocol";
     targetPath: string;
 };
 export declare function runImport(services: DSPServices, sourcePath: string): {

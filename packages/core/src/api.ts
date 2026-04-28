@@ -106,13 +106,17 @@ export async function runContextPack(
 
 export function runExport(
   services: DSPServices,
-  format: "json" | "dsp",
+  format: "json" | "dsp" | "protocol",
   targetPath?: string
-): { format: "json" | "dsp"; targetPath: string } {
+): { format: "json" | "dsp" | "protocol"; targetPath: string } {
   if (format === "json") {
     const finalPath = targetPath ?? path.join(services.rootDir, ".dsp", "graph.json");
     services.db.exportJson(finalPath);
     return { format, targetPath: finalPath };
+  }
+  if (format === "protocol") {
+    services.db.exportProtocol(services.rootDir);
+    return { format, targetPath: path.join(services.rootDir, ".dsp", "protocol") };
   }
   services.db.exportDsp(services.rootDir);
   return { format, targetPath: path.join(services.rootDir, ".dsp", "export") };

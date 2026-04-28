@@ -255,3 +255,11 @@ Status: done
 - Track imported symbols from resolved `use` paths.
 - When a call has no same-file target, link it to the imported module file as a low-confidence function call.
 - Add coverage for `use crate::module::function; function();` cross-file call edges.
+
+## 33. Export upstream-compatible protocol memory
+
+Status: done
+
+- Add a plain-text `.dsp/protocol` export with `obj-*`/`func-*` protocol IDs.
+- Generate per-entity `description`, `imports`, `shared`, reverse `exports`, `TOC`, and `uid-map.json` files.
+- Add CLI/API support for `dsp export --format protocol` while keeping SQLite canonical.

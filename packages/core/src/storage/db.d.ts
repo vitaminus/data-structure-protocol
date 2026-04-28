@@ -33,6 +33,7 @@ export declare class DSPDatabase {
     getSnapshot(): GraphSnapshot;
     exportJson(targetPath: string): void;
     importJson(sourcePath: string): GraphSnapshot;
+    exportProtocol(targetDir: string): void;
     exportDsp(targetDir: string): void;
     setEmbedding(uid: string, hash: string, vector: number[], provider: string, updatedAt: string): void;
     getEmbedding(uid: string): {
