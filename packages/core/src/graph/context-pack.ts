@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { ContextPackRequest, ContextPackResponse, Entity, Relation } from "./types.ts";
-import type { DSPDatabase } from "../storage/db.ts";
+import type { ContextPackRequest, ContextPackResponse, EmbeddingProvider, Entity, Relation } from "./types.ts";
+import { DSPDatabase } from "../storage/db.ts";
 import { semanticSearch } from "../semantic/search.ts";
 
 type StrategyDefaults = {
@@ -10,6 +10,15 @@ type StrategyDefaults = {
   includeTests: boolean;
 };
 type CodePayload = NonNullable<ContextPackResponse["code"]>[number];
+type ContextPackServices = {
+  db: DSPDatabase;
+  config?: {
+    embeddings?: {
+      enabled?: boolean;
+    };
+  };
+  embeddingProvider?: EmbeddingProvider;
+};
 
 const STRATEGY_DEFAULTS: Record<NonNullable<ContextPackRequest["strategy"]>, StrategyDefaults> = {
   minimal: { maxFiles: 8, maxDepth: 1, includeTests: false },
@@ -87,7 +96,7 @@ function readCodePayload(
 }
 
 function relationDepthFilter(
-  relations: Relation[],
+  db: DSPDatabase,
   seedUids: Set<string>,
   maxDepth: number
 ): { entities: Set<string>; relations: Relation[] } {
@@ -97,6 +106,7 @@ function relationDepthFilter(
   const visited = new Set<string>(seedUids);
   for (let depth = 0; depth < maxDepth; depth += 1) {
     const next = new Set<string>();
+    const relations = db.getRelationsTouching([...frontier], null);
     for (const relation of relations) {
       if (!frontier.has(relation.from) && !frontier.has(relation.to)) {
         continue;
@@ -126,22 +136,84 @@ function relationDepthFilter(
   return { entities: visited, relations: accepted };
 }
 
+function contextPackServices(input: DSPDatabase | ContextPackServices): ContextPackServices {
+  return input instanceof DSPDatabase ? { db: input } : input;
+}
+
+function topoSortByDependencies(
+  files: string[],
+  entities: Entity[],
+  dependencies: Relation[]
+): string[] {
+  const fileSet = new Set(files);
+  const entityPathByUid = new Map(entities.map((entity) => [entity.uid, entity.path]));
+  const adjacency = new Map(files.map((file) => [file, new Set<string>()]));
+  const indegree = new Map(files.map((file) => [file, 0]));
+  const dependencyKinds = new Set(["imports", "depends_on", "calls", "routes_to", "uses"]);
+
+  for (const relation of dependencies) {
+    if (!dependencyKinds.has(relation.kind)) {
+      continue;
+    }
+    const fromPath = entityPathByUid.get(relation.from);
+    const toPath = entityPathByUid.get(relation.to);
+    if (!fromPath || !toPath || fromPath === toPath || !fileSet.has(fromPath) || !fileSet.has(toPath)) {
+      continue;
+    }
+    const dependents = adjacency.get(toPath);
+    if (dependents && !dependents.has(fromPath)) {
+      dependents.add(fromPath);
+      indegree.set(fromPath, (indegree.get(fromPath) ?? 0) + 1);
+    }
+  }
+
+  const orderRank = new Map(files.map((file, index) => [file, index]));
+  const queue = files
+    .filter((file) => (indegree.get(file) ?? 0) === 0)
+    .sort((a, b) => (orderRank.get(a) ?? 0) - (orderRank.get(b) ?? 0));
+  const ordered: string[] = [];
+
+  while (queue.length > 0) {
+    const file = queue.shift()!;
+    ordered.push(file);
+    for (const dependent of adjacency.get(file) ?? []) {
+      indegree.set(dependent, (indegree.get(dependent) ?? 0) - 1);
+      if ((indegree.get(dependent) ?? 0) === 0) {
+        queue.push(dependent);
+        queue.sort((a, b) => (orderRank.get(a) ?? 0) - (orderRank.get(b) ?? 0));
+      }
+    }
+  }
+
+  for (const file of files) {
+    if (!ordered.includes(file)) {
+      ordered.push(file);
+    }
+  }
+  return ordered;
+}
+
 export async function buildContextPack(
-  db: DSPDatabase,
+  input: DSPDatabase | ContextPackServices,
   request: ContextPackRequest
 ): Promise<ContextPackResponse> {
+  const services = contextPackServices(input);
+  const db = services.db;
   const strategyDefaults = STRATEGY_DEFAULTS[request.strategy ?? "balanced"];
   const maxTokens = request.maxTokens ?? 8000;
   const maxFiles = request.maxFiles ?? strategyDefaults.maxFiles;
   const maxDepth = request.maxDepth ?? strategyDefaults.maxDepth;
   const includeTests = request.includeTests ?? strategyDefaults.includeTests;
   const includeCode = request.includeCode ?? "none";
+  const embeddingsEnabled = Boolean(services.config?.embeddings?.enabled && services.embeddingProvider);
   const searchResults = await semanticSearch(db, request.task, {
     topK: Math.max(25, maxFiles * 2),
-    embeddingsEnabled: false
+    embeddingsEnabled,
+    provider: services.embeddingProvider
   });
   const entitiesByUid = new Map<string, Entity>();
-  for (const entity of db.getEntities(200000)) {
+  const seedEntities = db.getEntitiesByUid(searchResults.map((result) => result.uid));
+  for (const entity of seedEntities) {
     entitiesByUid.set(entity.uid, entity);
   }
   const rankedEntities = searchResults
@@ -150,13 +222,17 @@ export async function buildContextPack(
     .filter((entity) => includeTests || entity.kind !== "test");
   const selectedEntities = rankedEntities.slice(0, maxFiles * 3);
   const selectedUids = new Set(selectedEntities.map((entity) => entity.uid));
-  const allRelations = db.getRelations(500000);
-  const graphSlice = relationDepthFilter(allRelations, selectedUids, maxDepth);
-  const dependencies = graphSlice.relations
-    .filter((relation) => graphSlice.entities.has(relation.from) && graphSlice.entities.has(relation.to))
-    .slice(0, 300);
+  const graphSlice = relationDepthFilter(db, selectedUids, maxDepth);
+  const graphDependencies = graphSlice.relations.filter(
+    (relation) => graphSlice.entities.has(relation.from) && graphSlice.entities.has(relation.to)
+  );
+  const dependencies = graphDependencies.slice(0, 300);
+  const dependenciesTruncated = graphDependencies.length > dependencies.length;
   const contextEntities = [...selectedEntities];
   const contextEntityUids = new Set(contextEntities.map((entity) => entity.uid));
+  for (const entity of db.getEntitiesByUid([...graphSlice.entities])) {
+    entitiesByUid.set(entity.uid, entity);
+  }
   for (const uid of graphSlice.entities) {
     const entity = entitiesByUid.get(uid);
     if (!includeTests && entity?.kind === "test") {
@@ -178,10 +254,14 @@ export async function buildContextPack(
     dependencies.some((rel) => rel.kind === "exports")
       ? "Public API nodes involved in context."
       : "No direct public API edges in selected context.",
-    tests.length > 0 ? `${tests.length} related tests included.` : "No tests in top-ranked context."
+    tests.length > 0 ? `${tests.length} related tests included.` : "No tests in top-ranked context.",
+    ...(dependenciesTruncated ? [`Graph dependencies truncated from ${graphDependencies.length} to ${dependencies.length}.`] : [])
   ];
 
-  const suggestedEditOrder = files.slice(0, Math.min(files.length, 10));
+  const suggestedEditOrder = topoSortByDependencies(files, contextEntities, dependencies).slice(
+    0,
+    Math.min(files.length, 10)
+  );
   let context: ContextPackResponse = {
     relevantEntities: contextEntities.slice(0, maxFiles * 4),
     files,
@@ -192,7 +272,7 @@ export async function buildContextPack(
     suggestedEditOrder,
     estimatedTokens: 0,
     maxTokens,
-    truncated: false
+    truncated: dependenciesTruncated
   };
 
   let estimatedTokens = estimateTokens(JSON.stringify(context));

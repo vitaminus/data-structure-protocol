@@ -311,3 +311,67 @@ Status: done
 - Add upstream-style manual commands: `create-object`, `create-function`, `create-shared`, `add-import`, `update-description`, `update-import-why`, `move-entity`, `remove-import`, `remove-shared`, and `remove-entity`.
 - Add public database deletion helpers for manual relation/entity cleanup.
 - Keep manual writes provenance-tagged as human/dsp-cli while preserving auto-index as the primary path.
+
+## 40. Use configured parallelism during indexing
+
+Status: done
+
+- Split indexing into a parallel parse/extract phase and a sequential SQLite commit phase.
+- Limit parse concurrency with `performance.parallelism` while keeping DB writes deterministic.
+- Add integration coverage comparing graph snapshots for `parallelism=1` and `parallelism=4`.
+- Add failure handling coverage so failed parses mark the run failed without partially refreshing the failing file.
+
+## 41. Move search, validation, and graph slicing closer to SQLite
+
+Status: done
+
+- Add schema versioning and migrations for secondary indexes and `entity_fts`.
+- Use SQLite/FTS to narrow lexical search candidates before JS reranking.
+- Add targeted DB helpers for entity batches, relation neighborhoods, validation scans, and context-pack graph slices.
+- Add migration, ranking, and synthetic stress coverage for large graphs.
+
+## 42. Enable configured embeddings in ContextPack
+
+Status: done
+
+- Add a shared runtime embedding provider policy to `DSPServices`.
+- Let `runSearch`, MCP semantic search, and ContextPack use the same provider/config behavior.
+- Keep embeddings disabled by default for backward compatibility.
+- Add dependency-aware `suggestedEditOrder` instead of returning the first selected files.
+- Add deterministic mock-provider, invalidation, mixed-cache, and disabled-mode tests.
+
+## 43. Build an integration and contract test matrix
+
+Status: done
+
+- Add representative multi-language fixtures and golden outputs for `.dsp/export` and `.dsp/protocol`.
+- Cover init, index, search, impact, context pack, validate, export/import, markers, and MCP as an end-to-end system.
+- Add changed-only update scenarios for rename, delete, and import graph changes.
+- Split the suite into fast smoke tests and fuller integration coverage.
+
+## 44. Add a formal benchmark suite and baseline JSON output
+
+Status: done
+
+- Add `bench/` fixtures, scripts, and baseline result files.
+- Measure cold bootstrap, warm reindex, changed-only update, search, context-pack, validate, RSS, and SQLite size.
+- Record results for multiple `performance.parallelism` values.
+- Add retrieval-quality query sets for context-pack comparison.
+
+## 45. Add GitHub Actions CI and coverage reporting
+
+Status: done
+
+- Add workflow jobs for lint/typecheck, unit tests, integration smoke tests, and build on Node 20/22.
+- Add coverage artifact/report generation after the core suite is stable.
+- Add a non-blocking benchmark smoke job once `bench/` exists.
+- Keep local hook checks and server CI behavior aligned.
+
+## 46. Consolidate API schemas and strengthen graph typing
+
+Status: done
+
+- Fix `dsp embeddings stats` to report embedding-specific stats instead of generic cache stats.
+- Introduce shared CLI/MCP input schemas or validators to reduce surface drift.
+- Add branded UID/helper types in a backward-compatible, staged way.
+- Add CLI output snapshots, MCP schema snapshots, compile-time typing tests, and an embeddings stats regression test.

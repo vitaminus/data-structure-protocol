@@ -163,4 +163,90 @@ describe("DSPDatabase", () => {
       ])
     );
   });
+
+  it("indexes entities into SQLite FTS for lexical candidate lookup", () => {
+    const now = stableNowIso();
+    const uid = buildUid("function", "src/users.ts", "createUser");
+    db.upsertEntity({
+      uid,
+      kind: "function",
+      name: "createUser",
+      path: "src/users.ts",
+      description: "Creates account records",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+
+    expect(db.searchEntityUids("create user", 10)).toContain(uid);
+  });
+
+  it("rebuilds FTS when opening a legacy database without schema metadata", () => {
+    db.close();
+    const legacyRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dsp-legacy-db-test-"));
+    const dspDir = path.join(legacyRoot, ".dsp");
+    fs.mkdirSync(dspDir, { recursive: true });
+    const sqlite = new Database(path.join(dspDir, "dsp.sqlite"));
+    sqlite.exec(`
+      CREATE TABLE entities (
+        uid TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        name TEXT NOT NULL,
+        path TEXT,
+        language TEXT,
+        signature TEXT,
+        start_line INTEGER,
+        end_line INTEGER,
+        description TEXT,
+        docstring TEXT,
+        tags_json TEXT,
+        metadata_json TEXT,
+        confidence REAL NOT NULL,
+        provenance_json TEXT NOT NULL,
+        source_priority INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+    const now = stableNowIso();
+    const uid = buildUid("function", "src/auth.ts", "validateToken");
+    sqlite
+      .prepare(
+        `
+        INSERT INTO entities (
+          uid, kind, name, path, language, signature, start_line, end_line,
+          description, docstring, tags_json, metadata_json, confidence, provenance_json,
+          source_priority, created_at, updated_at
+        ) VALUES (?, 'function', 'validateToken', 'src/auth.ts', 'typescript', NULL, NULL, NULL,
+          'Validates bearer tokens', NULL, '[]', '{}', 1, ?, 10, ?, ?)
+        `
+      )
+      .run(uid, JSON.stringify([{ source: "ast", timestamp: now, confidence: 1 }]), now, now);
+    sqlite.close();
+
+    const migrated = new DSPDatabase(legacyRoot);
+    try {
+      expect(migrated.searchEntityUids("validate token", 10)).toContain(uid);
+    } finally {
+      migrated.close();
+      fs.rmSync(legacyRoot, { recursive: true, force: true });
+      db = new DSPDatabase(tempDir);
+    }
+  });
+
+  it("reports embedding counts by provider", () => {
+    const now = stableNowIso();
+    db.setEmbedding("function:src/auth.ts#login", "hash-a", [0.1, 0.2], "mock", now);
+    db.setEmbedding("function:src/user.ts#create", "hash-b", [0.3, 0.4], "openai-compatible", now);
+    db.setEmbedding("function:src/user.ts#update", "hash-c", [0.5, 0.6], "mock", now);
+
+    expect(db.embeddingStats()).toEqual({
+      total: 3,
+      byProvider: {
+        mock: 2,
+        "openai-compatible": 1
+      }
+    });
+  });
 });

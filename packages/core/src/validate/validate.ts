@@ -28,61 +28,61 @@ function withSeverity(issue: Omit<ValidationIssue, "severity">): ValidationIssue
 
 export function validateGraph(db: DSPDatabase, rootDir: string): ValidationResult {
   const issues: ValidationIssue[] = [];
-  const entities = db.getEntities(300000);
-  const entitySet = new Set(entities.map((entity) => entity.uid));
-  const relations = db.getRelations(600000);
+  const fileEntities = db.getFileEntities(300000);
+  const danglingRelations = db.getDanglingRelations(600000);
+  const lowConfidenceRelations = db.getLowConfidenceCriticalRelations(600000);
   const unresolved = db.getUnresolvedReferences();
 
-  for (const entity of entities) {
-    if (entity.kind === "file" && entity.path) {
-      const absPath = path.join(rootDir, entity.path);
-      try {
-        const content = readFileSync(absPath, "utf8");
-        const currentHash = contentHash(content);
-        const indexedHash = db.getFileHash(entity.path);
-        if (indexedHash && indexedHash !== currentHash) {
-          issues.push(
-            withSeverity({
-              kind: "stale_hash",
-              uid: entity.uid,
-              path: entity.path,
-              message: `File hash changed since last index: ${entity.path}`
-            })
-          );
-        }
-      } catch {
+  for (const entity of fileEntities) {
+    if (!entity.path) {
+      continue;
+    }
+    const absPath = path.join(rootDir, entity.path);
+    try {
+      const content = readFileSync(absPath, "utf8");
+      const currentHash = contentHash(content);
+      const indexedHash = db.getFileHash(entity.path);
+      if (indexedHash && indexedHash !== currentHash) {
         issues.push(
           withSeverity({
-            kind: "missing_file",
+            kind: "stale_hash",
             uid: entity.uid,
             path: entity.path,
-            message: `Indexed file no longer exists: ${entity.path}`
+            message: `File hash changed since last index: ${entity.path}`
           })
         );
       }
+    } catch {
+      issues.push(
+        withSeverity({
+          kind: "missing_file",
+          uid: entity.uid,
+          path: entity.path,
+          message: `Indexed file no longer exists: ${entity.path}`
+        })
+      );
     }
   }
 
-  for (const relation of relations) {
-    if (!entitySet.has(relation.from) || !entitySet.has(relation.to)) {
-      issues.push(
-        withSeverity({
-          kind: "dangling_relation",
-          relation: { from: relation.from, to: relation.to, kind: relation.kind },
-          message: `Relation has missing endpoint: ${relation.from} -> ${relation.to}`
-        })
-      );
-    }
-    if (["imports", "depends_on", "calls"].includes(relation.kind) && relation.confidence < 0.35) {
-      issues.push(
-        withSeverity({
-          kind: "low_confidence_critical",
-          relation: { from: relation.from, to: relation.to, kind: relation.kind },
-          confidence: relation.confidence,
-          message: `Low confidence on critical relation ${relation.kind}: ${relation.from} -> ${relation.to}`
-        })
-      );
-    }
+  for (const relation of danglingRelations) {
+    issues.push(
+      withSeverity({
+        kind: "dangling_relation",
+        relation: { from: relation.from, to: relation.to, kind: relation.kind },
+        message: `Relation has missing endpoint: ${relation.from} -> ${relation.to}`
+      })
+    );
+  }
+
+  for (const relation of lowConfidenceRelations) {
+    issues.push(
+      withSeverity({
+        kind: "low_confidence_critical",
+        relation: { from: relation.from, to: relation.to, kind: relation.kind },
+        confidence: relation.confidence,
+        message: `Low confidence on critical relation ${relation.kind}: ${relation.from} -> ${relation.to}`
+      })
+    );
   }
 
   for (const ref of unresolved) {
@@ -97,7 +97,7 @@ export function validateGraph(db: DSPDatabase, rootDir: string): ValidationResul
     );
   }
 
-  const annotationConflicts = entities.filter((entity) => {
+  const annotationConflicts = db.getEntities(300000).filter((entity) => {
     const sources = new Set(entity.provenance.map((provenance) => provenance.source));
     return sources.has("human") && sources.has("ast") && entity.confidence < 0.5;
   });

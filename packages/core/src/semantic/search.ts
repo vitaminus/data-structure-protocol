@@ -33,24 +33,56 @@ function normalizedText(text: string): string {
   return tokenize(text).join(" ");
 }
 
+function providerCacheKey(provider: EmbeddingProvider): string {
+  return provider.cacheKey?.() ?? provider.constructor.name;
+}
+
 export async function semanticSearch(
   db: DSPDatabase,
   query: string,
   options: {
     topK?: number;
+    candidateLimit?: number;
     provider?: EmbeddingProvider;
     embeddingsEnabled?: boolean;
   } = {}
 ): Promise<SearchResult[]> {
   const topK = options.topK ?? 20;
-  const entities = db.getEntities(200000);
+  const candidateLimit = options.candidateLimit ?? Math.max(500, topK * 20);
   const tokens = tokenize(query);
   const normalizedQuery = tokens.join(" ");
+  const providerKey = options.provider ? providerCacheKey(options.provider) : undefined;
 
   let queryVector: number[] | undefined;
   if (options.embeddingsEnabled && options.provider) {
     queryVector = await options.provider.embed(query);
   }
+
+  const lexicalCandidateUids = db.searchEntityUids(query, candidateLimit);
+  const expandedCandidateUids = new Set(lexicalCandidateUids);
+  for (const uid of lexicalCandidateUids) {
+    for (const relation of db.getRelationsFrom(uid).slice(0, 10)) {
+      expandedCandidateUids.add(relation.to);
+    }
+    for (const relation of db.getRelationsTo(uid).slice(0, 10)) {
+      expandedCandidateUids.add(relation.from);
+    }
+  }
+
+  if (queryVector && providerKey) {
+    const storedEmbeddings = db.getEmbeddingsByProvider(providerKey);
+    for (const embedding of storedEmbeddings) {
+      expandedCandidateUids.add(embedding.uid);
+    }
+
+    if (storedEmbeddings.length < db.entityCount()) {
+      for (const entity of db.getEntities(200000)) {
+        expandedCandidateUids.add(entity.uid);
+      }
+    }
+  }
+
+  const entities = db.getEntitiesByUid([...expandedCandidateUids]);
 
   const scored: SearchResult[] = [];
   for (const entity of entities) {
@@ -101,7 +133,7 @@ export async function semanticSearch(
     }
 
     let embeddingScore = 0;
-    if (queryVector && options.provider) {
+    if (queryVector && options.provider && providerKey) {
       const semanticText = [
         entity.name,
         entity.signature ?? "",
@@ -111,11 +143,11 @@ export async function semanticSearch(
       const hash = contentHash(semanticText);
       const stored = db.getEmbedding(entity.uid);
       let vector: number[] | undefined;
-      if (stored && stored.hash === hash) {
+      if (stored && stored.hash === hash && stored.provider === providerKey) {
         vector = stored.vector;
       } else {
         vector = await options.provider.embed(semanticText);
-        db.setEmbedding(entity.uid, hash, vector, options.provider.constructor.name, new Date().toISOString());
+        db.setEmbedding(entity.uid, hash, vector, providerKey, new Date().toISOString());
       }
       embeddingScore = cosineSimilarity(queryVector, vector);
     }

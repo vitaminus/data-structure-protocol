@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DSPDatabase } from "../storage/db.ts";
 import { buildUid, stableNowIso } from "./uid.ts";
 import { buildContextPack } from "./context-pack.ts";
+import { DEFAULT_CONFIG } from "../config/types.ts";
+import { MockEmbeddingProvider } from "../semantic/providers.ts";
 
 describe("context pack", () => {
   let tempDir: string;
@@ -155,5 +157,138 @@ describe("context pack", () => {
       truncated: false
     });
     expect(result.code?.[0]?.content).toContain("createToken");
+  });
+
+  it("uses configured embeddings provider when building context packs through services", async () => {
+    const result = await buildContextPack(
+      {
+        db,
+        config: {
+          ...DEFAULT_CONFIG,
+          embeddings: { ...DEFAULT_CONFIG.embeddings, enabled: true, provider: "mock" }
+        },
+        embeddingProvider: new MockEmbeddingProvider()
+      },
+      {
+        task: "authentication logic",
+        maxFiles: 3
+      }
+    );
+
+    expect(result.relevantEntities.length).toBeGreaterThan(0);
+    expect(db.cacheStats().embeddings).toBeGreaterThan(0);
+  });
+
+  it("orders suggested edits with dependencies before dependents", async () => {
+    const now = stableNowIso();
+    const serviceUid = buildUid("function", "src/service.ts", "loadUser");
+    const appUid = buildUid("function", "src/app.ts", "renderUser");
+    db.upsertEntity({
+      uid: serviceUid,
+      kind: "function",
+      name: "loadUser",
+      path: "src/service.ts",
+      description: "user loading service dependency",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+    db.upsertEntity({
+      uid: appUid,
+      kind: "function",
+      name: "renderUser",
+      path: "src/app.ts",
+      description: "user rendering app dependent",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+    db.upsertRelation({
+      from: appUid,
+      to: serviceUid,
+      kind: "depends_on",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+
+    const result = await buildContextPack(db, {
+      task: "user service dependency render",
+      maxFiles: 5,
+      maxDepth: 1
+    });
+
+    expect(result.suggestedEditOrder.indexOf("src/service.ts")).toBeLessThan(
+      result.suggestedEditOrder.indexOf("src/app.ts")
+    );
+  });
+
+  it("does not silently drop direct graph neighbors after 5000 relations", async () => {
+    const now = stableNowIso();
+    const rootUid = buildUid("function", "src/root.ts", "root");
+    const importantUid = buildUid("function", "src/zzzz-important.ts", "handler");
+    db.transaction(() => {
+      db.upsertEntity({
+        uid: rootUid,
+        kind: "function",
+        name: "root",
+        path: "src/root.ts",
+        description: "root fanout",
+        confidence: 1,
+        provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+        createdAt: now,
+        updatedAt: now
+      });
+      for (let index = 0; index < 5005; index += 1) {
+        const uid = buildUid("function", `src/generated-${String(index).padStart(4, "0")}.ts`, "handler");
+        db.upsertEntity({
+          uid,
+          kind: "function",
+          name: `handler${index}`,
+          path: `src/generated-${String(index).padStart(4, "0")}.ts`,
+          description: "generated dependency",
+          confidence: 1,
+          provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+          createdAt: now,
+          updatedAt: now
+        });
+        db.upsertRelation({
+          from: rootUid,
+          to: uid,
+          kind: "calls",
+          confidence: 1,
+          provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+        });
+      }
+      db.upsertEntity({
+        uid: importantUid,
+        kind: "function",
+        name: "handler",
+        path: "src/zzzz-important.ts",
+        description: "late ordered direct dependency",
+        confidence: 1,
+        provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+        createdAt: now,
+        updatedAt: now
+      });
+      db.upsertRelation({
+        from: rootUid,
+        to: importantUid,
+        kind: "calls",
+        confidence: 1,
+        provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+      });
+    });
+
+    const result = await buildContextPack(db, {
+      task: "root fanout",
+      maxDepth: 1,
+      maxFiles: 6008
+    });
+
+    expect(result.relevantEntities.map((entity) => entity.uid)).toContain(importantUid);
+    expect(result.truncated).toBe(true);
+    expect(result.riskNotes.some((note) => note.includes("Graph dependencies truncated"))).toBe(true);
   });
 });

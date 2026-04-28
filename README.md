@@ -1,14 +1,14 @@
-# DSP v2
+# DSP
 
-DSP v2 is a local context compiler for AI coding agents.
+DSP is a local context compiler for AI coding agents.
 
 It builds a deterministic structural-semantic graph of a repository, keeps it incrementally updated, and serves bounded context packs for coding tasks.
 
 ## Why not just grep?
 
 - `grep`/`rg` is lexical only.
-- DSP v2 adds typed entities, graph relations, provenance, confidence, and impact analysis.
-- DSP v2 can return ranked task-focused context without sending full repo content to an LLM.
+- DSP adds typed entities, graph relations, provenance, confidence, and impact analysis.
+- DSP can return ranked task-focused context without sending full repo content to an LLM.
 
 ## Why not only vector DB?
 

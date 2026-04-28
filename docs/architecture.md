@@ -11,14 +11,16 @@
 
 1. Discover files with ignore rules + `.gitignore`
 2. Select language adapter
-3. Parse file and extract entities/relations/unresolved refs
-4. Upsert into SQLite with source-priority merge
+3. Parse files and extract entities/relations/unresolved refs with concurrency capped by `performance.parallelism`
+4. Commit parsed file results to SQLite sequentially with source-priority merge
 5. Store file hash for incremental updates
 6. Expose graph through CLI and MCP
 
+The parse/extract phase may complete files in a different order when `performance.parallelism` is greater than 1. SQLite commits remain serial and deterministic in discovered-file order.
+
 ## Storage
 
-SQLite is canonical. `.dsp` and JSON are exports.
+SQLite is canonical. `.dsp` and JSON are exports. Secondary lookup surfaces such as `entity_fts` are rebuilt automatically through schema migrations and are not the source of truth.
 
 Tables:
 
@@ -30,3 +32,6 @@ Tables:
 - `embeddings`
 - `unresolved_references`
 - `checkpoints`
+- `entity_fts`
+
+Search and context-pack graph slicing first narrow candidates in SQLite, then use JavaScript for graph-aware reranking and response shaping.

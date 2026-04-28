@@ -1,0 +1,14 @@
+[
+  {
+    "query": "auth token validation",
+    "expectedPathIncludes": ["auth-"]
+  },
+  {
+    "query": "handle auth",
+    "expectedPathIncludes": ["auth-"]
+  },
+  {
+    "query": "token length check",
+    "expectedPathIncludes": ["auth-"]
+  }
+]

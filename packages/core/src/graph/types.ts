@@ -13,6 +13,12 @@ export type EntityKind =
   | "test"
   | "unknown";
 
+export type Brand<T, B extends string> = T & { readonly __brand: B };
+
+export type EntityUid<K extends EntityKind = EntityKind> = Brand<string, `entity:${K}`>;
+
+export type FileUid = EntityUid<"file">;
+
 export type RelationKind =
   | "contains"
   | "imports"
@@ -93,6 +99,7 @@ export type LanguageAdapter = {
 
 export type EmbeddingProvider = {
   embed(text: string): Promise<number[]>;
+  cacheKey?: () => string;
 };
 
 export type SearchResult = {

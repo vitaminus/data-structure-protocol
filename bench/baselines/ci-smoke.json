@@ -1,0 +1,20 @@
+{
+  "max": {
+    "tiny-synthetic-ts": {
+      "coldBootstrapMs": 500,
+      "warmIndexMs": 200,
+      "changedOnlyMs": 100,
+      "searchP95Ms": 100,
+      "searchCandidatesP50": 500,
+      "contextPackP95Ms": 150,
+      "validateMs": 100,
+      "rssMb": 512,
+      "dbSizeMb": 16
+    }
+  },
+  "min": {
+    "tiny-synthetic-ts": {
+      "retrievalRecallAt5": 1
+    }
+  }
+}
