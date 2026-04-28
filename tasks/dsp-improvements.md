@@ -159,3 +159,11 @@ Status: done
 - Extract Rails model associations, validations, scopes, callbacks, and enums.
 - Add domain macro entities and class containment relations.
 - Add `depends_on` relations from model classes to associated model files.
+
+## 21. Link Ruby test files to implementation files
+
+Status: done
+
+- Map RSpec files under `spec/models`, `spec/controllers`, `spec/services`, jobs, mailers, and lib to matching implementation paths.
+- Map Minitest files under `test/models`, `test/controllers`, services, jobs, mailers, and lib to matching implementation paths.
+- Add `test` entities and `tests` relations for Ruby test path conventions.

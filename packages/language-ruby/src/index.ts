@@ -462,6 +462,29 @@ function controllerActionTarget(controllerAction: string): { filePath: string; c
   return { filePath, className, methodName: action };
 }
 
+function implementationPathForRubyTest(filePath: string): string | undefined {
+  const normalized = filePath.replaceAll("\\", "/");
+  const specMatch = normalized.match(/(?:^|\/)spec\/(models|controllers|services|jobs|mailers|requests|system|lib)\/(.+)_spec\.rb$/);
+  if (specMatch) {
+    const area = specMatch[1]!;
+    const relative = specMatch[2]!;
+    if (area === "requests" || area === "system") {
+      return undefined;
+    }
+    if (area === "lib") {
+      return `lib/${relative}.rb`;
+    }
+    return `app/${area}/${relative}.rb`;
+  }
+  const testMatch = normalized.match(/(?:^|\/)test\/(models|controllers|services|jobs|mailers|lib)\/(.+)_test\.rb$/);
+  if (testMatch) {
+    const area = testMatch[1]!;
+    const relative = testMatch[2]!;
+    return area === "lib" ? `lib/${relative}.rb` : `app/${area}/${relative}.rb`;
+  }
+  return undefined;
+}
+
 function railsConstantForPath(filePath: string): string | undefined {
   const match = filePath.match(/(?:^|\/)app\/(models|controllers|services|jobs|mailers)\/(.+)\.rb$/);
   if (!match) {
@@ -678,6 +701,31 @@ export class RubyLanguageAdapter implements LanguageAdapter {
           });
         }
       }
+    }
+
+    const testedPath = implementationPathForRubyTest(filePath);
+    if (testedPath) {
+      const testUid = buildUid("test", filePath);
+      addEntity({
+        uid: testUid,
+        kind: "test",
+        name: path.basename(filePath),
+        path: filePath,
+        language: "ruby",
+        confidence: 0.86,
+        provenance: prov(0.86, "regex", "ruby test path convention"),
+        metadata: { testedPath },
+        createdAt: now,
+        updatedAt: now
+      });
+      relations.push({
+        from: testUid,
+        to: buildUid("file", testedPath),
+        kind: "tests",
+        reason: "ruby test path convention",
+        confidence: 0.86,
+        provenance: prov(0.86, "regex", "ruby test path convention")
+      });
     }
 
     return {

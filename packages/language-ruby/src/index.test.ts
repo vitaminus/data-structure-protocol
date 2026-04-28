@@ -86,6 +86,20 @@ end
     ).toBe(true);
   });
 
+  it("links Ruby spec and test files to implementation files", async () => {
+    const adapter = new RubyLanguageAdapter();
+    const spec = await adapter.parseFile("spec/models/user_spec.rb", "RSpec.describe User do\nend\n");
+    const minitest = await adapter.parseFile("test/controllers/users_controller_test.rb", "class UsersControllerTest\nend\n");
+    expect(
+      spec.relations.some((relation) => relation.kind === "tests" && relation.to === "file:app/models/user.rb")
+    ).toBe(true);
+    expect(
+      minitest.relations.some(
+        (relation) => relation.kind === "tests" && relation.to === "file:app/controllers/users_controller.rb"
+      )
+    ).toBe(true);
+  });
+
   it("indexes ActiveRecord associations, validations, scopes, callbacks and enums", async () => {
     const adapter = new RubyLanguageAdapter();
     const parsed = await adapter.parseFile(
