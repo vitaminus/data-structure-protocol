@@ -34,6 +34,44 @@ describe("typescript adapter", () => {
     expect(relations.some((relation) => relation.kind === "exports")).toBe(true);
   });
 
+  it("extracts TypeScript extends and implements relations", async () => {
+    const adapter = new TypeScriptLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "src/auth.ts",
+      `
+interface BaseRepo {}
+interface UserRepo extends BaseRepo {}
+class BaseService {}
+class AuthService extends BaseService implements UserRepo {}
+`
+    );
+    const relations = adapter.extractRelations(parsed, parsed.entities);
+    expect(
+      relations.some(
+        (relation) =>
+          relation.kind === "extends" &&
+          relation.from === "class:src/auth.ts#AuthService" &&
+          relation.to === "class:src/auth.ts#BaseService"
+      )
+    ).toBe(true);
+    expect(
+      relations.some(
+        (relation) =>
+          relation.kind === "implements" &&
+          relation.from === "class:src/auth.ts#AuthService" &&
+          relation.to === "interface:src/auth.ts#UserRepo"
+      )
+    ).toBe(true);
+    expect(
+      relations.some(
+        (relation) =>
+          relation.kind === "extends" &&
+          relation.from === "interface:src/auth.ts#UserRepo" &&
+          relation.to === "interface:src/auth.ts#BaseRepo"
+      )
+    ).toBe(true);
+  });
+
   it("extracts exported arrow functions, constants and enums", async () => {
     const adapter = new TypeScriptLanguageAdapter();
     const parsed = await adapter.parseFile(

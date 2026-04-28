@@ -228,6 +228,19 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
           createdAt: now,
           updatedAt: now
         });
+        for (const clause of node.heritageClauses ?? []) {
+          for (const type of clause.types) {
+            const targetName = type.expression.getText(source);
+            relations.push({
+              from: classUid,
+              to: buildUid(clause.token === ts.SyntaxKind.ExtendsKeyword ? "class" : "interface", filePath, targetName),
+              kind: clause.token === ts.SyntaxKind.ExtendsKeyword ? "extends" : "implements",
+              reason: targetName,
+              confidence: 0.86,
+              provenance: withProv(0.86, clause.token === ts.SyntaxKind.ExtendsKeyword ? "class extends" : "class implements")
+            });
+          }
+        }
         for (const member of node.members) {
           if (ts.isMethodDeclaration(member) && member.name && ts.isIdentifier(member.name)) {
             const methodName = member.name.text;
@@ -259,8 +272,9 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
 
       if (ts.isInterfaceDeclaration(node)) {
         const name = node.name.text;
+        const interfaceUid = buildUid("interface", filePath, name);
         addEntity({
-          uid: buildUid("interface", filePath, name),
+          uid: interfaceUid,
           kind: "interface",
           name,
           path: filePath,
@@ -273,6 +287,19 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
           createdAt: now,
           updatedAt: now
         });
+        for (const clause of node.heritageClauses ?? []) {
+          for (const type of clause.types) {
+            const targetName = type.expression.getText(source);
+            relations.push({
+              from: interfaceUid,
+              to: buildUid("interface", filePath, targetName),
+              kind: "extends",
+              reason: targetName,
+              confidence: 0.86,
+              provenance: withProv(0.86, "interface extends")
+            });
+          }
+        }
       }
 
       if (ts.isTypeAliasDeclaration(node)) {

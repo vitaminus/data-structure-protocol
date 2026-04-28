@@ -183,3 +183,11 @@ Status: done
 - Extract variable declarations as constants or functions when initialized with arrow/function expressions.
 - Extract TypeScript enum declarations as type entities.
 - Export relations now include exported constants, arrow functions, and enums.
+
+## 24. Extract TypeScript inheritance relations
+
+Status: done
+
+- Add `extends` relations for classes and interfaces.
+- Add `implements` relations for classes implementing interfaces.
+- Add coverage for class inheritance, class interface implementation, and interface inheritance.
