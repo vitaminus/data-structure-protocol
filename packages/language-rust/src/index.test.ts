@@ -94,6 +94,28 @@ use crate::{db::Repo, user::User};
     }
   });
 
+  it("maps derive attributes to implemented external traits", async () => {
+    const adapter = new RustLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "src/user.rs",
+      `
+#[derive(Debug, Clone)]
+pub struct User {}
+`
+    );
+    const entities = adapter.extractEntities(parsed);
+    const relations = adapter.extractRelations(parsed, entities);
+    expect(entities.some((entity) => entity.kind === "interface" && entity.uid === "interface:external/rust#Debug")).toBe(true);
+    expect(
+      relations.some(
+        (relation) =>
+          relation.kind === "implements" &&
+          relation.from === "type:src/user.rs#User" &&
+          relation.to === "interface:external/rust#Clone"
+      )
+    ).toBe(true);
+  });
+
   it("adds same-file call relations for Rust functions", async () => {
     const adapter = new RustLanguageAdapter();
     const parsed = await adapter.parseFile(

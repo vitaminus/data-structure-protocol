@@ -173,9 +173,18 @@ export class RustLanguageAdapter implements LanguageAdapter {
     let braceDepth = 0;
     let pendingTestAttribute = false;
     let pendingCfgTestAttribute = false;
+    let pendingDerives: string[] = [];
     for (let index = 0; index < lines.length; index += 1) {
       const raw = lines[index];
       const line = raw.trim();
+      const deriveMatch = line.match(/^#\[derive\(([^\]]+)\)\]/);
+      if (deriveMatch) {
+        pendingDerives = deriveMatch[1]!
+          .split(",")
+          .map((item) => item.trim())
+          .filter(Boolean);
+        continue;
+      }
       if (line.startsWith("#[test]") || line.startsWith("#[tokio::test]") || line.startsWith("#[async_std::test]")) {
         pendingTestAttribute = true;
         continue;
@@ -269,8 +278,9 @@ export class RustLanguageAdapter implements LanguageAdapter {
       const structMatch = line.match(/^(pub(?:\([^)]*\))?\s+)?struct\s+([A-Za-z_][A-Za-z0-9_]*)/);
       if (structMatch) {
         const name = structMatch[2];
+        const typeUid = buildUid("type", filePath, name);
         entities.push({
-          uid: buildUid("type", filePath, name),
+          uid: typeUid,
           kind: "type",
           name,
           path: filePath,
@@ -283,13 +293,37 @@ export class RustLanguageAdapter implements LanguageAdapter {
           createdAt: now,
           updatedAt: now
         });
+        for (const derive of pendingDerives) {
+          const traitUid = buildUid("interface", "external/rust", derive);
+          entities.push({
+            uid: traitUid,
+            kind: "interface",
+            name: derive,
+            language: "rust",
+            confidence: 0.68,
+            provenance: prov(0.68, "derive trait reference"),
+            metadata: { rustKind: "derive", external: true },
+            createdAt: now,
+            updatedAt: now
+          });
+          relations.push({
+            from: typeUid,
+            to: traitUid,
+            kind: "implements",
+            reason: `derive ${derive}`,
+            confidence: 0.74,
+            provenance: prov(0.74, "derive macro")
+          });
+        }
+        pendingDerives = [];
       }
 
       const enumMatch = line.match(/^(pub(?:\([^)]*\))?\s+)?enum\s+([A-Za-z_][A-Za-z0-9_]*)/);
       if (enumMatch) {
         const name = enumMatch[2];
+        const typeUid = buildUid("type", filePath, name);
         entities.push({
-          uid: buildUid("type", filePath, name),
+          uid: typeUid,
           kind: "type",
           name,
           path: filePath,
@@ -302,6 +336,29 @@ export class RustLanguageAdapter implements LanguageAdapter {
           createdAt: now,
           updatedAt: now
         });
+        for (const derive of pendingDerives) {
+          const traitUid = buildUid("interface", "external/rust", derive);
+          entities.push({
+            uid: traitUid,
+            kind: "interface",
+            name: derive,
+            language: "rust",
+            confidence: 0.68,
+            provenance: prov(0.68, "derive trait reference"),
+            metadata: { rustKind: "derive", external: true },
+            createdAt: now,
+            updatedAt: now
+          });
+          relations.push({
+            from: typeUid,
+            to: traitUid,
+            kind: "implements",
+            reason: `derive ${derive}`,
+            confidence: 0.74,
+            provenance: prov(0.74, "derive macro")
+          });
+        }
+        pendingDerives = [];
       }
 
       const traitMatch = line.match(/^(pub(?:\([^)]*\))?\s+)?trait\s+([A-Za-z_][A-Za-z0-9_]*)/);

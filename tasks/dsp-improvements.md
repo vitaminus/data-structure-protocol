@@ -143,3 +143,11 @@ Status: done
 - Track callable scope with brace depth while scanning Rust functions and methods.
 - Add low-confidence `calls` relations for same-file function/method invocations.
 - Add coverage for a function calling another function in the same Rust file.
+
+## 19. Capture Rust derive trait implementations
+
+Status: done
+
+- Detect `#[derive(...)]` attributes before structs and enums.
+- Add external Rust trait interface entities for derived traits.
+- Add `implements` relations from derived types to those trait entities without creating dangling graph edges.
