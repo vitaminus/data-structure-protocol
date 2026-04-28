@@ -199,3 +199,11 @@ Status: done
 - Track calls inside function declarations, arrow/function expressions, and class methods.
 - Add low-confidence same-file `calls` relations to matching function/method entities.
 - Add coverage for arrow functions and class methods calling a same-file function.
+
+## 26. Link TypeScript test files to implementation files
+
+Status: done
+
+- Detect `.test.ts`, `.spec.ts`, `.test.tsx`, `.spec.tsx`, and `__tests__` path conventions.
+- Add TypeScript `test` entities from adapter-level parsing.
+- Add `tests` relations from test files to conventional implementation files.

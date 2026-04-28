@@ -51,6 +51,16 @@ function compilerOptionsFor(containingFile: string): ts.CompilerOptions {
   return ts.parseJsonConfigFileContent(config.config, ts.sys, path.dirname(configPath)).options;
 }
 
+function implementationPathForTsTest(filePath: string): string | undefined {
+  const normalized = normalizePath(filePath);
+  const match = normalized.match(/^(.*?)(?:\.test|\.spec)(\.[tj]sx?)$/);
+  if (!match) {
+    return undefined;
+  }
+  const base = match[1]!.replace(/\/(__tests__|tests)\//, "/");
+  return `${base}${match[2]}`;
+}
+
 function resolveImport(fromPath: string, specifier: string): string | undefined {
   if (!specifier.startsWith(".")) {
     return undefined;
@@ -419,6 +429,31 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
           metadata: { line: edge.line }
         });
       }
+    }
+
+    const testedPath = implementationPathForTsTest(filePath);
+    if (testedPath && testedPath !== filePath) {
+      const testUid = buildUid("test", filePath);
+      addEntity({
+        uid: testUid,
+        kind: "test",
+        name: path.basename(filePath),
+        path: filePath,
+        language: lang,
+        confidence: 0.88,
+        provenance: withProv(0.88, "typescript test path convention"),
+        metadata: { testedPath },
+        createdAt: now,
+        updatedAt: now
+      });
+      relations.push({
+        from: testUid,
+        to: buildUid("file", testedPath),
+        kind: "tests",
+        reason: "typescript test path convention",
+        confidence: 0.88,
+        provenance: withProv(0.88, "typescript test path convention")
+      });
     }
 
     return {

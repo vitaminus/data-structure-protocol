@@ -34,6 +34,20 @@ describe("typescript adapter", () => {
     expect(relations.some((relation) => relation.kind === "exports")).toBe(true);
   });
 
+  it("links TypeScript test files to implementation files", async () => {
+    const adapter = new TypeScriptLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "src/auth/__tests__/AuthService.test.ts",
+      `import { AuthService } from "../AuthService";`
+    );
+    expect(parsed.entities.some((entity) => entity.kind === "test" && entity.uid === "test:src/auth/__tests__/AuthService.test.ts")).toBe(true);
+    expect(
+      parsed.relations.some(
+        (relation) => relation.kind === "tests" && relation.to === "file:src/auth/AuthService.ts"
+      )
+    ).toBe(true);
+  });
+
   it("adds same-file call relations for TypeScript callables", async () => {
     const adapter = new TypeScriptLanguageAdapter();
     const parsed = await adapter.parseFile(
