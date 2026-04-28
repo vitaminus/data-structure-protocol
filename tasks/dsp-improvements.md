@@ -135,3 +135,11 @@ Status: done
 - Detect `#[cfg(test)] mod ...` as test entities.
 - Detect `#[test]`, `#[tokio::test]`, and `#[async_std::test]` functions as test entities.
 - Add `tests` relations from Rust test entities back to the source file for impact/context packs.
+
+## 18. Add Rust same-file call relations
+
+Status: done
+
+- Track callable scope with brace depth while scanning Rust functions and methods.
+- Add low-confidence `calls` relations for same-file function/method invocations.
+- Add coverage for a function calling another function in the same Rust file.

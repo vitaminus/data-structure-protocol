@@ -102,6 +102,8 @@ function stripGenerics(input: string): string {
   return input.replace(/<[^<>]*>/g, "").trim();
 }
 
+const CALL_SKIP_WORDS = new Set(["if", "for", "while", "loop", "match", "return", "Some", "Ok", "Err", "Box", "Vec"]);
+
 function countBraces(line: string): { open: number; close: number } {
   const withoutStrings = line.replace(/"(?:\\.|[^"])*"/g, "");
   return {
@@ -166,6 +168,8 @@ export class RustLanguageAdapter implements LanguageAdapter {
 
     const lines = content.split("\n");
     const implStack: { target: string; trait?: string; depth: number }[] = [];
+    const callableStack: { uid: string; depth: number }[] = [];
+    const callEdges: { from: string; name: string; line: number }[] = [];
     let braceDepth = 0;
     let pendingTestAttribute = false;
     let pendingCfgTestAttribute = false;
@@ -182,6 +186,9 @@ export class RustLanguageAdapter implements LanguageAdapter {
       }
       while (implStack.length > 0 && braceDepth < implStack.at(-1)!.depth) {
         implStack.pop();
+      }
+      while (callableStack.length > 0 && braceDepth < callableStack.at(-1)!.depth) {
+        callableStack.pop();
       }
 
       const modMatch = line.match(/^(pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*;|\s*\{)?$/);
@@ -386,6 +393,9 @@ export class RustLanguageAdapter implements LanguageAdapter {
             provenance: prov(0.86, "rust test attribute")
           });
         }
+        if (line.includes("{")) {
+          callableStack.push({ uid, depth: braceDepth + 1 });
+        }
         if (owner && !isTestFunction) {
           relations.push({
             from: buildUid("type", filePath, owner),
@@ -397,8 +407,40 @@ export class RustLanguageAdapter implements LanguageAdapter {
         }
       }
 
+      if (!fnMatch && callableStack.length > 0) {
+        const currentCallable = callableStack.at(-1)!;
+        for (const callMatch of line.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*!?\s*\(/g)) {
+          const name = callMatch[1]!;
+          if (!CALL_SKIP_WORDS.has(name)) {
+            callEdges.push({ from: currentCallable.uid, name, line: index + 1 });
+          }
+        }
+      }
+
       const braces = countBraces(line);
       braceDepth += braces.open - braces.close;
+    }
+
+    const callableTargets = new Map<string, Entity[]>();
+    for (const entity of entities.filter((candidate) => candidate.kind === "function" || candidate.kind === "method")) {
+      const bucket = callableTargets.get(entity.name) ?? [];
+      bucket.push(entity);
+      callableTargets.set(entity.name, bucket);
+    }
+    for (const edge of callEdges) {
+      for (const target of callableTargets.get(edge.name) ?? []) {
+        if (target.uid !== edge.from) {
+          relations.push({
+            from: edge.from,
+            to: target.uid,
+            kind: "calls",
+            reason: `${edge.name}()`,
+            confidence: 0.62,
+            provenance: prov(0.62, "same-file call heuristic"),
+            metadata: { line: edge.line }
+          });
+        }
+      }
     }
 
     for (const entity of entities) {

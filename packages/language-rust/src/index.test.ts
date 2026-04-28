@@ -94,6 +94,31 @@ use crate::{db::Repo, user::User};
     }
   });
 
+  it("adds same-file call relations for Rust functions", async () => {
+    const adapter = new RustLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "src/lib.rs",
+      `
+fn hash_password() -> String {
+    String::new()
+}
+
+pub fn create_user() {
+    hash_password();
+}
+`
+    );
+    const relations = adapter.extractRelations(parsed, parsed.entities);
+    expect(
+      relations.some(
+        (relation) =>
+          relation.kind === "calls" &&
+          relation.from === "function:src/lib.rs#create_user" &&
+          relation.to === "function:src/lib.rs#hash_password"
+      )
+    ).toBe(true);
+  });
+
   it("extracts Rust unit tests and cfg test modules", async () => {
     const adapter = new RustLanguageAdapter();
     const parsed = await adapter.parseFile(
