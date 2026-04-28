@@ -34,6 +34,24 @@ describe("typescript adapter", () => {
     expect(relations.some((relation) => relation.kind === "exports")).toBe(true);
   });
 
+  it("extracts exported arrow functions, constants and enums", async () => {
+    const adapter = new TypeScriptLanguageAdapter();
+    const parsed = await adapter.parseFile(
+      "src/config.ts",
+      `
+export const makeUser = () => ({ id: 1 });
+export const API_URL = "https://example.com";
+export enum Role { Admin, User }
+`
+    );
+    const entities = adapter.extractEntities(parsed);
+    const relations = adapter.extractRelations(parsed, entities);
+    expect(entities.some((entity) => entity.kind === "function" && entity.name === "makeUser")).toBe(true);
+    expect(entities.some((entity) => entity.kind === "constant" && entity.name === "API_URL")).toBe(true);
+    expect(entities.some((entity) => entity.kind === "type" && entity.metadata?.tsKind === "enum")).toBe(true);
+    expect(relations.filter((relation) => relation.kind === "exports").length).toBeGreaterThanOrEqual(3);
+  });
+
   it("uses TypeScript module resolution for extensionless relative imports", async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "dsp-ts-adapter-"));
     cleanupDirs.push(tempDir);

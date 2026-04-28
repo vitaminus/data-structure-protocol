@@ -159,6 +159,55 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
         });
       }
 
+      if (ts.isVariableStatement(node)) {
+        const isPublic = node.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) ?? false;
+        for (const declaration of node.declarationList.declarations) {
+          if (!ts.isIdentifier(declaration.name)) {
+            continue;
+          }
+          const name = declaration.name.text;
+          const initializer = declaration.initializer;
+          const isCallable = Boolean(initializer && (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer)));
+          addEntity({
+            uid: buildUid(isCallable ? "function" : "constant", filePath, name),
+            kind: isCallable ? "function" : "constant",
+            name,
+            path: filePath,
+            language: lang,
+            signature: node.getText(source).split("=")[0]?.trim(),
+            startLine: source.getLineAndCharacterOfPosition(declaration.getStart()).line + 1,
+            endLine: source.getLineAndCharacterOfPosition(declaration.getEnd()).line + 1,
+            metadata: {
+              public: isPublic,
+              declarationKind: ts.tokenToString(node.declarationList.flags & ts.NodeFlags.Const ? ts.SyntaxKind.ConstKeyword : ts.SyntaxKind.LetKeyword)
+            },
+            confidence: isCallable ? 0.92 : 0.9,
+            provenance: withProv(isCallable ? 0.92 : 0.9, isCallable ? "function variable declaration" : "constant declaration"),
+            createdAt: now,
+            updatedAt: now
+          });
+        }
+      }
+
+      if (ts.isEnumDeclaration(node)) {
+        const name = node.name.text;
+        addEntity({
+          uid: buildUid("type", filePath, name),
+          kind: "type",
+          name,
+          path: filePath,
+          language: lang,
+          signature: node.name.getText(source),
+          startLine: source.getLineAndCharacterOfPosition(node.getStart()).line + 1,
+          endLine: source.getLineAndCharacterOfPosition(node.getEnd()).line + 1,
+          metadata: { public: node.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) ?? false, tsKind: "enum" },
+          confidence: 0.94,
+          provenance: withProv(0.94, "enum declaration"),
+          createdAt: now,
+          updatedAt: now
+        });
+      }
+
       if (ts.isClassDeclaration(node) && node.name) {
         const className = node.name.text;
         const classUid = buildUid("class", filePath, className);
@@ -257,11 +306,18 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
         }
       }
       if (
-        (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) &&
+        (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node) || ts.isEnumDeclaration(node)) &&
         node.name &&
         node.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)
       ) {
         exportNames.add(node.name.text);
+      }
+      if (ts.isVariableStatement(node) && node.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)) {
+        for (const declaration of node.declarationList.declarations) {
+          if (ts.isIdentifier(declaration.name)) {
+            exportNames.add(declaration.name.text);
+          }
+        }
       }
     });
     for (const entity of entities) {

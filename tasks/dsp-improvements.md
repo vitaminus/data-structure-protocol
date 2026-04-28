@@ -175,3 +175,11 @@ Status: done
 - Include `Gemfile` and `Gemfile.lock` in Ruby indexing.
 - Extract gems as external dependency entities from Gemfile and lockfile formats.
 - Add `depends_on` relations from Bundler files to external gem entities.
+
+## 23. Extract TypeScript constants, arrow functions, and enums
+
+Status: done
+
+- Extract variable declarations as constants or functions when initialized with arrow/function expressions.
+- Extract TypeScript enum declarations as type entities.
+- Export relations now include exported constants, arrow functions, and enums.
