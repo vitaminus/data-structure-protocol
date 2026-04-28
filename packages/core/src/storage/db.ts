@@ -269,6 +269,28 @@ export class DSPDatabase {
     return rows.map((row) => this.rowToRelation(row));
   }
 
+  deleteRelation(fromUid: string, toUid: string, kind?: RelationKind): number {
+    if (kind) {
+      const result = this.db
+        .prepare("DELETE FROM relations WHERE from_uid = ? AND to_uid = ? AND kind = ?")
+        .run(fromUid, toUid, kind);
+      return result.changes;
+    }
+    const result = this.db
+      .prepare("DELETE FROM relations WHERE from_uid = ? AND to_uid = ?")
+      .run(fromUid, toUid);
+    return result.changes;
+  }
+
+  deleteEntity(uid: string): boolean {
+    const result = this.db.transaction(() => {
+      this.db.prepare("DELETE FROM relations WHERE from_uid = ? OR to_uid = ?").run(uid, uid);
+      this.db.prepare("DELETE FROM embeddings WHERE uid = ?").run(uid);
+      return this.db.prepare("DELETE FROM entities WHERE uid = ?").run(uid).changes;
+    })();
+    return result > 0;
+  }
+
   upsertEntity(entity: Entity): void {
     const existing = this.getEntity(entity.uid);
     const mergedProvenance = mergeProvenance(existing?.provenance ?? [], entity.provenance);

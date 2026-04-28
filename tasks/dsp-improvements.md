@@ -303,3 +303,11 @@ Status: done
 - Add upstream-style commands: `get-entity`, `find-by-source`, `get-children`, `get-parents`, `get-path`, and `read-toc`.
 - Add diagnostic commands: `get-stats`, `detect-cycles`, and `get-orphans`.
 - Implement directed traversal, shortest path, cycle detection, source lookup, and graph stats on top of the SQLite graph.
+
+## 39. Add manual graph mutation CLI commands
+
+Status: done
+
+- Add upstream-style manual commands: `create-object`, `create-function`, `create-shared`, `add-import`, `update-description`, `update-import-why`, `move-entity`, `remove-import`, `remove-shared`, and `remove-entity`.
+- Add public database deletion helpers for manual relation/entity cleanup.
+- Keep manual writes provenance-tagged as human/dsp-cli while preserving auto-index as the primary path.

@@ -43,6 +43,44 @@ describe("DSPDatabase", () => {
     expect(db.getRelationsFrom(buildUid("file", "src/auth.ts")).length).toBe(1);
   });
 
+  it("deletes manual entities and relations", () => {
+    const now = stableNowIso();
+    const fileUid = buildUid("file", "src/auth.ts");
+    const fnUid = buildUid("function", "src/auth.ts", "login");
+    db.upsertEntity({
+      uid: fileUid,
+      kind: "file",
+      name: "auth.ts",
+      path: "src/auth.ts",
+      confidence: 1,
+      provenance: [{ source: "human", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+    db.upsertEntity({
+      uid: fnUid,
+      kind: "function",
+      name: "login",
+      path: "src/auth.ts",
+      confidence: 1,
+      provenance: [{ source: "human", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+    db.upsertRelation({
+      from: fileUid,
+      to: fnUid,
+      kind: "exports",
+      confidence: 1,
+      provenance: [{ source: "human", timestamp: now, confidence: 1 }]
+    });
+
+    expect(db.deleteRelation(fileUid, fnUid, "exports")).toBe(1);
+    expect(db.getRelationsFrom(fileUid)).toHaveLength(0);
+    expect(db.deleteEntity(fnUid)).toBe(true);
+    expect(db.getEntity(fnUid)).toBeUndefined();
+  });
+
   it("roundtrips json export/import", () => {
     const now = stableNowIso();
     const uid = buildUid("file", "src/main.ts");

@@ -20,6 +20,8 @@ export declare class DSPDatabase {
     getRelations(limit?: number): Relation[];
     getRelationsFrom(uid: string): Relation[];
     getRelationsTo(uid: string): Relation[];
+    deleteRelation(fromUid: string, toUid: string, kind?: Relation["kind"]): number;
+    deleteEntity(uid: string): boolean;
     upsertEntity(entity: Entity): void;
     upsertRelation(relation: Relation): void;
     markFileHash(filePath: string, hash: string, indexedAt: string): void;

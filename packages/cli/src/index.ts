@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import path from "node:path";
 import fs from "node:fs";
+import { randomBytes } from "node:crypto";
 import { Command } from "commander";
 import {
   findEntityByUidOrPath,
@@ -20,6 +21,7 @@ import {
   runValidate,
   type DSPServices,
   type Entity,
+  type EntityKind,
   type LanguageAdapter,
   type RelationKind
 } from "@dsp/core";
@@ -200,6 +202,63 @@ function orphans(services: DSPServices): Entity[] {
       .filter((relation) => relation.kind !== "contains")
       .length === 0;
   });
+}
+
+function manualUid(prefix: "obj" | "func", requested?: string): string {
+  if (requested) {
+    return requested;
+  }
+  return `${prefix}-${randomBytes(4).toString("hex")}`;
+}
+
+function manualProvenance(now: string, evidence: string) {
+  return [{ source: "human" as const, tool: "dsp-cli", timestamp: now, confidence: 1, evidence }];
+}
+
+function parseSource(source: string): { path: string; symbol?: string; name: string } {
+  const [sourcePath, symbol] = source.split("#");
+  return {
+    path: sourcePath!,
+    symbol,
+    name: symbol ?? path.basename(sourcePath!)
+  };
+}
+
+function entityKindFromOption(kind: string, fallback: EntityKind): EntityKind {
+  const allowed: EntityKind[] = [
+    "repository",
+    "directory",
+    "file",
+    "module",
+    "function",
+    "class",
+    "method",
+    "type",
+    "interface",
+    "constant",
+    "route",
+    "test",
+    "unknown"
+  ];
+  return allowed.includes(kind as EntityKind) ? (kind as EntityKind) : fallback;
+}
+
+function relationKindFromOption(kind: string, fallback: RelationKind): RelationKind {
+  const allowed: RelationKind[] = [
+    "contains",
+    "imports",
+    "exports",
+    "calls",
+    "extends",
+    "implements",
+    "uses",
+    "tests",
+    "routes_to",
+    "depends_on",
+    "similar_to",
+    "annotates"
+  ];
+  return allowed.includes(kind as RelationKind) ? (kind as RelationKind) : fallback;
 }
 
 const program = new Command();
@@ -500,6 +559,270 @@ program
     try {
       const result = orphans(services);
       printOutput({ orphans: result, count: result.length }, options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
+  .command("create-object")
+  .argument("<source>", "source path or external name")
+  .argument("<purpose>", "entity purpose")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--uid <uid>", "explicit stable UID")
+  .option("--kind <kind>", "entity kind", "module")
+  .option("--language <language>", "entity language")
+  .option("--external", "mark as external dependency", false)
+  .option("--json", "machine-readable output", false)
+  .action((source: string, purpose: string, rootDir: string, options: { uid?: string; kind: string; language?: string; external: boolean; json: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      const now = new Date().toISOString();
+      const parsed = parseSource(source);
+      const entity: Entity = {
+        uid: manualUid("obj", options.uid),
+        kind: options.external ? "unknown" : entityKindFromOption(options.kind, "module"),
+        name: parsed.name,
+        path: options.external ? undefined : parsed.path,
+        language: options.language,
+        description: purpose,
+        confidence: 1,
+        provenance: manualProvenance(now, "manual create-object"),
+        metadata: { external: options.external || undefined, manual: true },
+        createdAt: now,
+        updatedAt: now
+      };
+      services.db.upsertEntity(entity);
+      printOutput({ created: true, entity }, options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
+  .command("create-function")
+  .argument("<source>", "source path#symbol")
+  .argument("<purpose>", "function purpose")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--uid <uid>", "explicit stable UID")
+  .option("--owner <uid>", "owning entity UID")
+  .option("--kind <kind>", "entity kind", "function")
+  .option("--language <language>", "entity language")
+  .option("--json", "machine-readable output", false)
+  .action((source: string, purpose: string, rootDir: string, options: { uid?: string; owner?: string; kind: string; language?: string; json: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      const now = new Date().toISOString();
+      const parsed = parseSource(source);
+      const entity: Entity = {
+        uid: manualUid("func", options.uid),
+        kind: entityKindFromOption(options.kind, "function"),
+        name: parsed.name,
+        path: parsed.path,
+        language: options.language,
+        description: purpose,
+        confidence: 1,
+        provenance: manualProvenance(now, "manual create-function"),
+        metadata: { manual: true, owner: options.owner },
+        createdAt: now,
+        updatedAt: now
+      };
+      services.db.upsertEntity(entity);
+      if (options.owner) {
+        services.db.upsertRelation({
+          from: options.owner,
+          to: entity.uid,
+          kind: "contains",
+          confidence: 1,
+          provenance: manualProvenance(now, "manual owner contains function")
+        });
+      }
+      printOutput({ created: true, entity }, options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
+  .command("create-shared")
+  .argument("<exporterUid>", "exporting entity UID")
+  .argument("<sharedUids...>", "shared/exported entity UIDs")
+  .option("--root <rootDir>", "root directory", ".")
+  .option("--json", "machine-readable output", false)
+  .action((exporterUid: string, sharedUids: string[], options: { root: string; json: boolean }) => {
+    const services = openDSP(path.resolve(options.root), adapters());
+    try {
+      const now = new Date().toISOString();
+      for (const sharedUid of sharedUids) {
+        services.db.upsertRelation({
+          from: exporterUid,
+          to: sharedUid,
+          kind: "exports",
+          confidence: 1,
+          provenance: manualProvenance(now, "manual create-shared")
+        });
+      }
+      printOutput({ exporterUid, sharedUids, created: sharedUids.length }, options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
+  .command("add-import")
+  .argument("<importerUid>", "importing entity UID")
+  .argument("<importedUid>", "imported entity UID")
+  .argument("<why>", "reason for import")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--kind <kind>", "relation kind", "imports")
+  .option("--exporter <uid>", "exporter/provider UID metadata")
+  .option("--json", "machine-readable output", false)
+  .action((importerUid: string, importedUid: string, why: string, rootDir: string, options: { kind: string; exporter?: string; json: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      const now = new Date().toISOString();
+      const relation = {
+        from: importerUid,
+        to: importedUid,
+        kind: relationKindFromOption(options.kind, "imports"),
+        reason: why,
+        confidence: 1,
+        provenance: manualProvenance(now, "manual add-import"),
+        metadata: { exporter: options.exporter }
+      };
+      services.db.upsertRelation(relation);
+      printOutput({ added: true, relation }, options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
+  .command("update-description")
+  .argument("<uid>", "entity UID")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--purpose <purpose>", "new purpose/description")
+  .option("--source <source>", "new source path or path#symbol")
+  .option("--kind <kind>", "new entity kind")
+  .option("--json", "machine-readable output", false)
+  .action((uid: string, rootDir: string, options: { purpose?: string; source?: string; kind?: string; json: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      const existing = services.db.getEntity(uid);
+      if (!existing) {
+        printOutput({ updated: false, reason: "not_found", uid }, options.json);
+        return;
+      }
+      const parsed = options.source ? parseSource(options.source) : undefined;
+      const updated: Entity = {
+        ...existing,
+        kind: options.kind ? entityKindFromOption(options.kind, existing.kind) : existing.kind,
+        name: parsed?.name ?? existing.name,
+        path: parsed?.path ?? existing.path,
+        description: options.purpose ?? existing.description,
+        provenance: [...existing.provenance, ...manualProvenance(new Date().toISOString(), "manual update-description")],
+        updatedAt: new Date().toISOString()
+      };
+      services.db.upsertEntity(updated);
+      printOutput({ updated: true, entity: updated }, options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
+  .command("update-import-why")
+  .argument("<importerUid>", "importing entity UID")
+  .argument("<importedUid>", "imported entity UID")
+  .argument("<why>", "new reason")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--kind <kind>", "relation kind", "imports")
+  .option("--json", "machine-readable output", false)
+  .action((importerUid: string, importedUid: string, why: string, rootDir: string, options: { kind: string; json: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      const now = new Date().toISOString();
+      const relation = {
+        from: importerUid,
+        to: importedUid,
+        kind: relationKindFromOption(options.kind, "imports"),
+        reason: why,
+        confidence: 1,
+        provenance: manualProvenance(now, "manual update-import-why")
+      };
+      services.db.upsertRelation(relation);
+      printOutput({ updated: true, relation }, options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
+  .command("move-entity")
+  .argument("<uid>", "entity UID")
+  .argument("<newSource>", "new source path or path#symbol")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--json", "machine-readable output", false)
+  .action((uid: string, newSource: string, rootDir: string, options: { json: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      const existing = services.db.getEntity(uid);
+      if (!existing) {
+        printOutput({ moved: false, reason: "not_found", uid }, options.json);
+        return;
+      }
+      const parsed = parseSource(newSource);
+      const updated = { ...existing, path: parsed.path, name: parsed.name, updatedAt: new Date().toISOString() };
+      services.db.upsertEntity(updated);
+      printOutput({ moved: true, entity: updated }, options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
+  .command("remove-import")
+  .argument("<importerUid>", "importing entity UID")
+  .argument("<importedUid>", "imported entity UID")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--kind <kind>", "relation kind", "imports")
+  .option("--json", "machine-readable output", false)
+  .action((importerUid: string, importedUid: string, rootDir: string, options: { kind: string; json: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      const removed = services.db.deleteRelation(importerUid, importedUid, relationKindFromOption(options.kind, "imports"));
+      printOutput({ removed }, options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
+  .command("remove-shared")
+  .argument("<exporterUid>", "exporting entity UID")
+  .argument("<sharedUid>", "shared/exported entity UID")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--json", "machine-readable output", false)
+  .action((exporterUid: string, sharedUid: string, rootDir: string, options: { json: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      const removed = services.db.deleteRelation(exporterUid, sharedUid, "exports");
+      printOutput({ removed }, options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
+  .command("remove-entity")
+  .argument("<uid>", "entity UID")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--json", "machine-readable output", false)
+  .action((uid: string, rootDir: string, options: { json: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      const removed = services.db.deleteEntity(uid);
+      printOutput({ removed, uid }, options.json);
     } finally {
       services.db.close();
     }
