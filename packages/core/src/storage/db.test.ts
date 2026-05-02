@@ -326,4 +326,90 @@ describe("DSPDatabase", () => {
     expect(db.getRelationsTo(externalUid)).toEqual([]);
     expect(db.searchEntityUids("bulk cleanup target", 10)).toEqual([]);
   });
+
+  it("renames AST graph data across related lookup tables", () => {
+    const now = stableNowIso();
+    const oldPath = "src/old.ts";
+    const newPath = "src/new.ts";
+    const oldFileUid = buildUid("file", oldPath);
+    const oldFunctionUid = buildUid("function", oldPath, "demo");
+    const newFileUid = buildUid("file", newPath);
+    const newFunctionUid = buildUid("function", newPath, "demo");
+    const externalUid = buildUid("function", "src/external.ts", "caller");
+
+    db.upsertEntity({
+      uid: oldFileUid,
+      kind: "file",
+      name: "old.ts",
+      path: oldPath,
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+    db.upsertEntity({
+      uid: oldFunctionUid,
+      kind: "function",
+      name: "demo",
+      path: oldPath,
+      description: "rename me",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+    db.upsertEntity({
+      uid: externalUid,
+      kind: "function",
+      name: "caller",
+      path: "src/external.ts",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+    db.upsertRelation({
+      from: oldFileUid,
+      to: oldFunctionUid,
+      kind: "contains",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+    db.upsertRelation({
+      from: externalUid,
+      to: oldFunctionUid,
+      kind: "calls",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+    db.upsertUnresolvedReference(
+      {
+        path: oldPath,
+        fromUid: oldFunctionUid,
+        symbol: "MissingType",
+        kind: "type",
+        confidence: 0.5
+      },
+      now
+    );
+    db.setEmbedding(oldFunctionUid, "semantic-hash", [0.1, 0.2], "mock", now);
+    db.markFileHash(oldPath, "file-hash", now);
+
+    expect(db.renameAstDataPath(oldPath, newPath, now)).toBe(true);
+
+    expect(db.getEntity(oldFileUid)).toBeUndefined();
+    expect(db.getEntity(oldFunctionUid)).toBeUndefined();
+    expect(db.getEntity(newFileUid)).toBeDefined();
+    expect(db.getEntity(newFunctionUid)?.path).toBe(newPath);
+    expect(db.getRelationsFrom(newFileUid).some((relation) => relation.to === newFunctionUid)).toBe(true);
+    expect(db.getRelationsFrom(externalUid).some((relation) => relation.to === newFunctionUid)).toBe(true);
+    expect(db.getUnresolvedReferences()).toContainEqual(
+      expect.objectContaining({ path: newPath, fromUid: newFunctionUid, symbol: "MissingType" })
+    );
+    expect(db.getEmbedding(newFunctionUid)).toMatchObject({ hash: "semantic-hash", provider: "mock" });
+    expect(db.getEmbedding(oldFunctionUid)).toBeUndefined();
+    expect(db.getFileHash(oldPath)).toBeUndefined();
+    expect(db.getFileHash(newPath)).toBe("file-hash");
+    expect(db.searchEntityUids("rename me", 10)).toContain(newFunctionUid);
+  });
 });

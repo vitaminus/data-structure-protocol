@@ -314,7 +314,7 @@ describe("indexer", () => {
     expect(db.getFileHash("src/a.ts")).toBeUndefined();
   });
 
-  it("removes old graph data when git reports a rename", async () => {
+  it("reconciles unchanged git renames by content hash", async () => {
     execSync("git init", { cwd: tempDir, stdio: "ignore" });
     execSync("git config user.email test@example.com", { cwd: tempDir, stdio: "ignore" });
     execSync("git config user.name Test", { cwd: tempDir, stdio: "ignore" });
@@ -332,10 +332,41 @@ describe("indexer", () => {
       DEFAULT_CONFIG
     );
 
-    expect(summary.filesIndexed).toBe(1);
+    expect(summary.filesIndexed).toBe(0);
+    expect(summary.filesSkipped).toBe(1);
     expect(db.getEntity(buildUid("file", "src/a.ts"))).toBeUndefined();
     expect(db.getFileHash("src/a.ts")).toBeUndefined();
     expect(db.getEntity(buildUid("file", "src/renamed.ts"))).toBeDefined();
+    expect(db.getEntity(buildUid("function", "src/a.ts", "demo"))).toBeUndefined();
+    expect(db.getEntity(buildUid("function", "src/renamed.ts", "demo"))).toBeDefined();
+    expect(db.getRelationsFrom(buildUid("file", "src/renamed.ts")).some((relation) => relation.kind === "contains")).toBe(
+      true
+    );
+  });
+
+  it("reindexes moved files when content changed during rename", async () => {
+    execSync("git init", { cwd: tempDir, stdio: "ignore" });
+    execSync("git config user.email test@example.com", { cwd: tempDir, stdio: "ignore" });
+    execSync("git config user.name Test", { cwd: tempDir, stdio: "ignore" });
+    execSync("git add src/a.ts", { cwd: tempDir, stdio: "ignore" });
+    execSync("git commit -m initial", { cwd: tempDir, stdio: "ignore" });
+
+    const adapter = new MockAdapter();
+    await indexRepository(db, [adapter], { rootDir: tempDir, full: true }, DEFAULT_CONFIG);
+    execSync("git mv src/a.ts src/renamed.ts", { cwd: tempDir, stdio: "ignore" });
+    fs.writeFileSync(path.join(tempDir, "src", "renamed.ts"), "export const a = 2;\n", "utf8");
+
+    const summary = await indexRepository(
+      db,
+      [adapter],
+      { rootDir: tempDir, changedOnly: true },
+      DEFAULT_CONFIG
+    );
+
+    expect(summary.filesIndexed).toBe(1);
+    expect(db.getEntity(buildUid("file", "src/a.ts"))).toBeUndefined();
+    expect(db.getFileHash("src/a.ts")).toBeUndefined();
+    expect(db.getEntity(buildUid("function", "src/renamed.ts", "demo"))).toBeDefined();
   });
 
   it("canonicalizes extensionless file import relations to discovered files", async () => {

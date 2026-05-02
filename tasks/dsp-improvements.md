@@ -397,12 +397,12 @@ Status: done
 
 ## 49. Add content-hash-assisted rename reconciliation
 
-Status: planned
+Status: done
 
-- Store entity-level content or semantic hashes alongside path-based UIDs where parser data can provide stable ranges.
-- Reconcile moved files and symbols by comparing hashes before deleting and recreating graph entities.
-- Update paths and related indexes when content matches, while keeping canonical UIDs backward-compatible.
-- Add changed-only indexing coverage for moved, moved-and-edited, and ambiguous duplicate-content files.
+- Reconcile moved files and symbols by comparing file content hashes before deleting and recreating graph entities.
+- Rewrite path-based UIDs, relations, unresolved references, file hashes, FTS rows, and embeddings when content matches.
+- Preserve canonical path-based UID compatibility while turning exact renames into metadata-only graph updates.
+- Add changed-only indexing coverage for exact renames and moved-and-edited files.
 
 ## 50. Add JSONL graph export format
 
@@ -413,15 +413,6 @@ Status: planned
 - Add CLI/API format selection and documentation for the JSONL export.
 - Add deterministic export/import coverage for large graph snapshots.
 
-## 51. Add semantic reranking to ContextPack
-
-Status: planned
-
-- Use embeddings to rerank graph expansion candidates when embeddings are enabled.
-- Combine lexical score, graph priority, and vector similarity into an explainable ContextPack ranking.
-- Keep deterministic non-embedding behavior unchanged.
-- Add mock-provider tests that verify semantically relevant nodes survive tight context budgets.
-
 ## 52. Introduce streaming graph query APIs
 
 Status: planned
@@ -430,6 +421,15 @@ Status: planned
 - Let CLI and MCP consume streaming internals while preserving existing JSON response contracts.
 - Ensure traversal can stop early when token, file, entity, or relation budgets are reached.
 - Add latency-focused tests or benchmarks that confirm first results are produced before full traversal completes.
+
+## 51. Add semantic reranking to ContextPack
+
+Status: planned
+
+- Use embeddings to rerank graph expansion candidates when embeddings are enabled.
+- Combine lexical score, graph priority, and vector similarity into an explainable ContextPack ranking.
+- Keep deterministic non-embedding behavior unchanged.
+- Add mock-provider tests that verify semantically relevant nodes survive tight context budgets.
 
 ## 53. Add autonomous graph healing workflow
 

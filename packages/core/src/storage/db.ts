@@ -70,6 +70,19 @@ function chunks<T>(items: T[], chunkSize = SQLITE_LIST_CHUNK_SIZE): T[][] {
   return result;
 }
 
+function rewritePathBasedUid(uid: string, oldPath: string, newPath: string): string {
+  const separatorIndex = uid.indexOf(":");
+  if (separatorIndex === -1) {
+    return uid;
+  }
+  const prefix = uid.slice(0, separatorIndex);
+  const suffix = uid.slice(separatorIndex + 1);
+  if (suffix === oldPath || suffix.startsWith(`${oldPath}#`)) {
+    return `${prefix}:${newPath}${suffix.slice(oldPath.length)}`;
+  }
+  return uid;
+}
+
 export type GraphSnapshot = {
   entities: Entity[];
   relations: Relation[];
@@ -637,6 +650,110 @@ export class DSPDatabase {
 
   removeFileHash(filePath: string): void {
     this.db.prepare("DELETE FROM file_hashes WHERE path = ?").run(filePath);
+  }
+
+  renameAstDataPath(oldPath: string, newPath: string, indexedAt: string): boolean {
+    if (oldPath === newPath) {
+      return false;
+    }
+    const entityRows = this.db
+      .prepare("SELECT * FROM entities WHERE path = ? AND source_priority < 100")
+      .all(oldPath) as Record<string, unknown>[];
+    if (entityRows.length === 0) {
+      return false;
+    }
+
+    const oldEntities = entityRows.map((row) => this.rowToEntity(row));
+    const uidMap = new Map(oldEntities.map((entity) => [entity.uid, rewritePathBasedUid(entity.uid, oldPath, newPath)]));
+    const oldUids = [...uidMap.keys()];
+    const relations = this.getRelationsTouching(oldUids, null);
+    const unresolvedRows = this.db
+      .prepare("SELECT from_uid, symbol, kind, reason, confidence FROM unresolved_references WHERE path = ? AND resolved = 0")
+      .all(oldPath) as {
+      from_uid: string | null;
+      symbol: string;
+      kind: UnresolvedReference["kind"];
+      reason: string | null;
+      confidence: number;
+    }[];
+    const embeddingRows = chunks(oldUids).flatMap((chunk) => {
+      const placeholders = chunk.map(() => "?").join(", ");
+      return this.db
+        .prepare(`SELECT uid, content_hash, vector_json, provider, updated_at FROM embeddings WHERE uid IN (${placeholders})`)
+        .all(...chunk) as {
+        uid: string;
+        content_hash: string;
+        vector_json: string;
+        provider: string;
+        updated_at: string;
+      }[];
+    });
+    const oldHash = this.getFileHash(oldPath);
+
+    this.clearAstDataForPath(newPath);
+    this.clearAstDataForPath(oldPath);
+    for (const chunk of chunks(oldUids)) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      this.db.prepare(`DELETE FROM embeddings WHERE uid IN (${placeholders})`).run(...chunk);
+    }
+    this.removeFileHash(oldPath);
+
+    for (const entity of oldEntities) {
+      this.upsertEntity({
+        ...entity,
+        uid: uidMap.get(entity.uid)!,
+        path: newPath,
+        metadata: {
+          ...(entity.metadata ?? {}),
+          previousPath: oldPath,
+          renameReconciledAt: indexedAt
+        },
+        updatedAt: indexedAt
+      });
+    }
+    for (const relation of relations) {
+      this.upsertRelation({
+        ...relation,
+        from: uidMap.get(relation.from) ?? relation.from,
+        to: uidMap.get(relation.to) ?? relation.to,
+        metadata: {
+          ...(relation.metadata ?? {}),
+          renameReconciledAt: indexedAt
+        }
+      });
+    }
+    for (const ref of unresolvedRows) {
+      this.upsertUnresolvedReference(
+        {
+          path: newPath,
+          fromUid: ref.from_uid ? uidMap.get(ref.from_uid) ?? ref.from_uid : undefined,
+          symbol: ref.symbol,
+          kind: ref.kind,
+          reason: ref.reason ?? undefined,
+          confidence: ref.confidence
+        },
+        indexedAt
+      );
+    }
+    for (const row of embeddingRows) {
+      this.db
+        .prepare(
+          `
+          INSERT INTO embeddings(uid, content_hash, vector_json, provider, updated_at)
+          VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(uid) DO UPDATE SET
+            content_hash = excluded.content_hash,
+            vector_json = excluded.vector_json,
+            provider = excluded.provider,
+            updated_at = excluded.updated_at
+          `
+        )
+        .run(uidMap.get(row.uid) ?? row.uid, row.content_hash, row.vector_json, row.provider, indexedAt);
+    }
+    if (oldHash) {
+      this.markFileHash(newPath, oldHash, indexedAt);
+    }
+    return true;
   }
 
   clearUnresolvedForPath(filePath: string): void {

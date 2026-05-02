@@ -98,7 +98,7 @@ describe("DSP integration contract", () => {
 
       const summary = await runIndex(services, { rootDir: tempDir, changedOnly: true });
 
-      expect(summary.filesIndexed).toBeGreaterThan(0);
+      expect(summary.filesScanned).toBeGreaterThan(0);
       expect(services.db.getEntity(buildUid("file", "src/auth/AuthService.ts"))).toBeUndefined();
       expect(services.db.getEntity(buildUid("file", "src/auth/TokenService.ts"))).toBeDefined();
       expect(services.db.getEntity(buildUid("file", "app/models/user.rb"))).toBeUndefined();
