@@ -406,7 +406,7 @@ Status: done
 
 ## 50. Add JSONL graph export format
 
-Status: planned
+Status: done
 
 - Add `entities.jsonl`, `relations.jsonl`, and `unresolved.jsonl` export files with a compact manifest.
 - Keep existing JSON and protocol exports backward-compatible.

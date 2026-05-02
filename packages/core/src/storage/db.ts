@@ -845,6 +845,53 @@ export class DSPDatabase {
     fs.writeFileSync(targetPath, `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
   }
 
+  exportJsonl(targetDir: string): void {
+    fs.mkdirSync(targetDir, { recursive: true });
+    const entities = this.getEntities(200000).sort((a, b) => a.uid.localeCompare(b.uid));
+    const relations = this.getRelations(500000).sort((a, b) =>
+      `${a.from}\0${a.kind}\0${a.to}`.localeCompare(`${b.from}\0${b.kind}\0${b.to}`)
+    );
+    const unresolvedReferences = this.getUnresolvedReferences().sort((a, b) =>
+      `${a.path}\0${a.kind}\0${a.symbol}\0${a.fromUid ?? ""}`.localeCompare(
+        `${b.path}\0${b.kind}\0${b.symbol}\0${b.fromUid ?? ""}`
+      )
+    );
+    const writeJsonLines = (fileName: string, rows: unknown[]) => {
+      fs.writeFileSync(
+        path.join(targetDir, fileName),
+        rows.map((row) => JSON.stringify(row)).join("\n") + (rows.length > 0 ? "\n" : ""),
+        "utf8"
+      );
+    };
+
+    writeJsonLines("entities.jsonl", entities);
+    writeJsonLines("relations.jsonl", relations);
+    writeJsonLines("unresolved.jsonl", unresolvedReferences);
+    fs.writeFileSync(
+      path.join(targetDir, "manifest.json"),
+      `${JSON.stringify(
+        {
+          format: "dsp-jsonl",
+          version: 1,
+          generatedAt: new Date().toISOString(),
+          files: {
+            entities: "entities.jsonl",
+            relations: "relations.jsonl",
+            unresolvedReferences: "unresolved.jsonl"
+          },
+          counts: {
+            entities: entities.length,
+            relations: relations.length,
+            unresolvedReferences: unresolvedReferences.length
+          }
+        },
+        null,
+        2
+      )}\n`,
+      "utf8"
+    );
+  }
+
   importJson(sourcePath: string): GraphSnapshot {
     const raw = fs.readFileSync(sourcePath, "utf8");
     const snapshot = JSON.parse(raw) as GraphSnapshot;

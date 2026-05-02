@@ -103,6 +103,80 @@ describe("DSPDatabase", () => {
     fresh.close();
   });
 
+  it("exports deterministic JSONL graph files with a manifest", () => {
+    const now = stableNowIso();
+    const fileUid = buildUid("file", "src/auth.ts");
+    const fnUid = buildUid("function", "src/auth.ts", "login");
+    db.upsertEntity({
+      uid: fnUid,
+      kind: "function",
+      name: "login",
+      path: "src/auth.ts",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+    db.upsertEntity({
+      uid: fileUid,
+      kind: "file",
+      name: "auth.ts",
+      path: "src/auth.ts",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+    db.upsertRelation({
+      from: fileUid,
+      to: fnUid,
+      kind: "contains",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+    db.upsertUnresolvedReference(
+      {
+        path: "src/auth.ts",
+        fromUid: fnUid,
+        symbol: "MissingType",
+        kind: "type",
+        confidence: 0.4
+      },
+      now
+    );
+
+    const outputDir = path.join(tempDir, "jsonl-export");
+    db.exportJsonl(outputDir);
+
+    const entities = fs
+      .readFileSync(path.join(outputDir, "entities.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { uid: string });
+    const relations = fs
+      .readFileSync(path.join(outputDir, "relations.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { from: string; to: string; kind: string });
+    const unresolved = fs
+      .readFileSync(path.join(outputDir, "unresolved.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { symbol: string });
+    const manifest = JSON.parse(fs.readFileSync(path.join(outputDir, "manifest.json"), "utf8")) as {
+      format: string;
+      counts: { entities: number; relations: number; unresolvedReferences: number };
+    };
+
+    expect(entities.map((entity) => entity.uid)).toEqual([fileUid, fnUid].sort());
+    expect(relations).toEqual([expect.objectContaining({ from: fileUid, to: fnUid, kind: "contains" })]);
+    expect(unresolved).toEqual([expect.objectContaining({ symbol: "MissingType" })]);
+    expect(manifest).toMatchObject({
+      format: "dsp-jsonl",
+      counts: { entities: 2, relations: 1, unresolvedReferences: 1 }
+    });
+  });
+
   it("exports a protocol-compatible plain text graph", () => {
     const now = stableNowIso();
     const fileUid = buildUid("file", "src/auth.ts");

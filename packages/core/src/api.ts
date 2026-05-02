@@ -114,12 +114,17 @@ export async function runContextPack(
 
 export function runExport(
   services: DSPServices,
-  format: "json" | "dsp" | "protocol",
+  format: "json" | "jsonl" | "dsp" | "protocol",
   targetPath?: string
-): { format: "json" | "dsp" | "protocol"; targetPath: string } {
+): { format: "json" | "jsonl" | "dsp" | "protocol"; targetPath: string } {
   if (format === "json") {
     const finalPath = targetPath ?? path.join(services.rootDir, ".dsp", "graph.json");
     services.db.exportJson(finalPath);
+    return { format, targetPath: finalPath };
+  }
+  if (format === "jsonl") {
+    const finalPath = targetPath ?? path.join(services.rootDir, ".dsp", "jsonl");
+    services.db.exportJsonl(finalPath);
     return { format, targetPath: finalPath };
   }
   if (format === "protocol") {
