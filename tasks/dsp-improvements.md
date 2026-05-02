@@ -450,7 +450,7 @@ Status: done
 
 ### 55. Enforce ContextPack token budgets after code payload assembly
 
-Status: pending
+Status: done
 
 - Ensure `estimatedTokens` does not remain above `maxTokens` after adding snippets or full-file code payloads.
 - Trim code payloads and secondary lists deterministically before returning.

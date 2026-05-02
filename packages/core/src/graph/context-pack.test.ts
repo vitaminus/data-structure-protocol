@@ -214,6 +214,32 @@ describe("context pack", () => {
     );
   });
 
+  it("enforces token budgets after code payload assembly", async () => {
+    fs.mkdirSync(path.join(tempDir, "src"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, "src", "auth.ts"),
+      [
+        "export function login() {",
+        ...Array.from({ length: 120 }, (_, index) => `  const value${index} = "authentication payload ${index}";`),
+        "  return true;",
+        "}"
+      ].join("\n"),
+      "utf8"
+    );
+
+    const result = await buildContextPack(db, {
+      task: "authentication logic",
+      includeCode: "full-files",
+      maxFiles: 1,
+      maxTokens: 650
+    });
+
+    expect(result.estimatedTokens).toBeLessThanOrEqual(result.maxTokens);
+    expect(result.truncated).toBe(true);
+    expect(result.code?.[0]?.truncated).toBe(true);
+    expect(result.files).toEqual(["src/auth.ts"]);
+  });
+
   it("uses configured embeddings provider when building context packs through services", async () => {
     const result = await buildContextPack(
       {
@@ -417,7 +443,8 @@ describe("context pack", () => {
     const result = await buildContextPack(db, {
       task: "root fanout",
       maxDepth: 1,
-      maxFiles: 6008
+      maxFiles: 6008,
+      maxTokens: 1_000_000
     });
 
     expect(result.relevantEntities.map((entity) => entity.uid)).toContain(importantUid);

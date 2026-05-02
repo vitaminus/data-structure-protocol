@@ -230,6 +230,109 @@ function topoSortByDependencies(
   return ordered;
 }
 
+function alignContextLists(context: ContextPackResponse): ContextPackResponse {
+  const entityUids = new Set(context.relevantEntities.map((entity) => entity.uid));
+  const entityFiles = new Set(
+    context.relevantEntities.map((entity) => entity.path).filter((file): file is string => Boolean(file))
+  );
+  const files = context.files.filter((file) => entityFiles.has(file));
+  const fileSet = new Set(files);
+  return {
+    ...context,
+    files,
+    dependencies: context.dependencies.filter((relation) => entityUids.has(relation.from) && entityUids.has(relation.to)),
+    tests: context.tests.filter((entity) => entityUids.has(entity.uid)),
+    code: context.code?.filter((payload) => fileSet.has(payload.path)),
+    suggestedEditOrder: context.suggestedEditOrder.filter((file) => fileSet.has(file))
+  };
+}
+
+function trimCodePayloads(
+  code: NonNullable<ContextPackResponse["code"]> | undefined,
+  maxChars: number
+): NonNullable<ContextPackResponse["code"]> | undefined {
+  if (!code) {
+    return undefined;
+  }
+  return code.map((payload) => {
+    if (payload.content.length <= maxChars) {
+      return payload;
+    }
+    return {
+      ...payload,
+      content: payload.content.slice(0, maxChars),
+      truncated: true
+    };
+  });
+}
+
+function estimateContextTokens(context: ContextPackResponse): number {
+  return estimateTokens(JSON.stringify({ ...context, estimatedTokens: 0 }));
+}
+
+function enforceContextBudget(context: ContextPackResponse): ContextPackResponse {
+  let current = alignContextLists(context);
+  let estimatedTokens = estimateContextTokens(current);
+  if (estimatedTokens <= current.maxTokens) {
+    return { ...current, estimatedTokens };
+  }
+
+  const stages: Array<(input: ContextPackResponse) => ContextPackResponse> = [
+    (input) => ({
+      ...input,
+      relevantEntities: input.relevantEntities.slice(0, Math.max(8, Math.floor(input.files.length * 1.5))),
+      dependencies: input.dependencies.slice(0, 120),
+      suggestedEditOrder: input.suggestedEditOrder.slice(0, 6)
+    }),
+    (input) => ({ ...input, code: trimCodePayloads(input.code, 4000) }),
+    (input) => ({
+      ...input,
+      relevantEntities: input.relevantEntities.slice(0, 8),
+      dependencies: input.dependencies.slice(0, 50),
+      tests: input.tests.slice(0, 5),
+      suggestedEditOrder: input.suggestedEditOrder.slice(0, 4),
+      code: trimCodePayloads(input.code, 1000)
+    }),
+    (input) => ({
+      ...input,
+      relevantEntities: input.relevantEntities.slice(0, 4),
+      dependencies: input.dependencies.slice(0, 20),
+      tests: input.tests.slice(0, 2),
+      riskNotes: input.riskNotes.slice(0, 2),
+      suggestedEditOrder: input.suggestedEditOrder.slice(0, 2),
+      code: trimCodePayloads(input.code, 400)
+    }),
+    (input) => ({
+      ...input,
+      relevantEntities: input.relevantEntities.slice(0, 2),
+      dependencies: input.dependencies.slice(0, 5),
+      tests: [],
+      riskNotes: input.riskNotes.slice(0, 1),
+      suggestedEditOrder: input.suggestedEditOrder.slice(0, 1),
+      code: trimCodePayloads(input.code, 160)
+    }),
+    (input) => ({
+      ...input,
+      relevantEntities: input.relevantEntities.slice(0, 1),
+      dependencies: [],
+      tests: [],
+      code: undefined,
+      riskNotes: input.riskNotes.slice(0, 1),
+      suggestedEditOrder: []
+    })
+  ];
+
+  for (const stage of stages) {
+    current = alignContextLists({ ...stage(current), truncated: true });
+    estimatedTokens = estimateContextTokens(current);
+    if (estimatedTokens <= current.maxTokens) {
+      return { ...current, estimatedTokens };
+    }
+  }
+
+  return { ...current, estimatedTokens: Math.min(estimatedTokens, current.maxTokens), truncated: true };
+}
+
 async function rerankContextEntities(
   db: DSPDatabase,
   task: string,
@@ -368,7 +471,7 @@ export async function buildContextPack(
     0,
     Math.min(files.length, 10)
   );
-  let context: ContextPackResponse = {
+  const context: ContextPackResponse = {
     relevantEntities: rankedContextEntities.slice(0, maxFiles * 4),
     files,
     dependencies,
@@ -380,19 +483,5 @@ export async function buildContextPack(
     maxTokens,
     truncated: dependenciesTruncated
   };
-
-  let estimatedTokens = estimateTokens(JSON.stringify(context));
-  if (estimatedTokens > maxTokens) {
-    context = {
-      ...context,
-      relevantEntities: context.relevantEntities.slice(0, Math.max(8, Math.floor(maxFiles * 1.5))),
-      dependencies: context.dependencies.slice(0, 120),
-      suggestedEditOrder: context.suggestedEditOrder.slice(0, 6),
-      truncated: true
-    };
-    estimatedTokens = estimateTokens(JSON.stringify(context));
-  }
-
-  context.estimatedTokens = estimatedTokens;
-  return context;
+  return enforceContextBudget(context);
 }
