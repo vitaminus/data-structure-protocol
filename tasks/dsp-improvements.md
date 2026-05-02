@@ -385,3 +385,57 @@ Status: done
 - Add `maxEntities` and `maxRelations` budgets to CLI and MCP neighbor queries.
 - Apply budgeted, priority-ordered relation slicing to ContextPack graph expansion.
 - Add regression coverage for hub-style graphs with tight traversal budgets.
+
+## 48. Add batch-safe SQLite list operations
+
+Status: done
+
+- Replace large `WHERE uid IN (...)` call sites with shared chunking helpers.
+- Cover `getEntitiesByUid`, relation endpoint queries, and AST cleanup paths that receive large UID lists.
+- Preserve deterministic result ordering for callers that pass ordered UID arrays.
+- Add scale tests that exceed SQLite variable limits without raising `too many SQL variables`.
+
+## 49. Add content-hash-assisted rename reconciliation
+
+Status: planned
+
+- Store entity-level content or semantic hashes alongside path-based UIDs where parser data can provide stable ranges.
+- Reconcile moved files and symbols by comparing hashes before deleting and recreating graph entities.
+- Update paths and related indexes when content matches, while keeping canonical UIDs backward-compatible.
+- Add changed-only indexing coverage for moved, moved-and-edited, and ambiguous duplicate-content files.
+
+## 50. Add JSONL graph export format
+
+Status: planned
+
+- Add `entities.jsonl`, `relations.jsonl`, and `unresolved.jsonl` export files with a compact manifest.
+- Keep existing JSON and protocol exports backward-compatible.
+- Add CLI/API format selection and documentation for the JSONL export.
+- Add deterministic export/import coverage for large graph snapshots.
+
+## 51. Add semantic reranking to ContextPack
+
+Status: planned
+
+- Use embeddings to rerank graph expansion candidates when embeddings are enabled.
+- Combine lexical score, graph priority, and vector similarity into an explainable ContextPack ranking.
+- Keep deterministic non-embedding behavior unchanged.
+- Add mock-provider tests that verify semantically relevant nodes survive tight context budgets.
+
+## 52. Introduce streaming graph query APIs
+
+Status: planned
+
+- Add async iterator variants for graph traversal and context assembly internals.
+- Let CLI and MCP consume streaming internals while preserving existing JSON response contracts.
+- Ensure traversal can stop early when token, file, entity, or relation budgets are reached.
+- Add latency-focused tests or benchmarks that confirm first results are produced before full traversal completes.
+
+## 53. Add autonomous graph healing workflow
+
+Status: planned
+
+- Add a repair workflow for unresolved references and dangling relations reported by validation.
+- Reparse only the smallest affected file or dependency neighborhood needed to resolve a graph gap.
+- Record repair provenance so automatic healing remains auditable.
+- Add dry-run and test coverage for unresolved imports, stale hashes, and dangling relation cleanup.

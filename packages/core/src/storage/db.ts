@@ -13,6 +13,7 @@ import { mergeProvenance, topSourcePriority } from "../graph/provenance.ts";
 import { ensureDir } from "../util/fs.ts";
 
 const SCHEMA_VERSION = 2;
+const SQLITE_LIST_CHUNK_SIZE = 400;
 
 function toJson(value: unknown): string {
   return JSON.stringify(value ?? null);
@@ -59,6 +60,14 @@ function searchableText(value: string | undefined): string {
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .replace(/[^a-zA-Z0-9]+/g, " ")
     .toLowerCase();
+}
+
+function chunks<T>(items: T[], chunkSize = SQLITE_LIST_CHUNK_SIZE): T[][] {
+  const result: T[][] = [];
+  for (let index = 0; index < items.length; index += chunkSize) {
+    result.push(items.slice(index, index + chunkSize));
+  }
+  return result;
 }
 
 export type GraphSnapshot = {
@@ -320,12 +329,18 @@ export class DSPDatabase {
     if (uids.length === 0) {
       return [];
     }
-    const placeholders = uids.map(() => "?").join(", ");
-    const rows = this.db.prepare(`SELECT * FROM entities WHERE uid IN (${placeholders})`).all(...uids) as Record<
-      string,
-      unknown
-    >[];
-    const byUid = new Map(rows.map((row) => [String(row.uid), this.rowToEntity(row)]));
+
+    const byUid = new Map<string, Entity>();
+    for (const chunk of chunks([...new Set(uids)])) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      const rows = this.db
+        .prepare(`SELECT * FROM entities WHERE uid IN (${placeholders})`)
+        .all(...chunk) as Record<string, unknown>[];
+      for (const row of rows) {
+        byUid.set(String(row.uid), this.rowToEntity(row));
+      }
+    }
+
     return uids.map((uid) => byUid.get(uid)).filter((entity): entity is Entity => Boolean(entity));
   }
 
@@ -424,13 +439,10 @@ export class DSPDatabase {
       return [];
     }
     const rows: Record<string, unknown>[] = [];
-    const uniqueUids = [...new Set(uids)];
-    const chunkSize = 400;
-    for (let index = 0; index < uniqueUids.length; index += chunkSize) {
+    for (const chunk of chunks([...new Set(uids)])) {
       if (limit !== null && rows.length >= limit) {
         break;
       }
-      const chunk = uniqueUids.slice(index, index + chunkSize);
       const placeholders = chunk.map(() => "?").join(", ");
       const remainingLimit = limit === null ? null : limit - rows.length;
       const sql = `
@@ -682,13 +694,18 @@ export class DSPDatabase {
       this.clearUnresolvedForPath(filePath);
       return;
     }
-    const placeholders = uids.map(() => "?").join(", ");
-    this.db.prepare(`DELETE FROM relations WHERE from_uid IN (${placeholders}) OR to_uid IN (${placeholders})`).run(
-      ...uids,
-      ...uids
-    );
-    this.db.prepare(`DELETE FROM entity_fts WHERE uid IN (${placeholders})`).run(...uids);
-    this.db.prepare(`DELETE FROM entities WHERE uid IN (${placeholders})`).run(...uids);
+    for (const chunk of chunks(uids)) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      this.db.prepare(`DELETE FROM relations WHERE from_uid IN (${placeholders}) OR to_uid IN (${placeholders})`).run(
+        ...chunk,
+        ...chunk
+      );
+    }
+    for (const chunk of chunks(uids)) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      this.db.prepare(`DELETE FROM entity_fts WHERE uid IN (${placeholders})`).run(...chunk);
+      this.db.prepare(`DELETE FROM entities WHERE uid IN (${placeholders})`).run(...chunk);
+    }
     this.clearUnresolvedForPath(filePath);
   }
 

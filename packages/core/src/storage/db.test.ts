@@ -249,4 +249,81 @@ describe("DSPDatabase", () => {
       }
     });
   });
+
+  it("returns entity batches in requested UID order", () => {
+    const now = stableNowIso();
+    const uids = Array.from({ length: 1_205 }, (_, index) =>
+      buildUid("function", `src/batch-${index}.ts`, `handler${index}`)
+    );
+    db.transaction(() => {
+      for (const [index, uid] of uids.entries()) {
+        db.upsertEntity({
+          uid,
+          kind: "function",
+          name: `handler${index}`,
+          path: `src/batch-${index}.ts`,
+          confidence: 1,
+          provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+          createdAt: now,
+          updatedAt: now
+        });
+      }
+    });
+
+    const requested = [uids[1000]!, uids[3]!, "function:missing.ts#missing", uids[604]!, uids[0]!];
+    expect(db.getEntitiesByUid(requested).map((entity) => entity.uid)).toEqual([
+      uids[1000],
+      uids[3],
+      uids[604],
+      uids[0]
+    ]);
+  });
+
+  it("clears AST data for paths with more entities than SQLite variable limits allow", () => {
+    const now = stableNowIso();
+    const filePath = "src/large-module.ts";
+    const externalUid = buildUid("function", "src/external.ts", "external");
+    const uids = Array.from({ length: 650 }, (_, index) =>
+      buildUid("function", filePath, `handler${index}`)
+    );
+    db.transaction(() => {
+      db.upsertEntity({
+        uid: externalUid,
+        kind: "function",
+        name: "external",
+        path: "src/external.ts",
+        confidence: 1,
+        provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+        createdAt: now,
+        updatedAt: now
+      });
+      for (const [index, uid] of uids.entries()) {
+        db.upsertEntity({
+          uid,
+          kind: "function",
+          name: `handler${index}`,
+          path: filePath,
+          description: "bulk cleanup target",
+          confidence: 1,
+          provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+          createdAt: now,
+          updatedAt: now
+        });
+        db.upsertRelation({
+          from: uid,
+          to: externalUid,
+          kind: "calls",
+          confidence: 1,
+          provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+        });
+      }
+    });
+
+    db.clearAstDataForPath(filePath);
+
+    expect(db.getEntitiesByUid(uids)).toEqual([]);
+    expect(db.getEntity(externalUid)).toBeDefined();
+    expect(db.getRelationsTo(externalUid)).toEqual([]);
+    expect(db.searchEntityUids("bulk cleanup target", 10)).toEqual([]);
+  });
 });
