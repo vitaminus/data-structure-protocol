@@ -91,7 +91,8 @@ export async function runSearch(
   query: string,
   opts: { topK?: number; embeddingsEnabled?: boolean } = {}
 ): Promise<SearchResult[]> {
-  const embeddingsEnabled = opts.embeddingsEnabled ?? false;
+  const embeddingsEnabled =
+    opts.embeddingsEnabled ?? Boolean(services.config.embeddings.enabled && services.embeddingProvider);
   return semanticSearch(services.db, query, {
     topK: opts.topK,
     embeddingsEnabled,

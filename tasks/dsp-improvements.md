@@ -458,7 +458,7 @@ Status: done
 
 ### 56. Honor configured embedding search policy by default
 
-Status: pending
+Status: done
 
 - Make `runSearch` use `services.config.embeddings.enabled` unless the caller explicitly overrides `embeddingsEnabled`.
 - Preserve explicit lexical-only and semantic-search call sites.
