@@ -149,7 +149,7 @@ export async function semanticSearch(
         vector = await options.provider.embed(semanticText);
         db.setEmbedding(entity.uid, hash, vector, providerKey, new Date().toISOString());
       }
-      embeddingScore = cosineSimilarity(queryVector, vector);
+      embeddingScore = Math.max(0, cosineSimilarity(queryVector, vector));
     }
 
     const lexicalAndGraphScore = Math.min(1, lexicalScore * 0.85 + neighborScore * 0.15);

@@ -466,7 +466,7 @@ Status: done
 
 ### 57. Clamp negative semantic similarity during search scoring
 
-Status: pending
+Status: done
 
 - Treat negative cosine similarity as zero so embeddings cannot penalize lexical matches.
 - Keep ContextPack reranking and search scoring consistent.
