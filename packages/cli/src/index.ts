@@ -18,6 +18,7 @@ import {
   runImpact,
   runMarkersApply,
   runIndex,
+  runRepair,
   runSearch,
   runValidate,
   type DSPServices,
@@ -888,6 +889,21 @@ program
     const services = openDSP(path.resolve(rootDir), adapters());
     try {
       const result = runValidate(services);
+      printOutput(result, options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
+  .command("repair")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--dry-run", "show planned repairs without writing", false)
+  .option("--json", "machine-readable output", false)
+  .action(async (rootDir: string, options: { dryRun: boolean; json: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      const result = await runRepair(services, { dryRun: options.dryRun });
       printOutput(result, options.json);
     } finally {
       services.db.close();

@@ -433,7 +433,7 @@ Status: done
 
 ## 53. Add autonomous graph healing workflow
 
-Status: planned
+Status: done
 
 - Add a repair workflow for unresolved references and dangling relations reported by validation.
 - Reparse only the smallest affected file or dependency neighborhood needed to resolve a graph gap.

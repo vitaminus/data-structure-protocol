@@ -11,6 +11,7 @@
 - `dsp graph <uid-or-path> --depth 2 --max-entities 100 --max-relations 250 --max-files 20`
 - `dsp impact <uid-or-path>`
 - `dsp validate`
+- `dsp repair --dry-run`
 - `dsp export --format json|jsonl|dsp|protocol`
 - `dsp import <graph.json>`
 - `dsp mcp`

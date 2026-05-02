@@ -8,6 +8,7 @@ import type {
   IndexSummary,
   EmbeddingProvider,
   LanguageAdapter,
+  RepairResult,
   SearchResult,
   ValidationResult
 } from "./graph/types.ts";
@@ -19,6 +20,7 @@ import { indexRepository, bootstrapRepository, changedFiles } from "./indexer/in
 import { semanticSearch } from "./semantic/search.ts";
 import { analyzeImpact } from "./impact/impact.ts";
 import { validateGraph } from "./validate/validate.ts";
+import { repairGraph } from "./validate/repair.ts";
 import { insertSourceMarkers } from "./markers/markers.ts";
 import { createEmbeddingProvider, MockEmbeddingProvider } from "./semantic/providers.ts";
 import { contentHash } from "./graph/uid.ts";
@@ -103,6 +105,13 @@ export function runImpact(services: DSPServices, target: string): ImpactResult {
 
 export function runValidate(services: DSPServices): ValidationResult {
   return validateGraph(services.db, services.rootDir);
+}
+
+export async function runRepair(
+  services: DSPServices,
+  options: { dryRun?: boolean } = {}
+): Promise<RepairResult> {
+  return repairGraph(services.db, services.rootDir, services.adapters, services.config, options);
 }
 
 export async function runContextPack(

@@ -154,6 +154,22 @@ export type ValidationResult = {
   summary: ValidationSummary;
 };
 
+export type RepairAction = {
+  kind: ValidationIssue["kind"];
+  status: "planned" | "applied" | "skipped";
+  message: string;
+  path?: string;
+  uid?: string;
+  relation?: { from: string; to: string; kind: RelationKind };
+};
+
+export type RepairResult = {
+  dryRun: boolean;
+  actions: RepairAction[];
+  validationBefore: ValidationSummary;
+  validationAfter?: ValidationSummary;
+};
+
 export type ContextPackRequest = {
   task: string;
   maxTokens?: number;
