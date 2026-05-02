@@ -103,6 +103,80 @@ describe("DSPDatabase", () => {
     fresh.close();
   });
 
+  it("exports deterministic JSONL graph files with a manifest", () => {
+    const now = stableNowIso();
+    const fileUid = buildUid("file", "src/auth.ts");
+    const fnUid = buildUid("function", "src/auth.ts", "login");
+    db.upsertEntity({
+      uid: fnUid,
+      kind: "function",
+      name: "login",
+      path: "src/auth.ts",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+    db.upsertEntity({
+      uid: fileUid,
+      kind: "file",
+      name: "auth.ts",
+      path: "src/auth.ts",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+    db.upsertRelation({
+      from: fileUid,
+      to: fnUid,
+      kind: "contains",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+    db.upsertUnresolvedReference(
+      {
+        path: "src/auth.ts",
+        fromUid: fnUid,
+        symbol: "MissingType",
+        kind: "type",
+        confidence: 0.4
+      },
+      now
+    );
+
+    const outputDir = path.join(tempDir, "jsonl-export");
+    db.exportJsonl(outputDir);
+
+    const entities = fs
+      .readFileSync(path.join(outputDir, "entities.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { uid: string });
+    const relations = fs
+      .readFileSync(path.join(outputDir, "relations.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { from: string; to: string; kind: string });
+    const unresolved = fs
+      .readFileSync(path.join(outputDir, "unresolved.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { symbol: string });
+    const manifest = JSON.parse(fs.readFileSync(path.join(outputDir, "manifest.json"), "utf8")) as {
+      format: string;
+      counts: { entities: number; relations: number; unresolvedReferences: number };
+    };
+
+    expect(entities.map((entity) => entity.uid)).toEqual([fileUid, fnUid].sort());
+    expect(relations).toEqual([expect.objectContaining({ from: fileUid, to: fnUid, kind: "contains" })]);
+    expect(unresolved).toEqual([expect.objectContaining({ symbol: "MissingType" })]);
+    expect(manifest).toMatchObject({
+      format: "dsp-jsonl",
+      counts: { entities: 2, relations: 1, unresolvedReferences: 1 }
+    });
+  });
+
   it("exports a protocol-compatible plain text graph", () => {
     const now = stableNowIso();
     const fileUid = buildUid("file", "src/auth.ts");
@@ -248,5 +322,168 @@ describe("DSPDatabase", () => {
         "openai-compatible": 1
       }
     });
+  });
+
+  it("returns entity batches in requested UID order", () => {
+    const now = stableNowIso();
+    const uids = Array.from({ length: 1_205 }, (_, index) =>
+      buildUid("function", `src/batch-${index}.ts`, `handler${index}`)
+    );
+    db.transaction(() => {
+      for (const [index, uid] of uids.entries()) {
+        db.upsertEntity({
+          uid,
+          kind: "function",
+          name: `handler${index}`,
+          path: `src/batch-${index}.ts`,
+          confidence: 1,
+          provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+          createdAt: now,
+          updatedAt: now
+        });
+      }
+    });
+
+    const requested = [uids[1000]!, uids[3]!, "function:missing.ts#missing", uids[604]!, uids[0]!];
+    expect(db.getEntitiesByUid(requested).map((entity) => entity.uid)).toEqual([
+      uids[1000],
+      uids[3],
+      uids[604],
+      uids[0]
+    ]);
+  });
+
+  it("clears AST data for paths with more entities than SQLite variable limits allow", () => {
+    const now = stableNowIso();
+    const filePath = "src/large-module.ts";
+    const externalUid = buildUid("function", "src/external.ts", "external");
+    const uids = Array.from({ length: 650 }, (_, index) =>
+      buildUid("function", filePath, `handler${index}`)
+    );
+    db.transaction(() => {
+      db.upsertEntity({
+        uid: externalUid,
+        kind: "function",
+        name: "external",
+        path: "src/external.ts",
+        confidence: 1,
+        provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+        createdAt: now,
+        updatedAt: now
+      });
+      for (const [index, uid] of uids.entries()) {
+        db.upsertEntity({
+          uid,
+          kind: "function",
+          name: `handler${index}`,
+          path: filePath,
+          description: "bulk cleanup target",
+          confidence: 1,
+          provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+          createdAt: now,
+          updatedAt: now
+        });
+        db.upsertRelation({
+          from: uid,
+          to: externalUid,
+          kind: "calls",
+          confidence: 1,
+          provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+        });
+      }
+    });
+
+    db.clearAstDataForPath(filePath);
+
+    expect(db.getEntitiesByUid(uids)).toEqual([]);
+    expect(db.getEntity(externalUid)).toBeDefined();
+    expect(db.getRelationsTo(externalUid)).toEqual([]);
+    expect(db.searchEntityUids("bulk cleanup target", 10)).toEqual([]);
+  });
+
+  it("renames AST graph data across related lookup tables", () => {
+    const now = stableNowIso();
+    const oldPath = "src/old.ts";
+    const newPath = "src/new.ts";
+    const oldFileUid = buildUid("file", oldPath);
+    const oldFunctionUid = buildUid("function", oldPath, "demo");
+    const newFileUid = buildUid("file", newPath);
+    const newFunctionUid = buildUid("function", newPath, "demo");
+    const externalUid = buildUid("function", "src/external.ts", "caller");
+
+    db.upsertEntity({
+      uid: oldFileUid,
+      kind: "file",
+      name: "old.ts",
+      path: oldPath,
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+    db.upsertEntity({
+      uid: oldFunctionUid,
+      kind: "function",
+      name: "demo",
+      path: oldPath,
+      description: "rename me",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+    db.upsertEntity({
+      uid: externalUid,
+      kind: "function",
+      name: "caller",
+      path: "src/external.ts",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+    db.upsertRelation({
+      from: oldFileUid,
+      to: oldFunctionUid,
+      kind: "contains",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+    db.upsertRelation({
+      from: externalUid,
+      to: oldFunctionUid,
+      kind: "calls",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+    db.upsertUnresolvedReference(
+      {
+        path: oldPath,
+        fromUid: oldFunctionUid,
+        symbol: "MissingType",
+        kind: "type",
+        confidence: 0.5
+      },
+      now
+    );
+    db.setEmbedding(oldFunctionUid, "semantic-hash", [0.1, 0.2], "mock", now);
+    db.markFileHash(oldPath, "file-hash", now);
+
+    expect(db.renameAstDataPath(oldPath, newPath, now)).toBe(true);
+
+    expect(db.getEntity(oldFileUid)).toBeUndefined();
+    expect(db.getEntity(oldFunctionUid)).toBeUndefined();
+    expect(db.getEntity(newFileUid)).toBeDefined();
+    expect(db.getEntity(newFunctionUid)?.path).toBe(newPath);
+    expect(db.getRelationsFrom(newFileUid).some((relation) => relation.to === newFunctionUid)).toBe(true);
+    expect(db.getRelationsFrom(externalUid).some((relation) => relation.to === newFunctionUid)).toBe(true);
+    expect(db.getUnresolvedReferences()).toContainEqual(
+      expect.objectContaining({ path: newPath, fromUid: newFunctionUid, symbol: "MissingType" })
+    );
+    expect(db.getEmbedding(newFunctionUid)).toMatchObject({ hash: "semantic-hash", provider: "mock" });
+    expect(db.getEmbedding(oldFunctionUid)).toBeUndefined();
+    expect(db.getFileHash(oldPath)).toBeUndefined();
+    expect(db.getFileHash(newPath)).toBe("file-hash");
+    expect(db.searchEntityUids("rename me", 10)).toContain(newFunctionUid);
   });
 });

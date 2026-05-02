@@ -7,6 +7,24 @@ import { buildUid, stableNowIso } from "./uid.ts";
 import { buildContextPack } from "./context-pack.ts";
 import { DEFAULT_CONFIG } from "../config/types.ts";
 import { MockEmbeddingProvider } from "../semantic/providers.ts";
+import type { EmbeddingProvider } from "./types.ts";
+
+class KeywordEmbeddingProvider implements EmbeddingProvider {
+  cacheKey(): string {
+    return "keyword-test";
+  }
+
+  async embed(text: string): Promise<number[]> {
+    const normalized = text.toLowerCase();
+    if (normalized.includes("payment") || normalized.includes("billing") || normalized.includes("checkout")) {
+      return [1, 0];
+    }
+    if (normalized.includes("cache")) {
+      return [0, 1];
+    }
+    return [0.1, 0.1];
+  }
+}
 
 describe("context pack", () => {
   let tempDir: string;
@@ -159,6 +177,69 @@ describe("context pack", () => {
     expect(result.code?.[0]?.content).toContain("createToken");
   });
 
+  it("filters test-only graph dependencies when tests are excluded", async () => {
+    const now = stableNowIso();
+    const authUid = buildUid("function", "src/auth.ts", "login");
+    const testUid = buildUid("test", "src/auth.test.ts");
+    db.upsertEntity({
+      uid: testUid,
+      kind: "test",
+      name: "auth.test.ts",
+      path: "src/auth.test.ts",
+      description: "authentication login regression",
+      confidence: 1,
+      provenance: [{ source: "test", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+    db.upsertRelation({
+      from: testUid,
+      to: authUid,
+      kind: "tests",
+      confidence: 1,
+      provenance: [{ source: "test", timestamp: now, confidence: 1 }]
+    });
+
+    const result = await buildContextPack(db, {
+      task: "authentication login",
+      includeTests: false,
+      maxDepth: 1
+    });
+
+    expect(result.tests).toEqual([]);
+    expect(result.relevantEntities.map((entity) => entity.uid)).not.toContain(testUid);
+    expect(result.files).not.toContain("src/auth.test.ts");
+    expect(result.dependencies).not.toContainEqual(
+      expect.objectContaining({ from: testUid, to: authUid, kind: "tests" })
+    );
+  });
+
+  it("enforces token budgets after code payload assembly", async () => {
+    fs.mkdirSync(path.join(tempDir, "src"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, "src", "auth.ts"),
+      [
+        "export function login() {",
+        ...Array.from({ length: 120 }, (_, index) => `  const value${index} = "authentication payload ${index}";`),
+        "  return true;",
+        "}"
+      ].join("\n"),
+      "utf8"
+    );
+
+    const result = await buildContextPack(db, {
+      task: "authentication logic",
+      includeCode: "full-files",
+      maxFiles: 1,
+      maxTokens: 650
+    });
+
+    expect(result.estimatedTokens).toBeLessThanOrEqual(result.maxTokens);
+    expect(result.truncated).toBe(true);
+    expect(result.code?.[0]?.truncated).toBe(true);
+    expect(result.files).toEqual(["src/auth.ts"]);
+  });
+
   it("uses configured embeddings provider when building context packs through services", async () => {
     const result = await buildContextPack(
       {
@@ -177,6 +258,84 @@ describe("context pack", () => {
 
     expect(result.relevantEntities.length).toBeGreaterThan(0);
     expect(db.cacheStats().embeddings).toBeGreaterThan(0);
+  });
+
+  it("uses semantic reranking to keep relevant graph nodes under tight file budgets", async () => {
+    const now = stableNowIso();
+    const checkoutUid = buildUid("function", "src/checkout.ts", "checkout");
+    const billingUid = buildUid("function", "src/billing.ts", "settleInvoice");
+    const cacheUid = buildUid("function", "src/cache.ts", "refreshCache");
+
+    for (const entity of [
+      {
+        uid: checkoutUid,
+        kind: "function" as const,
+        name: "checkout",
+        path: "src/checkout.ts",
+        description: "checkout entry point for order submission"
+      },
+      {
+        uid: billingUid,
+        kind: "function" as const,
+        name: "settleInvoice",
+        path: "src/billing.ts",
+        description: "payment billing settlement for invoices"
+      },
+      {
+        uid: cacheUid,
+        kind: "function" as const,
+        name: "refreshCache",
+        path: "src/cache.ts",
+        description: "cache refresh utility"
+      }
+    ]) {
+      db.upsertEntity({
+        ...entity,
+        confidence: 1,
+        provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+        createdAt: now,
+        updatedAt: now
+      });
+    }
+    db.upsertRelation({
+      from: checkoutUid,
+      to: cacheUid,
+      kind: "calls",
+      weight: 0.95,
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+    db.upsertRelation({
+      from: checkoutUid,
+      to: billingUid,
+      kind: "uses",
+      weight: 0.4,
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+
+    const result = await buildContextPack(
+      {
+        db,
+        config: {
+          ...DEFAULT_CONFIG,
+          embeddings: { ...DEFAULT_CONFIG.embeddings, enabled: true, provider: "mock" }
+        },
+        embeddingProvider: new KeywordEmbeddingProvider()
+      },
+      {
+        task: "checkout payment bug",
+        maxFiles: 2,
+        maxDepth: 1
+      }
+    );
+
+    expect(result.files).toContain("src/billing.ts");
+    expect(result.files).not.toContain("src/cache.ts");
+    expect(result.riskNotes).toContain("Semantic reranking applied to context entities.");
+    expect(result.relevantEntities.find((entity) => entity.uid === billingUid)?.metadata?.contextRank).toMatchObject({
+      semantic: 1
+    });
   });
 
   it("orders suggested edits with dependencies before dependents", async () => {
@@ -284,7 +443,8 @@ describe("context pack", () => {
     const result = await buildContextPack(db, {
       task: "root fanout",
       maxDepth: 1,
-      maxFiles: 6008
+      maxFiles: 6008,
+      maxTokens: 1_000_000
     });
 
     expect(result.relevantEntities.map((entity) => entity.uid)).toContain(importantUid);

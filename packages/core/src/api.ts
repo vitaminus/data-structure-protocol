@@ -8,6 +8,7 @@ import type {
   IndexSummary,
   EmbeddingProvider,
   LanguageAdapter,
+  RepairResult,
   SearchResult,
   ValidationResult
 } from "./graph/types.ts";
@@ -19,6 +20,7 @@ import { indexRepository, bootstrapRepository, changedFiles } from "./indexer/in
 import { semanticSearch } from "./semantic/search.ts";
 import { analyzeImpact } from "./impact/impact.ts";
 import { validateGraph } from "./validate/validate.ts";
+import { repairGraph } from "./validate/repair.ts";
 import { insertSourceMarkers } from "./markers/markers.ts";
 import { createEmbeddingProvider, MockEmbeddingProvider } from "./semantic/providers.ts";
 import { contentHash } from "./graph/uid.ts";
@@ -89,7 +91,8 @@ export async function runSearch(
   query: string,
   opts: { topK?: number; embeddingsEnabled?: boolean } = {}
 ): Promise<SearchResult[]> {
-  const embeddingsEnabled = opts.embeddingsEnabled ?? false;
+  const embeddingsEnabled =
+    opts.embeddingsEnabled ?? Boolean(services.config.embeddings.enabled && services.embeddingProvider);
   return semanticSearch(services.db, query, {
     topK: opts.topK,
     embeddingsEnabled,
@@ -105,6 +108,13 @@ export function runValidate(services: DSPServices): ValidationResult {
   return validateGraph(services.db, services.rootDir);
 }
 
+export async function runRepair(
+  services: DSPServices,
+  options: { dryRun?: boolean } = {}
+): Promise<RepairResult> {
+  return repairGraph(services.db, services.rootDir, services.adapters, services.config, options);
+}
+
 export async function runContextPack(
   services: DSPServices,
   request: ContextPackRequest
@@ -114,12 +124,17 @@ export async function runContextPack(
 
 export function runExport(
   services: DSPServices,
-  format: "json" | "dsp" | "protocol",
+  format: "json" | "jsonl" | "dsp" | "protocol",
   targetPath?: string
-): { format: "json" | "dsp" | "protocol"; targetPath: string } {
+): { format: "json" | "jsonl" | "dsp" | "protocol"; targetPath: string } {
   if (format === "json") {
     const finalPath = targetPath ?? path.join(services.rootDir, ".dsp", "graph.json");
     services.db.exportJson(finalPath);
+    return { format, targetPath: finalPath };
+  }
+  if (format === "jsonl") {
+    const finalPath = targetPath ?? path.join(services.rootDir, ".dsp", "jsonl");
+    services.db.exportJsonl(finalPath);
     return { format, targetPath: finalPath };
   }
   if (format === "protocol") {

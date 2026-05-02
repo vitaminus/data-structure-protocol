@@ -18,6 +18,7 @@ import {
   runImpact,
   runMarkersApply,
   runIndex,
+  runRepair,
   runSearch,
   runValidate,
   type DSPServices,
@@ -401,9 +402,24 @@ program
   .argument("<uidOrPath>", "entity uid or path")
   .argument("[rootDir]", "root directory", ".")
   .option("--depth <number>", "graph depth", "2")
+  .option("--max-entities <number>", "maximum graph entities to return")
+  .option("--max-relations <number>", "maximum graph relations to return")
+  .option("--max-files <number>", "maximum graph files to include")
+  .option("--max-estimated-tokens <number>", "maximum estimated graph tokens")
   .option("--json", "machine-readable output", false)
   .action(
-    (uidOrPath: string, rootDir: string, options: { depth: string; json: boolean }) => {
+    (
+      uidOrPath: string,
+      rootDir: string,
+      options: {
+        depth: string;
+        maxEntities?: string;
+        maxRelations?: string;
+        maxFiles?: string;
+        maxEstimatedTokens?: string;
+        json: boolean;
+      }
+    ) => {
       const services = openDSP(path.resolve(rootDir), adapters());
       try {
         const entity = findEntityByUidOrPath(services.db, uidOrPath);
@@ -411,7 +427,12 @@ program
           printOutput({ found: false, uidOrPath }, options.json);
           return;
         }
-        const graph = getNeighbors(services.db, entity.uid, Number(options.depth));
+        const graph = getNeighbors(services.db, entity.uid, Number(options.depth), {
+          maxEntities: options.maxEntities ? Number(options.maxEntities) : undefined,
+          maxRelations: options.maxRelations ? Number(options.maxRelations) : undefined,
+          maxFiles: options.maxFiles ? Number(options.maxFiles) : undefined,
+          maxEstimatedTokens: options.maxEstimatedTokens ? Number(options.maxEstimatedTokens) : undefined
+        });
         printOutput({ root: entity.uid, ...graph }, options.json);
       } finally {
         services.db.close();
@@ -875,12 +896,27 @@ program
   });
 
 program
+  .command("repair")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--dry-run", "show planned repairs without writing", false)
+  .option("--json", "machine-readable output", false)
+  .action(async (rootDir: string, options: { dryRun: boolean; json: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      const result = await runRepair(services, { dryRun: options.dryRun });
+      printOutput(result, options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
   .command("export")
   .argument("[rootDir]", "root directory", ".")
-  .option("--format <format>", "json, dsp, or protocol", "json")
+  .option("--format <format>", "json, jsonl, dsp, or protocol", "json")
   .option("--output <path>", "output path")
   .option("--json", "machine-readable output", false)
-  .action((rootDir: string, options: { format: "json" | "dsp" | "protocol"; output?: string; json: boolean }) => {
+  .action((rootDir: string, options: { format: "json" | "jsonl" | "dsp" | "protocol"; output?: string; json: boolean }) => {
     const services = openDSP(path.resolve(rootDir), adapters());
     try {
       const result = runExport(services, options.format, options.output);

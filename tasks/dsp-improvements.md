@@ -375,3 +375,99 @@ Status: done
 - Introduce shared CLI/MCP input schemas or validators to reduce surface drift.
 - Add branded UID/helper types in a backward-compatible, staged way.
 - Add CLI output snapshots, MCP schema snapshots, compile-time typing tests, and an embeddings stats regression test.
+
+## 47. Add budgeted priority graph traversal
+
+Status: done
+
+- Replace unbounded depth-first neighbor expansion with priority-queue traversal in `getNeighbors`.
+- Rank relations by explicit weight, confidence, and relation kind so high-signal edges survive tight budgets.
+- Add `maxEntities` and `maxRelations` budgets to CLI and MCP neighbor queries.
+- Apply budgeted, priority-ordered relation slicing to ContextPack graph expansion.
+- Add regression coverage for hub-style graphs with tight traversal budgets.
+
+## 48. Add batch-safe SQLite list operations
+
+Status: done
+
+- Replace large `WHERE uid IN (...)` call sites with shared chunking helpers.
+- Cover `getEntitiesByUid`, relation endpoint queries, and AST cleanup paths that receive large UID lists.
+- Preserve deterministic result ordering for callers that pass ordered UID arrays.
+- Add scale tests that exceed SQLite variable limits without raising `too many SQL variables`.
+
+## 49. Add content-hash-assisted rename reconciliation
+
+Status: done
+
+- Reconcile moved files and symbols by comparing file content hashes before deleting and recreating graph entities.
+- Rewrite path-based UIDs, relations, unresolved references, file hashes, FTS rows, and embeddings when content matches.
+- Preserve canonical path-based UID compatibility while turning exact renames into metadata-only graph updates.
+- Add changed-only indexing coverage for exact renames and moved-and-edited files.
+
+## 50. Add JSONL graph export format
+
+Status: done
+
+- Add `entities.jsonl`, `relations.jsonl`, and `unresolved.jsonl` export files with a compact manifest.
+- Keep existing JSON and protocol exports backward-compatible.
+- Add CLI/API format selection and documentation for the JSONL export.
+- Add deterministic export/import coverage for large graph snapshots.
+
+## 52. Introduce streaming graph query APIs
+
+Status: done
+
+- Add async iterator variants for graph traversal and context assembly internals.
+- Let CLI and MCP consume streaming internals while preserving existing JSON response contracts.
+- Ensure traversal can stop early when token, file, entity, or relation budgets are reached.
+- Add latency-focused tests or benchmarks that confirm first results are produced before full traversal completes.
+
+## 51. Add semantic reranking to ContextPack
+
+Status: done
+
+- Use embeddings to rerank graph expansion candidates when embeddings are enabled.
+- Combine lexical score, graph priority, and vector similarity into an explainable ContextPack ranking.
+- Keep deterministic non-embedding behavior unchanged.
+- Add mock-provider tests that verify semantically relevant nodes survive tight context budgets.
+
+## 53. Add autonomous graph healing workflow
+
+Status: done
+
+- Add a repair workflow for unresolved references and dangling relations reported by validation.
+- Reparse only the smallest affected file or dependency neighborhood needed to resolve a graph gap.
+- Record repair provenance so automatic healing remains auditable.
+- Add dry-run and test coverage for unresolved imports, stale hashes, and dangling relation cleanup.
+
+### 54. Prevent test-only graph dependencies from leaking into ContextPack
+
+Status: done
+
+- When `includeTests` is `false`, filter dependencies whose endpoints are test entities.
+- Keep relevant entity, file, code, and dependency lists consistent.
+- Add regression coverage for a selected implementation that has a `tests` relation.
+
+### 55. Enforce ContextPack token budgets after code payload assembly
+
+Status: done
+
+- Ensure `estimatedTokens` does not remain above `maxTokens` after adding snippets or full-file code payloads.
+- Trim code payloads and secondary lists deterministically before returning.
+- Add coverage for a small token budget with included code.
+
+### 56. Honor configured embedding search policy by default
+
+Status: done
+
+- Make `runSearch` use `services.config.embeddings.enabled` unless the caller explicitly overrides `embeddingsEnabled`.
+- Preserve explicit lexical-only and semantic-search call sites.
+- Add API-level coverage with a configured provider.
+
+### 57. Clamp negative semantic similarity during search scoring
+
+Status: done
+
+- Treat negative cosine similarity as zero so embeddings cannot penalize lexical matches.
+- Keep ContextPack reranking and search scoring consistent.
+- Add coverage for an embedding provider that returns an opposite vector.

@@ -426,8 +426,18 @@ export async function indexRepository(
     if (changedEntries) {
       db.transaction(() => {
         for (const entry of changedEntries) {
+          let renameReconciled = false;
+          if (entry.oldPath && entry.oldPath !== entry.path && existsSync(entry.path)) {
+            const oldRelPath = normalizePath(path.relative(scanRoot, entry.oldPath));
+            const newRelPath = normalizePath(path.relative(scanRoot, entry.path));
+            const oldHash = db.getFileHash(oldRelPath);
+            const newHash = contentHash(readFileSync(entry.path, "utf8"));
+            if (oldHash && oldHash === newHash) {
+              renameReconciled = db.renameAstDataPath(oldRelPath, newRelPath, stableNowIso());
+            }
+          }
           const stalePaths = [
-            ...(entry.oldPath && entry.oldPath !== entry.path ? [entry.oldPath] : []),
+            ...(entry.oldPath && entry.oldPath !== entry.path && !renameReconciled ? [entry.oldPath] : []),
             ...(!existsSync(entry.path) || entry.status.startsWith("D") ? [entry.path] : [])
           ];
           for (const stalePath of stalePaths) {

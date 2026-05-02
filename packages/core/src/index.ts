@@ -11,5 +11,6 @@ export * from "./semantic/providers.ts";
 export * from "./semantic/search.ts";
 export * from "./impact/impact.ts";
 export * from "./validate/validate.ts";
+export * from "./validate/repair.ts";
 export * from "./markers/markers.ts";
 export * from "./api.ts";

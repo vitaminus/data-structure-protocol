@@ -35,6 +35,16 @@ class SynonymProvider implements EmbeddingProvider {
   }
 }
 
+class OppositeVectorProvider implements EmbeddingProvider {
+  cacheKey(): string {
+    return "opposite-vector-test";
+  }
+
+  async embed(text: string): Promise<number[]> {
+    return text.trim().toLowerCase() === "auth" ? [1, 0] : [-1, 0];
+  }
+}
+
 describe("semantic search", () => {
   let tempDir: string;
   let db: DSPDatabase;
@@ -179,5 +189,31 @@ describe("semantic search", () => {
     });
 
     expect(results[0]?.uid).toBe(loginUid);
+  });
+
+  it("does not let negative semantic similarity penalize lexical matches", async () => {
+    const now = stableNowIso();
+    const uid = buildUid("function", "src/auth.ts", "validateToken");
+    db.upsertEntity({
+      uid,
+      kind: "function",
+      name: "validateToken",
+      path: "src/auth.ts",
+      description: "auth token validation",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+
+    const results = await semanticSearch(db, "auth", {
+      topK: 1,
+      embeddingsEnabled: true,
+      provider: new OppositeVectorProvider()
+    });
+
+    expect(results[0]?.uid).toBe(uid);
+    expect(results[0]?.score).toBeGreaterThan(0);
+    expect(results[0]?.explanation).toContain("lexical=");
   });
 });

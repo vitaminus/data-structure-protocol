@@ -13,6 +13,7 @@ import { mergeProvenance, topSourcePriority } from "../graph/provenance.ts";
 import { ensureDir } from "../util/fs.ts";
 
 const SCHEMA_VERSION = 2;
+const SQLITE_LIST_CHUNK_SIZE = 400;
 
 function toJson(value: unknown): string {
   return JSON.stringify(value ?? null);
@@ -59,6 +60,27 @@ function searchableText(value: string | undefined): string {
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .replace(/[^a-zA-Z0-9]+/g, " ")
     .toLowerCase();
+}
+
+function chunks<T>(items: T[], chunkSize = SQLITE_LIST_CHUNK_SIZE): T[][] {
+  const result: T[][] = [];
+  for (let index = 0; index < items.length; index += chunkSize) {
+    result.push(items.slice(index, index + chunkSize));
+  }
+  return result;
+}
+
+function rewritePathBasedUid(uid: string, oldPath: string, newPath: string): string {
+  const separatorIndex = uid.indexOf(":");
+  if (separatorIndex === -1) {
+    return uid;
+  }
+  const prefix = uid.slice(0, separatorIndex);
+  const suffix = uid.slice(separatorIndex + 1);
+  if (suffix === oldPath || suffix.startsWith(`${oldPath}#`)) {
+    return `${prefix}:${newPath}${suffix.slice(oldPath.length)}`;
+  }
+  return uid;
 }
 
 export type GraphSnapshot = {
@@ -320,12 +342,18 @@ export class DSPDatabase {
     if (uids.length === 0) {
       return [];
     }
-    const placeholders = uids.map(() => "?").join(", ");
-    const rows = this.db.prepare(`SELECT * FROM entities WHERE uid IN (${placeholders})`).all(...uids) as Record<
-      string,
-      unknown
-    >[];
-    const byUid = new Map(rows.map((row) => [String(row.uid), this.rowToEntity(row)]));
+
+    const byUid = new Map<string, Entity>();
+    for (const chunk of chunks([...new Set(uids)])) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      const rows = this.db
+        .prepare(`SELECT * FROM entities WHERE uid IN (${placeholders})`)
+        .all(...chunk) as Record<string, unknown>[];
+      for (const row of rows) {
+        byUid.set(String(row.uid), this.rowToEntity(row));
+      }
+    }
+
     return uids.map((uid) => byUid.get(uid)).filter((entity): entity is Entity => Boolean(entity));
   }
 
@@ -424,13 +452,10 @@ export class DSPDatabase {
       return [];
     }
     const rows: Record<string, unknown>[] = [];
-    const uniqueUids = [...new Set(uids)];
-    const chunkSize = 400;
-    for (let index = 0; index < uniqueUids.length; index += chunkSize) {
+    for (const chunk of chunks([...new Set(uids)])) {
       if (limit !== null && rows.length >= limit) {
         break;
       }
-      const chunk = uniqueUids.slice(index, index + chunkSize);
       const placeholders = chunk.map(() => "?").join(", ");
       const remainingLimit = limit === null ? null : limit - rows.length;
       const sql = `
@@ -627,6 +652,110 @@ export class DSPDatabase {
     this.db.prepare("DELETE FROM file_hashes WHERE path = ?").run(filePath);
   }
 
+  renameAstDataPath(oldPath: string, newPath: string, indexedAt: string): boolean {
+    if (oldPath === newPath) {
+      return false;
+    }
+    const entityRows = this.db
+      .prepare("SELECT * FROM entities WHERE path = ? AND source_priority < 100")
+      .all(oldPath) as Record<string, unknown>[];
+    if (entityRows.length === 0) {
+      return false;
+    }
+
+    const oldEntities = entityRows.map((row) => this.rowToEntity(row));
+    const uidMap = new Map(oldEntities.map((entity) => [entity.uid, rewritePathBasedUid(entity.uid, oldPath, newPath)]));
+    const oldUids = [...uidMap.keys()];
+    const relations = this.getRelationsTouching(oldUids, null);
+    const unresolvedRows = this.db
+      .prepare("SELECT from_uid, symbol, kind, reason, confidence FROM unresolved_references WHERE path = ? AND resolved = 0")
+      .all(oldPath) as {
+      from_uid: string | null;
+      symbol: string;
+      kind: UnresolvedReference["kind"];
+      reason: string | null;
+      confidence: number;
+    }[];
+    const embeddingRows = chunks(oldUids).flatMap((chunk) => {
+      const placeholders = chunk.map(() => "?").join(", ");
+      return this.db
+        .prepare(`SELECT uid, content_hash, vector_json, provider, updated_at FROM embeddings WHERE uid IN (${placeholders})`)
+        .all(...chunk) as {
+        uid: string;
+        content_hash: string;
+        vector_json: string;
+        provider: string;
+        updated_at: string;
+      }[];
+    });
+    const oldHash = this.getFileHash(oldPath);
+
+    this.clearAstDataForPath(newPath);
+    this.clearAstDataForPath(oldPath);
+    for (const chunk of chunks(oldUids)) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      this.db.prepare(`DELETE FROM embeddings WHERE uid IN (${placeholders})`).run(...chunk);
+    }
+    this.removeFileHash(oldPath);
+
+    for (const entity of oldEntities) {
+      this.upsertEntity({
+        ...entity,
+        uid: uidMap.get(entity.uid)!,
+        path: newPath,
+        metadata: {
+          ...(entity.metadata ?? {}),
+          previousPath: oldPath,
+          renameReconciledAt: indexedAt
+        },
+        updatedAt: indexedAt
+      });
+    }
+    for (const relation of relations) {
+      this.upsertRelation({
+        ...relation,
+        from: uidMap.get(relation.from) ?? relation.from,
+        to: uidMap.get(relation.to) ?? relation.to,
+        metadata: {
+          ...(relation.metadata ?? {}),
+          renameReconciledAt: indexedAt
+        }
+      });
+    }
+    for (const ref of unresolvedRows) {
+      this.upsertUnresolvedReference(
+        {
+          path: newPath,
+          fromUid: ref.from_uid ? uidMap.get(ref.from_uid) ?? ref.from_uid : undefined,
+          symbol: ref.symbol,
+          kind: ref.kind,
+          reason: ref.reason ?? undefined,
+          confidence: ref.confidence
+        },
+        indexedAt
+      );
+    }
+    for (const row of embeddingRows) {
+      this.db
+        .prepare(
+          `
+          INSERT INTO embeddings(uid, content_hash, vector_json, provider, updated_at)
+          VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(uid) DO UPDATE SET
+            content_hash = excluded.content_hash,
+            vector_json = excluded.vector_json,
+            provider = excluded.provider,
+            updated_at = excluded.updated_at
+          `
+        )
+        .run(uidMap.get(row.uid) ?? row.uid, row.content_hash, row.vector_json, row.provider, indexedAt);
+    }
+    if (oldHash) {
+      this.markFileHash(newPath, oldHash, indexedAt);
+    }
+    return true;
+  }
+
   clearUnresolvedForPath(filePath: string): void {
     this.db.prepare("DELETE FROM unresolved_references WHERE path = ?").run(filePath);
   }
@@ -682,13 +811,18 @@ export class DSPDatabase {
       this.clearUnresolvedForPath(filePath);
       return;
     }
-    const placeholders = uids.map(() => "?").join(", ");
-    this.db.prepare(`DELETE FROM relations WHERE from_uid IN (${placeholders}) OR to_uid IN (${placeholders})`).run(
-      ...uids,
-      ...uids
-    );
-    this.db.prepare(`DELETE FROM entity_fts WHERE uid IN (${placeholders})`).run(...uids);
-    this.db.prepare(`DELETE FROM entities WHERE uid IN (${placeholders})`).run(...uids);
+    for (const chunk of chunks(uids)) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      this.db.prepare(`DELETE FROM relations WHERE from_uid IN (${placeholders}) OR to_uid IN (${placeholders})`).run(
+        ...chunk,
+        ...chunk
+      );
+    }
+    for (const chunk of chunks(uids)) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      this.db.prepare(`DELETE FROM entity_fts WHERE uid IN (${placeholders})`).run(...chunk);
+      this.db.prepare(`DELETE FROM entities WHERE uid IN (${placeholders})`).run(...chunk);
+    }
     this.clearUnresolvedForPath(filePath);
   }
 
@@ -709,6 +843,53 @@ export class DSPDatabase {
     const snapshot = this.getSnapshot();
     fs.mkdirSync(path.dirname(targetPath), { recursive: true });
     fs.writeFileSync(targetPath, `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+  }
+
+  exportJsonl(targetDir: string): void {
+    fs.mkdirSync(targetDir, { recursive: true });
+    const entities = this.getEntities(200000).sort((a, b) => a.uid.localeCompare(b.uid));
+    const relations = this.getRelations(500000).sort((a, b) =>
+      `${a.from}\0${a.kind}\0${a.to}`.localeCompare(`${b.from}\0${b.kind}\0${b.to}`)
+    );
+    const unresolvedReferences = this.getUnresolvedReferences().sort((a, b) =>
+      `${a.path}\0${a.kind}\0${a.symbol}\0${a.fromUid ?? ""}`.localeCompare(
+        `${b.path}\0${b.kind}\0${b.symbol}\0${b.fromUid ?? ""}`
+      )
+    );
+    const writeJsonLines = (fileName: string, rows: unknown[]) => {
+      fs.writeFileSync(
+        path.join(targetDir, fileName),
+        rows.map((row) => JSON.stringify(row)).join("\n") + (rows.length > 0 ? "\n" : ""),
+        "utf8"
+      );
+    };
+
+    writeJsonLines("entities.jsonl", entities);
+    writeJsonLines("relations.jsonl", relations);
+    writeJsonLines("unresolved.jsonl", unresolvedReferences);
+    fs.writeFileSync(
+      path.join(targetDir, "manifest.json"),
+      `${JSON.stringify(
+        {
+          format: "dsp-jsonl",
+          version: 1,
+          generatedAt: new Date().toISOString(),
+          files: {
+            entities: "entities.jsonl",
+            relations: "relations.jsonl",
+            unresolvedReferences: "unresolved.jsonl"
+          },
+          counts: {
+            entities: entities.length,
+            relations: relations.length,
+            unresolvedReferences: unresolvedReferences.length
+          }
+        },
+        null,
+        2
+      )}\n`,
+      "utf8"
+    );
   }
 
   importJson(sourcePath: string): GraphSnapshot {

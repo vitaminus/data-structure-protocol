@@ -42,6 +42,7 @@ describe("CLI surface", () => {
         search [options] <query> [rootDir]
         impact [options] <uidOrPath> [rootDir]
         validate [options] [rootDir]
+        repair [options] [rootDir]
         export [options] [rootDir]
         import [options] <jsonPath> [rootDir]
         mcp [rootDir]
