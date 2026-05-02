@@ -177,6 +177,43 @@ describe("context pack", () => {
     expect(result.code?.[0]?.content).toContain("createToken");
   });
 
+  it("filters test-only graph dependencies when tests are excluded", async () => {
+    const now = stableNowIso();
+    const authUid = buildUid("function", "src/auth.ts", "login");
+    const testUid = buildUid("test", "src/auth.test.ts");
+    db.upsertEntity({
+      uid: testUid,
+      kind: "test",
+      name: "auth.test.ts",
+      path: "src/auth.test.ts",
+      description: "authentication login regression",
+      confidence: 1,
+      provenance: [{ source: "test", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+    db.upsertRelation({
+      from: testUid,
+      to: authUid,
+      kind: "tests",
+      confidence: 1,
+      provenance: [{ source: "test", timestamp: now, confidence: 1 }]
+    });
+
+    const result = await buildContextPack(db, {
+      task: "authentication login",
+      includeTests: false,
+      maxDepth: 1
+    });
+
+    expect(result.tests).toEqual([]);
+    expect(result.relevantEntities.map((entity) => entity.uid)).not.toContain(testUid);
+    expect(result.files).not.toContain("src/auth.test.ts");
+    expect(result.dependencies).not.toContainEqual(
+      expect.objectContaining({ from: testUid, to: authUid, kind: "tests" })
+    );
+  });
+
   it("uses configured embeddings provider when building context packs through services", async () => {
     const result = await buildContextPack(
       {

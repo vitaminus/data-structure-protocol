@@ -439,3 +439,35 @@ Status: done
 - Reparse only the smallest affected file or dependency neighborhood needed to resolve a graph gap.
 - Record repair provenance so automatic healing remains auditable.
 - Add dry-run and test coverage for unresolved imports, stale hashes, and dangling relation cleanup.
+
+### 54. Prevent test-only graph dependencies from leaking into ContextPack
+
+Status: done
+
+- When `includeTests` is `false`, filter dependencies whose endpoints are test entities.
+- Keep relevant entity, file, code, and dependency lists consistent.
+- Add regression coverage for a selected implementation that has a `tests` relation.
+
+### 55. Enforce ContextPack token budgets after code payload assembly
+
+Status: pending
+
+- Ensure `estimatedTokens` does not remain above `maxTokens` after adding snippets or full-file code payloads.
+- Trim code payloads and secondary lists deterministically before returning.
+- Add coverage for a small token budget with included code.
+
+### 56. Honor configured embedding search policy by default
+
+Status: pending
+
+- Make `runSearch` use `services.config.embeddings.enabled` unless the caller explicitly overrides `embeddingsEnabled`.
+- Preserve explicit lexical-only and semantic-search call sites.
+- Add API-level coverage with a configured provider.
+
+### 57. Clamp negative semantic similarity during search scoring
+
+Status: pending
+
+- Treat negative cosine similarity as zero so embeddings cannot penalize lexical matches.
+- Keep ContextPack reranking and search scoring consistent.
+- Add coverage for an embedding provider that returns an opposite vector.

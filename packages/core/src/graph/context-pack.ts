@@ -173,6 +173,10 @@ function contextPackServices(input: DSPDatabase | ContextPackServices): ContextP
   return input instanceof DSPDatabase ? { db: input } : input;
 }
 
+function relationHasTestEndpoint(relation: Relation, entitiesByUid: Map<string, Entity>): boolean {
+  return entitiesByUid.get(relation.from)?.kind === "test" || entitiesByUid.get(relation.to)?.kind === "test";
+}
+
 function topoSortByDependencies(
   files: string[],
   entities: Entity[],
@@ -317,16 +321,19 @@ export async function buildContextPack(
     maxEntities: Math.max(maxFiles * 8, selectedUids.size),
     maxRelations: Math.max(maxFiles * 40, 300)
   });
-  const graphDependencies = graphSlice.relations.filter(
-    (relation) => graphSlice.entities.has(relation.from) && graphSlice.entities.has(relation.to)
-  );
-  const dependencies = graphDependencies.slice(0, 300);
-  const dependenciesTruncated = graphDependencies.length > dependencies.length;
   const contextEntities = [...selectedEntities];
   const contextEntityUids = new Set(contextEntities.map((entity) => entity.uid));
   for (const entity of db.getEntitiesByUid([...graphSlice.entities])) {
     entitiesByUid.set(entity.uid, entity);
   }
+  const graphDependencies = graphSlice.relations.filter(
+    (relation) =>
+      graphSlice.entities.has(relation.from) &&
+      graphSlice.entities.has(relation.to) &&
+      (includeTests || !relationHasTestEndpoint(relation, entitiesByUid))
+  );
+  const dependencies = graphDependencies.slice(0, 300);
+  const dependenciesTruncated = graphDependencies.length > dependencies.length;
   for (const uid of graphSlice.entities) {
     const entity = entitiesByUid.get(uid);
     if (!includeTests && entity?.kind === "test") {
