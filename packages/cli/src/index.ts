@@ -403,12 +403,21 @@ program
   .option("--depth <number>", "graph depth", "2")
   .option("--max-entities <number>", "maximum graph entities to return")
   .option("--max-relations <number>", "maximum graph relations to return")
+  .option("--max-files <number>", "maximum graph files to include")
+  .option("--max-estimated-tokens <number>", "maximum estimated graph tokens")
   .option("--json", "machine-readable output", false)
   .action(
     (
       uidOrPath: string,
       rootDir: string,
-      options: { depth: string; maxEntities?: string; maxRelations?: string; json: boolean }
+      options: {
+        depth: string;
+        maxEntities?: string;
+        maxRelations?: string;
+        maxFiles?: string;
+        maxEstimatedTokens?: string;
+        json: boolean;
+      }
     ) => {
       const services = openDSP(path.resolve(rootDir), adapters());
       try {
@@ -419,7 +428,9 @@ program
         }
         const graph = getNeighbors(services.db, entity.uid, Number(options.depth), {
           maxEntities: options.maxEntities ? Number(options.maxEntities) : undefined,
-          maxRelations: options.maxRelations ? Number(options.maxRelations) : undefined
+          maxRelations: options.maxRelations ? Number(options.maxRelations) : undefined,
+          maxFiles: options.maxFiles ? Number(options.maxFiles) : undefined,
+          maxEstimatedTokens: options.maxEstimatedTokens ? Number(options.maxEstimatedTokens) : undefined
         });
         printOutput({ root: entity.uid, ...graph }, options.json);
       } finally {

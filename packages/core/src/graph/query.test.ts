@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DSPDatabase } from "../storage/db.ts";
 import { buildUid, stableNowIso } from "./uid.ts";
-import { getNeighbors } from "./query.ts";
+import { getNeighbors, streamNeighbors } from "./query.ts";
 
 describe("graph query", () => {
   let tempDir: string;
@@ -119,5 +119,73 @@ describe("graph query", () => {
     expect(result.entities.map((entity) => entity.uid)).toEqual([root, directCall, confidentDependency]);
     expect(relationTargets).toEqual([directCall, confidentDependency]);
     expect(relationTargets).not.toContain(weakImport);
+  });
+
+  it("streams traversal events before callers collect the full graph", async () => {
+    const now = stableNowIso();
+    const root = buildUid("function", "src/root.ts", "root");
+    const child = buildUid("function", "src/child.ts", "child");
+
+    for (const [uid, name] of [
+      [root, "root"],
+      [child, "child"]
+    ] as const) {
+      db.upsertEntity({
+        uid,
+        kind: "function",
+        name,
+        path: uid.slice("function:".length).split("#")[0],
+        confidence: 1,
+        provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+        createdAt: now,
+        updatedAt: now
+      });
+    }
+    db.upsertRelation({
+      from: root,
+      to: child,
+      kind: "calls",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+
+    const iterator = streamNeighbors(db, root, 1);
+    await expect(iterator.next()).resolves.toMatchObject({
+      done: false,
+      value: { type: "entity", entity: { uid: root }, depth: 0 }
+    });
+    await iterator.return(undefined);
+  });
+
+  it("honors file and token budgets during traversal", () => {
+    const now = stableNowIso();
+    const root = buildUid("function", "src/root.ts", "root");
+    const child = buildUid("function", "src/child.ts", "child");
+
+    for (const [uid, name] of [
+      [root, "root"],
+      [child, "child"]
+    ] as const) {
+      db.upsertEntity({
+        uid,
+        kind: "function",
+        name,
+        path: uid.slice("function:".length).split("#")[0],
+        confidence: 1,
+        provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+        createdAt: now,
+        updatedAt: now
+      });
+    }
+    db.upsertRelation({
+      from: root,
+      to: child,
+      kind: "calls",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+
+    expect(getNeighbors(db, root, 1, { maxFiles: 1 }).entities.map((entity) => entity.uid)).toEqual([root]);
+    expect(getNeighbors(db, root, 1, { maxEstimatedTokens: 1 })).toEqual({ entities: [], relations: [] });
   });
 });

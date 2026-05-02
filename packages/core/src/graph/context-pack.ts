@@ -3,7 +3,7 @@ import path from "node:path";
 import type { ContextPackRequest, ContextPackResponse, EmbeddingProvider, Entity, Relation } from "./types.ts";
 import { DSPDatabase } from "../storage/db.ts";
 import { semanticSearch } from "../semantic/search.ts";
-import { relationPriority } from "./query.ts";
+import { streamNeighbors } from "./query.ts";
 
 type StrategyDefaults = {
   maxFiles: number;
@@ -96,30 +96,32 @@ function readCodePayload(
   });
 }
 
-function relationDepthFilter(
+async function relationDepthFilter(
   db: DSPDatabase,
   seedUids: Set<string>,
   maxDepth: number,
   options: { maxEntities: number; maxRelations: number }
-): { entities: Set<string>; relations: Relation[] } {
+): Promise<{ entities: Set<string>; relations: Relation[] }> {
   const accepted: Relation[] = [];
   const acceptedKeys = new Set<string>();
-  const frontier = new Set(seedUids);
   const visited = new Set<string>(seedUids);
-  for (let depth = 0; depth < maxDepth; depth += 1) {
-    const next = new Set<string>();
-    const relations = db
-      .getRelationsTouching([...frontier], null)
-      .filter((relation) => frontier.has(relation.from) || frontier.has(relation.to))
-      .sort(
-        (left, right) =>
-          relationPriority(right) - relationPriority(left) ||
-          `${left.from}\0${left.kind}\0${left.to}`.localeCompare(`${right.from}\0${right.kind}\0${right.to}`)
-    );
-    for (const relation of relations) {
-      if (accepted.length >= options.maxRelations) {
-        break;
+
+  for (const seedUid of seedUids) {
+    if (accepted.length >= options.maxRelations || visited.size >= options.maxEntities) {
+      break;
+    }
+    for await (const event of streamNeighbors(db, seedUid, maxDepth, {
+      maxEntities: options.maxEntities,
+      maxRelations: options.maxRelations - accepted.length
+    })) {
+      if (event.type === "entity") {
+        visited.add(event.entity.uid);
+        if (visited.size >= options.maxEntities) {
+          break;
+        }
+        continue;
       }
+      const relation = event.relation;
       const relationKey = `${relation.from}\0${relation.kind}\0${relation.to}`;
       if (acceptedKeys.has(relationKey)) {
         continue;
@@ -130,24 +132,11 @@ function relationDepthFilter(
       }
       acceptedKeys.add(relationKey);
       accepted.push(relation);
-      if (!visited.has(relation.from)) {
-        visited.add(relation.from);
-        next.add(relation.from);
+      visited.add(relation.from);
+      visited.add(relation.to);
+      if (accepted.length >= options.maxRelations || visited.size >= options.maxEntities) {
+        break;
       }
-      if (!visited.has(relation.to)) {
-        visited.add(relation.to);
-        next.add(relation.to);
-      }
-    }
-    frontier.clear();
-    for (const uid of next) {
-      frontier.add(uid);
-    }
-    if (frontier.size === 0) {
-      break;
-    }
-    if (accepted.length >= options.maxRelations) {
-      break;
     }
   }
   return { entities: visited, relations: accepted };
@@ -239,7 +228,7 @@ export async function buildContextPack(
     .filter((entity) => includeTests || entity.kind !== "test");
   const selectedEntities = rankedEntities.slice(0, maxFiles * 3);
   const selectedUids = new Set(selectedEntities.map((entity) => entity.uid));
-  const graphSlice = relationDepthFilter(db, selectedUids, maxDepth, {
+  const graphSlice = await relationDepthFilter(db, selectedUids, maxDepth, {
     maxEntities: Math.max(maxFiles * 8, selectedUids.size),
     maxRelations: Math.max(maxFiles * 40, 300)
   });

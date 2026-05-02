@@ -21,7 +21,9 @@ export const NEIGHBORS_INPUT_SCHEMA = {
     uid: { type: "string" },
     depth: { type: "number" },
     maxEntities: { type: "number" },
-    maxRelations: { type: "number" }
+    maxRelations: { type: "number" },
+    maxFiles: { type: "number" },
+    maxEstimatedTokens: { type: "number" }
   },
   required: ["uid"]
 } as const;

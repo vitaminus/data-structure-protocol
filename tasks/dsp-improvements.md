@@ -415,7 +415,7 @@ Status: done
 
 ## 52. Introduce streaming graph query APIs
 
-Status: planned
+Status: done
 
 - Add async iterator variants for graph traversal and context assembly internals.
 - Let CLI and MCP consume streaming internals while preserving existing JSON response contracts.

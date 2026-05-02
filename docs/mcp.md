@@ -35,7 +35,9 @@ Response includes selected entities/files/dependencies plus token estimate and t
   "uid": "function:src/auth.ts#login",
   "depth": 2,
   "maxEntities": 100,
-  "maxRelations": 250
+  "maxRelations": 250,
+  "maxFiles": 20,
+  "maxEstimatedTokens": 4000
 }
 ```
 

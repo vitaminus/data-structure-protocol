@@ -108,6 +108,12 @@ describe("mcp tool dispatcher", () => {
               "maxEntities": {
                 "type": "number",
               },
+              "maxEstimatedTokens": {
+                "type": "number",
+              },
+              "maxFiles": {
+                "type": "number",
+              },
               "maxRelations": {
                 "type": "number",
               },

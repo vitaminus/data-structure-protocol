@@ -157,7 +157,11 @@ export async function dispatchToolCall(
       const depth = typeof args.depth === "number" ? args.depth : 1;
       const maxEntities = typeof args.maxEntities === "number" ? args.maxEntities : undefined;
       const maxRelations = typeof args.maxRelations === "number" ? args.maxRelations : undefined;
-      return { content: [jsonText(getNeighbors(services.db, uid, depth, { maxEntities, maxRelations }))] };
+      const maxFiles = typeof args.maxFiles === "number" ? args.maxFiles : undefined;
+      const maxEstimatedTokens = typeof args.maxEstimatedTokens === "number" ? args.maxEstimatedTokens : undefined;
+      return {
+        content: [jsonText(getNeighbors(services.db, uid, depth, { maxEntities, maxRelations, maxFiles, maxEstimatedTokens }))]
+      };
     }
     case "dsp.impact": {
       const target = String(args.target ?? "");

@@ -8,7 +8,7 @@
 - `dsp update --from-git-diff`
 - `dsp changed`
 - `dsp search "<query>"`
-- `dsp graph <uid-or-path> --depth 2 --max-entities 100 --max-relations 250`
+- `dsp graph <uid-or-path> --depth 2 --max-entities 100 --max-relations 250 --max-files 20`
 - `dsp impact <uid-or-path>`
 - `dsp validate`
 - `dsp export --format json|jsonl|dsp|protocol`

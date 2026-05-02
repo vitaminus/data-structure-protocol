@@ -5,7 +5,22 @@ import { buildUid, normalizePath } from "./uid.ts";
 export type NeighborTraversalOptions = {
   maxEntities?: number;
   maxRelations?: number;
+  maxFiles?: number;
+  maxEstimatedTokens?: number;
 };
+
+export type NeighborTraversalEvent =
+  | {
+      type: "entity";
+      entity: Entity;
+      depth: number;
+    }
+  | {
+      type: "relation";
+      relation: Relation;
+      depth: number;
+      priority: number;
+    };
 
 const DEFAULT_MAX_ENTITIES = 500;
 const DEFAULT_MAX_RELATIONS = 1000;
@@ -110,28 +125,47 @@ function relationKey(relation: Relation): string {
 function normalizedTraversalOptions(options: NeighborTraversalOptions): Required<NeighborTraversalOptions> {
   const entities = Math.floor(options.maxEntities ?? DEFAULT_MAX_ENTITIES);
   const relations = Math.floor(options.maxRelations ?? DEFAULT_MAX_RELATIONS);
+  const files = Math.floor(options.maxFiles ?? Number.POSITIVE_INFINITY);
+  const tokens = Math.floor(options.maxEstimatedTokens ?? Number.POSITIVE_INFINITY);
   return {
     maxEntities: Number.isFinite(entities) ? Math.max(1, entities) : DEFAULT_MAX_ENTITIES,
-    maxRelations: Number.isFinite(relations) ? Math.max(0, relations) : DEFAULT_MAX_RELATIONS
+    maxRelations: Number.isFinite(relations) ? Math.max(0, relations) : DEFAULT_MAX_RELATIONS,
+    maxFiles: Number.isFinite(files) ? Math.max(0, files) : Number.POSITIVE_INFINITY,
+    maxEstimatedTokens: Number.isFinite(tokens) ? Math.max(0, tokens) : Number.POSITIVE_INFINITY
   };
 }
 
-export function getNeighbors(
+function estimateTokens(value: unknown): number {
+  return Math.ceil(JSON.stringify(value).length / 4);
+}
+
+function* traverseNeighbors(
   db: DSPDatabase,
   uid: string,
   depth = 1,
   options: NeighborTraversalOptions = {}
-): { entities: Entity[]; relations: Relation[] } {
+): Generator<NeighborTraversalEvent> {
   const normalizedDepth = Math.floor(depth);
   const maxDepth = Number.isFinite(normalizedDepth) ? Math.max(0, normalizedDepth) : 1;
-  const { maxEntities, maxRelations } = normalizedTraversalOptions(options);
+  const { maxEntities, maxRelations, maxFiles, maxEstimatedTokens } = normalizedTraversalOptions(options);
   const entities = new Map<string, Entity>();
   const relationKeys = new Set<string>();
-  const relations: Relation[] = [];
+  const files = new Set<string>();
+  let relationCount = 0;
+  let estimatedTokens = 0;
 
   const seed = db.getEntity(uid);
   if (seed) {
+    const seedTokens = estimateTokens(seed);
+    if (seedTokens > maxEstimatedTokens || (seed.path && maxFiles < 1)) {
+      return;
+    }
     entities.set(seed.uid, seed);
+    estimatedTokens += seedTokens;
+    if (seed.path) {
+      files.add(seed.path);
+    }
+    yield { type: "entity", entity: seed, depth: 0 };
   }
 
   const expandedDepth = new Map<string, number>();
@@ -146,7 +180,7 @@ export function getNeighbors(
   });
   queue.push({ uid, depth: 0, priority: Number.POSITIVE_INFINITY });
 
-  while (queue.size > 0 && relations.length < maxRelations) {
+  while (queue.size > 0 && relationCount < maxRelations) {
     const current = queue.pop()!;
     const previousDepth = expandedDepth.get(current.uid);
     if (previousDepth !== undefined && previousDepth <= current.depth) {
@@ -164,7 +198,7 @@ export function getNeighbors(
     );
 
     for (const relation of touchingRelations) {
-      if (relations.length >= maxRelations) {
+      if (relationCount >= maxRelations) {
         break;
       }
       const key = relationKey(relation);
@@ -180,20 +214,65 @@ export function getNeighbors(
       if (entities.size + newEntities.length > maxEntities) {
         continue;
       }
-
-      relationKeys.add(key);
-      relations.push(relation);
-      for (const entity of newEntities) {
-        entities.set(entity.uid, entity);
+      const newFiles = newEntities
+        .map((entity) => entity.path)
+        .filter((entityPath): entityPath is string => entityPath !== undefined && !files.has(entityPath));
+      if (files.size + newFiles.length > maxFiles) {
+        continue;
+      }
+      const eventTokens =
+        estimateTokens(relation) + newEntities.reduce((total, entity) => total + estimateTokens(entity), 0);
+      if (estimatedTokens + eventTokens > maxEstimatedTokens) {
+        continue;
       }
 
+      relationKeys.add(key);
+      relationCount += 1;
+      estimatedTokens += eventTokens;
       const nextDepth = current.depth + 1;
       const priority = relationPriority(relation) - nextDepth;
+      yield { type: "relation", relation, depth: nextDepth, priority };
+      for (const entity of newEntities) {
+        entities.set(entity.uid, entity);
+        if (entity.path) {
+          files.add(entity.path);
+        }
+        yield { type: "entity", entity, depth: nextDepth };
+      }
+
       for (const nextUid of [relation.from, relation.to]) {
         if (nextUid !== current.uid && nextDepth <= maxDepth) {
           queue.push({ uid: nextUid, depth: nextDepth, priority });
         }
       }
+    }
+  }
+}
+
+export async function* streamNeighbors(
+  db: DSPDatabase,
+  uid: string,
+  depth = 1,
+  options: NeighborTraversalOptions = {}
+): AsyncGenerator<NeighborTraversalEvent> {
+  for (const event of traverseNeighbors(db, uid, depth, options)) {
+    yield event;
+  }
+}
+
+export function getNeighbors(
+  db: DSPDatabase,
+  uid: string,
+  depth = 1,
+  options: NeighborTraversalOptions = {}
+): { entities: Entity[]; relations: Relation[] } {
+  const entities = new Map<string, Entity>();
+  const relations: Relation[] = [];
+  for (const event of traverseNeighbors(db, uid, depth, options)) {
+    if (event.type === "entity") {
+      entities.set(event.entity.uid, event.entity);
+    } else {
+      relations.push(event.relation);
     }
   }
   return {
