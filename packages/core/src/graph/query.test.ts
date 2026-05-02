@@ -62,4 +62,62 @@ describe("graph query", () => {
     expect(new Set(relationKeys).size).toBe(relationKeys.length);
     expect(relationKeys).toHaveLength(3);
   });
+
+  it("prioritizes high-value relations when traversal budgets are tight", () => {
+    const now = stableNowIso();
+    const root = buildUid("function", "src/root.ts", "root");
+    const directCall = buildUid("function", "src/direct.ts", "direct");
+    const confidentDependency = buildUid("function", "src/dependency.ts", "dependency");
+    const weakImport = buildUid("function", "src/import.ts", "weakImport");
+
+    for (const [uid, name] of [
+      [root, "root"],
+      [directCall, "direct"],
+      [confidentDependency, "dependency"],
+      [weakImport, "weakImport"]
+    ] as const) {
+      db.upsertEntity({
+        uid,
+        kind: "function",
+        name,
+        path: uid.slice("function:".length).split("#")[0],
+        confidence: 1,
+        provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+        createdAt: now,
+        updatedAt: now
+      });
+    }
+
+    db.upsertRelation({
+      from: root,
+      to: weakImport,
+      kind: "imports",
+      weight: 0.2,
+      confidence: 0.7,
+      provenance: [{ source: "ast", timestamp: now, confidence: 0.7 }]
+    });
+    db.upsertRelation({
+      from: root,
+      to: confidentDependency,
+      kind: "depends_on",
+      weight: 0.85,
+      confidence: 0.9,
+      provenance: [{ source: "ast", timestamp: now, confidence: 0.9 }]
+    });
+    db.upsertRelation({
+      from: root,
+      to: directCall,
+      kind: "calls",
+      weight: 0.95,
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+
+    const result = getNeighbors(db, root, 1, { maxEntities: 3, maxRelations: 2 });
+    const relationTargets = result.relations.map((relation) => relation.to);
+
+    expect(result.entities.map((entity) => entity.uid)).toEqual([root, directCall, confidentDependency]);
+    expect(relationTargets).toEqual([directCall, confidentDependency]);
+    expect(relationTargets).not.toContain(weakImport);
+  });
 });

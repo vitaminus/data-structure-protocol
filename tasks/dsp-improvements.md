@@ -375,3 +375,13 @@ Status: done
 - Introduce shared CLI/MCP input schemas or validators to reduce surface drift.
 - Add branded UID/helper types in a backward-compatible, staged way.
 - Add CLI output snapshots, MCP schema snapshots, compile-time typing tests, and an embeddings stats regression test.
+
+## 47. Add budgeted priority graph traversal
+
+Status: done
+
+- Replace unbounded depth-first neighbor expansion with priority-queue traversal in `getNeighbors`.
+- Rank relations by explicit weight, confidence, and relation kind so high-signal edges survive tight budgets.
+- Add `maxEntities` and `maxRelations` budgets to CLI and MCP neighbor queries.
+- Apply budgeted, priority-ordered relation slicing to ContextPack graph expansion.
+- Add regression coverage for hub-style graphs with tight traversal budgets.

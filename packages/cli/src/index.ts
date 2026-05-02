@@ -401,9 +401,15 @@ program
   .argument("<uidOrPath>", "entity uid or path")
   .argument("[rootDir]", "root directory", ".")
   .option("--depth <number>", "graph depth", "2")
+  .option("--max-entities <number>", "maximum graph entities to return")
+  .option("--max-relations <number>", "maximum graph relations to return")
   .option("--json", "machine-readable output", false)
   .action(
-    (uidOrPath: string, rootDir: string, options: { depth: string; json: boolean }) => {
+    (
+      uidOrPath: string,
+      rootDir: string,
+      options: { depth: string; maxEntities?: string; maxRelations?: string; json: boolean }
+    ) => {
       const services = openDSP(path.resolve(rootDir), adapters());
       try {
         const entity = findEntityByUidOrPath(services.db, uidOrPath);
@@ -411,7 +417,10 @@ program
           printOutput({ found: false, uidOrPath }, options.json);
           return;
         }
-        const graph = getNeighbors(services.db, entity.uid, Number(options.depth));
+        const graph = getNeighbors(services.db, entity.uid, Number(options.depth), {
+          maxEntities: options.maxEntities ? Number(options.maxEntities) : undefined,
+          maxRelations: options.maxRelations ? Number(options.maxRelations) : undefined
+        });
         printOutput({ root: entity.uid, ...graph }, options.json);
       } finally {
         services.db.close();

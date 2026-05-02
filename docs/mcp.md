@@ -27,3 +27,16 @@ DSP v2 MCP tools:
 ```
 
 Response includes selected entities/files/dependencies plus token estimate and truncation metadata.
+
+## Neighbor request
+
+```json
+{
+  "uid": "function:src/auth.ts#login",
+  "depth": 2,
+  "maxEntities": 100,
+  "maxRelations": 250
+}
+```
+
+Neighbor traversal is budgeted and priority-ordered by relation weight, confidence, and relation kind.

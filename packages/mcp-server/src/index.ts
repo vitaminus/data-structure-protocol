@@ -155,7 +155,9 @@ export async function dispatchToolCall(
     case "dsp.get_neighbors": {
       const uid = String(args.uid ?? "");
       const depth = typeof args.depth === "number" ? args.depth : 1;
-      return { content: [jsonText(getNeighbors(services.db, uid, depth))] };
+      const maxEntities = typeof args.maxEntities === "number" ? args.maxEntities : undefined;
+      const maxRelations = typeof args.maxRelations === "number" ? args.maxRelations : undefined;
+      return { content: [jsonText(getNeighbors(services.db, uid, depth, { maxEntities, maxRelations }))] };
     }
     case "dsp.impact": {
       const target = String(args.target ?? "");
