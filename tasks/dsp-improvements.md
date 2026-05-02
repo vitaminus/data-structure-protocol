@@ -424,7 +424,7 @@ Status: done
 
 ## 51. Add semantic reranking to ContextPack
 
-Status: planned
+Status: done
 
 - Use embeddings to rerank graph expansion candidates when embeddings are enabled.
 - Combine lexical score, graph priority, and vector similarity into an explainable ContextPack ranking.

@@ -3,7 +3,8 @@ import path from "node:path";
 import type { ContextPackRequest, ContextPackResponse, EmbeddingProvider, Entity, Relation } from "./types.ts";
 import { DSPDatabase } from "../storage/db.ts";
 import { semanticSearch } from "../semantic/search.ts";
-import { streamNeighbors } from "./query.ts";
+import { relationPriority, streamNeighbors } from "./query.ts";
+import { contentHash } from "./uid.ts";
 
 type StrategyDefaults = {
   maxFiles: number;
@@ -30,6 +31,32 @@ const STRATEGY_DEFAULTS: Record<NonNullable<ContextPackRequest["strategy"]>, Str
 
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
+}
+
+function cosineSimilarity(a: number[], b: number[]): number {
+  if (a.length === 0 || b.length === 0 || a.length !== b.length) {
+    return 0;
+  }
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let index = 0; index < a.length; index += 1) {
+    dot += a[index]! * b[index]!;
+    normA += a[index]! * a[index]!;
+    normB += b[index]! * b[index]!;
+  }
+  if (normA === 0 || normB === 0) {
+    return 0;
+  }
+  return dot / Math.sqrt(normA * normB);
+}
+
+function providerCacheKey(provider: EmbeddingProvider): string {
+  return provider.cacheKey?.() ?? provider.constructor.name;
+}
+
+function entitySemanticText(entity: Entity): string {
+  return [entity.name, entity.signature ?? "", entity.description ?? "", entity.docstring ?? ""].join("\n");
 }
 
 function rootDirForDb(db: DSPDatabase): string {
@@ -199,6 +226,63 @@ function topoSortByDependencies(
   return ordered;
 }
 
+async function rerankContextEntities(
+  db: DSPDatabase,
+  task: string,
+  entities: Entity[],
+  dependencies: Relation[],
+  searchScores: Map<string, number>,
+  provider: EmbeddingProvider
+): Promise<Entity[]> {
+  const queryVector = await provider.embed(task);
+  const providerKey = providerCacheKey(provider);
+  const graphScores = new Map<string, number>();
+  for (const relation of dependencies) {
+    const score = Math.min(1, relationPriority(relation) / 200);
+    graphScores.set(relation.from, Math.max(graphScores.get(relation.from) ?? 0, score));
+    graphScores.set(relation.to, Math.max(graphScores.get(relation.to) ?? 0, score));
+  }
+
+  const ranked = await Promise.all(
+    entities.map(async (entity, index) => {
+      const semanticText = entitySemanticText(entity);
+      const hash = contentHash(semanticText);
+      const stored = db.getEmbedding(entity.uid);
+      const vector =
+        stored && stored.hash === hash && stored.provider === providerKey
+          ? stored.vector
+          : await provider.embed(semanticText);
+      if (!stored || stored.hash !== hash || stored.provider !== providerKey) {
+        db.setEmbedding(entity.uid, hash, vector, providerKey, new Date().toISOString());
+      }
+      const lexicalGraphScore = searchScores.get(entity.uid) ?? 0;
+      const graphScore = graphScores.get(entity.uid) ?? 0;
+      const semanticScore = Math.max(0, cosineSimilarity(queryVector, vector));
+      const score = lexicalGraphScore * 0.45 + graphScore * 0.2 + semanticScore * 0.35;
+      return {
+        entity: {
+          ...entity,
+          metadata: {
+            ...(entity.metadata ?? {}),
+            contextRank: {
+              score: Number(score.toFixed(4)),
+              lexicalGraph: Number(lexicalGraphScore.toFixed(4)),
+              graph: Number(graphScore.toFixed(4)),
+              semantic: Number(semanticScore.toFixed(4))
+            }
+          }
+        },
+        index,
+        score
+      };
+    })
+  );
+
+  return ranked
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .map((entry) => entry.entity);
+}
+
 export async function buildContextPack(
   input: DSPDatabase | ContextPackServices,
   request: ContextPackRequest
@@ -217,6 +301,7 @@ export async function buildContextPack(
     embeddingsEnabled,
     provider: services.embeddingProvider
   });
+  const searchScores = new Map(searchResults.map((result) => [result.uid, result.score]));
   const entitiesByUid = new Map<string, Entity>();
   const seedEntities = db.getEntitiesByUid(searchResults.map((result) => result.uid));
   for (const entity of seedEntities) {
@@ -252,27 +337,32 @@ export async function buildContextPack(
       contextEntities.push(entity);
     }
   }
+  const rankedContextEntities =
+    embeddingsEnabled && services.embeddingProvider
+      ? await rerankContextEntities(db, request.task, contextEntities, graphDependencies, searchScores, services.embeddingProvider)
+      : contextEntities;
 
-  const files = [...new Set(contextEntities.map((entity) => entity.path).filter(Boolean))].slice(
+  const files = [...new Set(rankedContextEntities.map((entity) => entity.path).filter(Boolean))].slice(
     0,
     maxFiles
   ) as string[];
-  const tests = includeTests ? contextEntities.filter((entity) => entity.kind === "test").slice(0, 20) : [];
-  const code = readCodePayload(db, files, contextEntities, includeCode);
+  const tests = includeTests ? rankedContextEntities.filter((entity) => entity.kind === "test").slice(0, 20) : [];
+  const code = readCodePayload(db, files, rankedContextEntities, includeCode);
   const riskNotes = [
     dependencies.some((rel) => rel.kind === "exports")
       ? "Public API nodes involved in context."
       : "No direct public API edges in selected context.",
     tests.length > 0 ? `${tests.length} related tests included.` : "No tests in top-ranked context.",
+    ...(embeddingsEnabled ? ["Semantic reranking applied to context entities."] : []),
     ...(dependenciesTruncated ? [`Graph dependencies truncated from ${graphDependencies.length} to ${dependencies.length}.`] : [])
   ];
 
-  const suggestedEditOrder = topoSortByDependencies(files, contextEntities, dependencies).slice(
+  const suggestedEditOrder = topoSortByDependencies(files, rankedContextEntities, dependencies).slice(
     0,
     Math.min(files.length, 10)
   );
   let context: ContextPackResponse = {
-    relevantEntities: contextEntities.slice(0, maxFiles * 4),
+    relevantEntities: rankedContextEntities.slice(0, maxFiles * 4),
     files,
     dependencies,
     tests,

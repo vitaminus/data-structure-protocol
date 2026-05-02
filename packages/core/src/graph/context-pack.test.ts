@@ -7,6 +7,24 @@ import { buildUid, stableNowIso } from "./uid.ts";
 import { buildContextPack } from "./context-pack.ts";
 import { DEFAULT_CONFIG } from "../config/types.ts";
 import { MockEmbeddingProvider } from "../semantic/providers.ts";
+import type { EmbeddingProvider } from "./types.ts";
+
+class KeywordEmbeddingProvider implements EmbeddingProvider {
+  cacheKey(): string {
+    return "keyword-test";
+  }
+
+  async embed(text: string): Promise<number[]> {
+    const normalized = text.toLowerCase();
+    if (normalized.includes("payment") || normalized.includes("billing") || normalized.includes("checkout")) {
+      return [1, 0];
+    }
+    if (normalized.includes("cache")) {
+      return [0, 1];
+    }
+    return [0.1, 0.1];
+  }
+}
 
 describe("context pack", () => {
   let tempDir: string;
@@ -177,6 +195,84 @@ describe("context pack", () => {
 
     expect(result.relevantEntities.length).toBeGreaterThan(0);
     expect(db.cacheStats().embeddings).toBeGreaterThan(0);
+  });
+
+  it("uses semantic reranking to keep relevant graph nodes under tight file budgets", async () => {
+    const now = stableNowIso();
+    const checkoutUid = buildUid("function", "src/checkout.ts", "checkout");
+    const billingUid = buildUid("function", "src/billing.ts", "settleInvoice");
+    const cacheUid = buildUid("function", "src/cache.ts", "refreshCache");
+
+    for (const entity of [
+      {
+        uid: checkoutUid,
+        kind: "function" as const,
+        name: "checkout",
+        path: "src/checkout.ts",
+        description: "checkout entry point for order submission"
+      },
+      {
+        uid: billingUid,
+        kind: "function" as const,
+        name: "settleInvoice",
+        path: "src/billing.ts",
+        description: "payment billing settlement for invoices"
+      },
+      {
+        uid: cacheUid,
+        kind: "function" as const,
+        name: "refreshCache",
+        path: "src/cache.ts",
+        description: "cache refresh utility"
+      }
+    ]) {
+      db.upsertEntity({
+        ...entity,
+        confidence: 1,
+        provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+        createdAt: now,
+        updatedAt: now
+      });
+    }
+    db.upsertRelation({
+      from: checkoutUid,
+      to: cacheUid,
+      kind: "calls",
+      weight: 0.95,
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+    db.upsertRelation({
+      from: checkoutUid,
+      to: billingUid,
+      kind: "uses",
+      weight: 0.4,
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+
+    const result = await buildContextPack(
+      {
+        db,
+        config: {
+          ...DEFAULT_CONFIG,
+          embeddings: { ...DEFAULT_CONFIG.embeddings, enabled: true, provider: "mock" }
+        },
+        embeddingProvider: new KeywordEmbeddingProvider()
+      },
+      {
+        task: "checkout payment bug",
+        maxFiles: 2,
+        maxDepth: 1
+      }
+    );
+
+    expect(result.files).toContain("src/billing.ts");
+    expect(result.files).not.toContain("src/cache.ts");
+    expect(result.riskNotes).toContain("Semantic reranking applied to context entities.");
+    expect(result.relevantEntities.find((entity) => entity.uid === billingUid)?.metadata?.contextRank).toMatchObject({
+      semantic: 1
+    });
   });
 
   it("orders suggested edits with dependencies before dependents", async () => {
