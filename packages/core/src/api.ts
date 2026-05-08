@@ -10,6 +10,7 @@ import type {
   LanguageAdapter,
   RepairResult,
   SearchResult,
+  ValidationOptions,
   ValidationResult
 } from "./graph/types.ts";
 import { DSPDatabase } from "./storage/db.ts";
@@ -113,8 +114,11 @@ export function runImpact(services: DSPServices, target: string): ImpactResult {
   return analyzeImpact(services.db, target);
 }
 
-export function runValidate(services: DSPServices): ValidationResult {
-  return validateGraph(services.db, services.rootDir);
+export function runValidate(
+  services: DSPServices,
+  options: ValidationOptions = {}
+): ValidationResult {
+  return validateGraph(services.db, services.rootDir, options);
 }
 
 export async function runRepair(

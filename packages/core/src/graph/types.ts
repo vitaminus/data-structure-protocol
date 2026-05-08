@@ -160,6 +160,11 @@ export type ValidationResult = {
   summary: ValidationSummary;
 };
 
+export type ValidationOptions = {
+  changedOnly?: boolean;
+  deep?: boolean;
+};
+
 export type RepairAction = {
   kind: ValidationIssue["kind"];
   status: "planned" | "applied" | "skipped";

@@ -735,3 +735,11 @@ Status: done
 - Add a long-lived repository watcher that keeps DSP services warm and incrementally reindexes only changed files between polling cycles.
 - Reconcile deletions inside the watch loop by clearing stale AST/file-hash state before the next incremental pass.
 - Expose the new mode in the CLI with structured cycle summaries so local automation can consume watch progress without parsing human text.
+
+### 91. Add incremental validation modes
+
+Status: done
+
+- Split validation into a fast file-state pass and optional deep graph-consistency checks so routine runs avoid the heaviest traversal work.
+- Reuse cached `mtime` and size metadata to skip rereading unchanged files, while still hashing changed files before reporting stale-index drift.
+- Expose `validate --changed-only` and `validate --deep`, and reuse the focused mode in precommit-style CLI flows.

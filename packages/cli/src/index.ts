@@ -323,7 +323,7 @@ program
         noEmbeddings: options.embeddings === false,
         dryRun: options.dryRun
       });
-      const validation = runValidate(services);
+      const validation = runValidate(services, { deep: true });
       printOutput({ summary, validation }, options.json);
     } finally {
       services.db.close();
@@ -891,11 +891,16 @@ program
 program
   .command("validate")
   .argument("[rootDir]", "root directory", ".")
+  .option("--changed-only", "only validate files and graph issues touched by changed files", false)
+  .option("--deep", "include graph-wide consistency checks", false)
   .option("--json", "machine-readable output", false)
-  .action((rootDir: string, options: { json: boolean }) => {
+  .action((rootDir: string, options: { changedOnly: boolean; deep: boolean; json: boolean }) => {
     const services = openDSP(path.resolve(rootDir), adapters());
     try {
-      const result = runValidate(services);
+      const result = runValidate(services, {
+        changedOnly: options.changedOnly,
+        deep: options.deep
+      });
       printOutput(result, options.json);
     } finally {
       services.db.close();
@@ -912,7 +917,7 @@ program
     try {
       const report = {
         db: services.db.doctor(),
-        ...(options.deep ? { validation: runValidate(services) } : {})
+        ...(options.deep ? { validation: runValidate(services, { deep: true }) } : {})
       };
       printOutput(report, options.json);
     } finally {
@@ -983,7 +988,7 @@ program
     try {
       const changed = runChanged(services);
       const impacts = changed.map((target) => runImpact(services, target));
-      const validation = runValidate(services);
+      const validation = runValidate(services, { changedOnly: true, deep: true });
       printOutput({ changed, impacts, validation }, options.json);
     } finally {
       services.db.close();
@@ -1074,7 +1079,7 @@ ci
   .action((rootDir: string, options: { json: boolean }) => {
     const services = openDSP(path.resolve(rootDir), adapters());
     try {
-      const validation = runValidate(services);
+      const validation = runValidate(services, { deep: true });
       printOutput(validation, options.json);
       process.exitCode = validation.ok ? 0 : 1;
     } finally {

@@ -42,4 +42,37 @@ describe("validation", () => {
     expect(result.issues.find((issue) => issue.kind === "stale_hash")?.severity).toBe("warning");
     expect(result.summary).toEqual({ total: 1, errors: 0, warnings: 1, info: 0 });
   });
+
+  it("skips unchanged files without rereading content when cached stat metadata matches", () => {
+    const result = validateGraph(db, tempDir, { changedOnly: true });
+    expect(result.ok).toBe(true);
+    expect(result.summary).toEqual({ total: 0, errors: 0, warnings: 0, info: 0 });
+  });
+
+  it("keeps deep graph checks behind an explicit option", () => {
+    const now = stableNowIso();
+    db.upsertEntity({
+      uid: buildUid("function", "src/auth.ts#login"),
+      kind: "function",
+      name: "login",
+      path: "src/auth.ts",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+    db.upsertRelation({
+      from: buildUid("function", "src/auth.ts#login"),
+      to: "function:missing#dep",
+      kind: "calls",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+
+    const shallow = validateGraph(db, tempDir, { deep: false });
+    const deep = validateGraph(db, tempDir, { deep: true });
+
+    expect(shallow.issues.some((issue) => issue.kind === "dangling_relation")).toBe(false);
+    expect(deep.issues.some((issue) => issue.kind === "dangling_relation")).toBe(true);
+  });
 });
