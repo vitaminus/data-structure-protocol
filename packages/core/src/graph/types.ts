@@ -229,4 +229,9 @@ export type IndexSummary = {
   unresolvedReferences: number;
   lowConfidenceRelations: number;
   estimatedCoverage: number;
+  telemetry?: {
+    parserFallbackFiles: number;
+    fallbackByLanguage: Record<string, number>;
+    parserSourceCounts: Record<string, number>;
+  };
 };

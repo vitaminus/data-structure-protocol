@@ -647,3 +647,11 @@ Status: done
 - Add parser worker timeouts, maximum input-size checks, and worker recycling after a configurable number of jobs.
 - Thread the guardrail settings through the performance config so large repos can tune them without code changes.
 - Verify that timed-out workers restart cleanly and that oversized files fail fast before they pressure the worker pool.
+
+### 80. Add parser fallback telemetry to index runs
+
+Status: done
+
+- Track how many indexed files relied on fallback-style provenance instead of pure AST extraction.
+- Break fallback counts out by language and aggregate observed parser provenance sources in the index summary metadata.
+- Cover the telemetry with a regression test so fallback visibility stays present across future indexer refactors.

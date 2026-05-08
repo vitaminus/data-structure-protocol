@@ -425,6 +425,37 @@ describe("indexer", () => {
     expect(db.getFileHash("src/a.ts")).toBe(oldHash);
   });
 
+  it("reports parser fallback telemetry in index summaries", async () => {
+    class RegexAdapter extends MockAdapter {
+      override async parseFile(filePath: string): Promise<ParseResult> {
+        const now = stableNowIso();
+        return {
+          entities: [
+            {
+              uid: buildUid("unknown", filePath, "regex-fallback"),
+              kind: "unknown",
+              name: "regex-fallback",
+              path: filePath,
+              language: "typescript",
+              confidence: 0.5,
+              provenance: [{ source: "regex", timestamp: now, confidence: 0.5 }],
+              createdAt: now,
+              updatedAt: now
+            }
+          ],
+          relations: [],
+          unresolvedReferences: []
+        };
+      }
+    }
+
+    const summary = await indexRepository(db, [new RegexAdapter()], { rootDir: tempDir, full: true }, DEFAULT_CONFIG);
+
+    expect(summary.telemetry?.parserFallbackFiles).toBe(1);
+    expect(summary.telemetry?.fallbackByLanguage.typescript).toBe(1);
+    expect(summary.telemetry?.parserSourceCounts.regex).toBe(1);
+  });
+
   it("resumes full indexing from the last completed checkpoint batch", async () => {
     for (let index = 0; index < 40; index += 1) {
       fs.writeFileSync(path.join(tempDir, "src", `file-${index}.ts`), `export const value${index} = ${index};\n`, "utf8");

@@ -287,6 +287,8 @@ type ParseOneResult =
       entities: Entity[];
       relations: Relation[];
       unresolved: UnresolvedReference[];
+      parserSources: string[];
+      usedFallback: boolean;
     };
 
 function sameCachedFileState(
@@ -430,6 +432,12 @@ async function parseOne(
         ]
       : [])
   ];
+  const parserSources = [
+    ...new Set(
+      [...extractedEntities.flatMap((entity) => entity.provenance.map((provenance) => provenance.source)),
+      ...allRelations.flatMap((relation) => relation.provenance.map((provenance) => provenance.source))]
+    )
+  ];
 
   return {
     kind: "parsed",
@@ -441,7 +449,9 @@ async function parseOne(
     nowIso,
     entities: allEntities,
     relations: allRelations,
-    unresolved
+    unresolved,
+    parserSources,
+    usedFallback: parserSources.some((source) => source !== "ast" && source !== "test" && source !== "human")
   };
 }
 
@@ -462,6 +472,9 @@ export async function indexRepository(
   let relationCount = 0;
   let unresolvedCount = 0;
   let lowConfidenceCount = 0;
+  let parserFallbackFiles = 0;
+  const fallbackByLanguage = new Map<string, number>();
+  const parserSourceCounts = new Map<string, number>();
   const resolutionCache = new Map<string, string | undefined>();
   const directoryEntityUids = new Set<string>();
   const parsePool = parseWorkerPoolFor(adapters, config.performance);
@@ -635,6 +648,13 @@ export async function indexRepository(
         relations: result.relations,
         unresolved: result.unresolved
       });
+      if (result.usedFallback) {
+        parserFallbackFiles += 1;
+        fallbackByLanguage.set(result.language, (fallbackByLanguage.get(result.language) ?? 0) + 1);
+      }
+      for (const source of result.parserSources) {
+        parserSourceCounts.set(source, (parserSourceCounts.get(source) ?? 0) + 1);
+      }
     }
 
     const writeBatchSize = Math.max(32, config.performance.parallelism * 8);
@@ -693,7 +713,12 @@ export async function indexRepository(
       relations: relationCount,
       unresolvedReferences: unresolvedCount,
       lowConfidenceRelations: lowConfidenceCount,
-      estimatedCoverage
+      estimatedCoverage,
+      telemetry: {
+        parserFallbackFiles,
+        fallbackByLanguage: Object.fromEntries([...fallbackByLanguage.entries()].sort(([a], [b]) => a.localeCompare(b))),
+        parserSourceCounts: Object.fromEntries([...parserSourceCounts.entries()].sort(([a], [b]) => a.localeCompare(b)))
+      }
     };
     db.optimize();
     if (checkpointEligible) {
