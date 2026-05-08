@@ -3,6 +3,7 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { execFileSync } from "node:child_process";
 import { DEFAULT_EXCLUDES } from "../config/types.ts";
+import { workingTreeFingerprint } from "./git.ts";
 
 const require = createRequire(import.meta.url);
 const ignore = require("ignore") as typeof import("ignore").default;
@@ -10,6 +11,14 @@ const ignore = require("ignore") as typeof import("ignore").default;
 export type DiscoverOptions = {
   excludes?: string[];
   maxFileSizeKb?: number;
+};
+
+type DiscoveryManifest = {
+  rootDir: string;
+  excludes: string[];
+  maxFileSizeKb: number;
+  fingerprint: string;
+  files: string[];
 };
 
 export function ensureDir(target: string): void {
@@ -40,6 +49,52 @@ function readGitIgnore(rootDir: string): string[] {
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line.length > 0 && !line.startsWith("#"));
+}
+
+function manifestPath(rootDir: string): string {
+  return path.join(rootDir, ".dsp", "discovery-manifest.json");
+}
+
+function fallbackFingerprint(rootDir: string, excludes: string[], maxFileSizeKb: number): string {
+  const gitIgnorePath = path.join(rootDir, ".gitignore");
+  const gitIgnoreMtime = fs.existsSync(gitIgnorePath) ? fs.statSync(gitIgnorePath).mtimeMs : 0;
+  const entryFingerprint = fs
+    .readdirSync(rootDir, { withFileTypes: true })
+    .filter((entry) => entry.name !== ".dsp")
+    .map((entry) => {
+      const stat = fs.statSync(path.join(rootDir, entry.name));
+      return `${entry.name}:${entry.isDirectory() ? "d" : "f"}:${Math.trunc(stat.mtimeMs)}:${stat.size}`;
+    })
+    .sort();
+  return JSON.stringify({
+    rootDir: path.resolve(rootDir),
+    gitIgnoreMtimeMs: Math.trunc(gitIgnoreMtime),
+    entryFingerprint,
+    excludes,
+    maxFileSizeKb
+  });
+}
+
+function discoveryFingerprint(rootDir: string, excludes: string[], maxFileSizeKb: number): string {
+  return workingTreeFingerprint(rootDir) ?? fallbackFingerprint(rootDir, excludes, maxFileSizeKb);
+}
+
+function readDiscoveryManifest(rootDir: string): DiscoveryManifest | undefined {
+  const target = manifestPath(rootDir);
+  if (!fs.existsSync(target)) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(fs.readFileSync(target, "utf8")) as DiscoveryManifest;
+  } catch {
+    return undefined;
+  }
+}
+
+function writeDiscoveryManifest(rootDir: string, manifest: DiscoveryManifest): void {
+  const target = manifestPath(rootDir);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
 }
 
 function discoverFilesFromGit(
@@ -97,8 +152,26 @@ export function discoverFiles(rootDir: string, options: DiscoverOptions = {}): s
   const gitIgnores = readGitIgnore(rootDir);
   rules.add([...excludes, ...gitIgnores]);
   const maxFileSizeKb = options.maxFileSizeKb ?? 512;
+  const fingerprint = discoveryFingerprint(rootDir, excludes, maxFileSizeKb);
+  const cachedManifest = readDiscoveryManifest(rootDir);
+  if (
+    cachedManifest &&
+    cachedManifest.rootDir === path.resolve(rootDir) &&
+    cachedManifest.maxFileSizeKb === maxFileSizeKb &&
+    cachedManifest.fingerprint === fingerprint &&
+    JSON.stringify(cachedManifest.excludes) === JSON.stringify(excludes)
+  ) {
+    return cachedManifest.files.map((filePath) => path.resolve(filePath));
+  }
   const gitFiles = discoverFilesFromGit(rootDir, rules, maxFileSizeKb);
   if (gitFiles) {
+    writeDiscoveryManifest(rootDir, {
+      rootDir: path.resolve(rootDir),
+      excludes: [...excludes],
+      maxFileSizeKb,
+      fingerprint,
+      files: gitFiles
+    });
     return gitFiles;
   }
   const files: string[] = [];
@@ -133,7 +206,15 @@ export function discoverFiles(rootDir: string, options: DiscoverOptions = {}): s
     }
   }
 
-  return files.sort();
+  const sorted = files.sort();
+  writeDiscoveryManifest(rootDir, {
+    rootDir: path.resolve(rootDir),
+    excludes: [...excludes],
+    maxFileSizeKb,
+    fingerprint,
+    files: sorted
+  });
+  return sorted;
 }
 
 export function readTextFile(filePath: string): string {

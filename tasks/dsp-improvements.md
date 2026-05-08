@@ -671,3 +671,11 @@ Status: done
 - Construct a path-resolution index from known file paths so extensionless and index-style imports resolve from memory before hitting the filesystem.
 - Feed the index into canonical import rewriting during parsing while keeping `existsSync` as a fallback for uncached edge cases.
 - Reuse the existing import canonicalization tests to guard the new fast path without changing outward behavior.
+
+### 83. Cache file discovery manifests between full scans
+
+Status: done
+
+- Persist a discovery manifest keyed by the current working-tree fingerprint so repeated full scans can reuse the previous file list.
+- Fall back to a lightweight non-git fingerprint when no repository metadata is available.
+- Cover the cache with a unit test that forbids nested directory rescans on a clean manifest cache hit.

@@ -56,3 +56,21 @@ export function changedFilesStaged(rootDir: string): string[] {
     return [];
   }
 }
+
+export function workingTreeFingerprint(rootDir: string): string | undefined {
+  try {
+    const head = execSync("git rev-parse HEAD", {
+      cwd: rootDir,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    }).trim();
+    const status = execSync("git status --porcelain=v1 --untracked-files=all -z", {
+      cwd: rootDir,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    });
+    return `${head}\0${status}`;
+  } catch {
+    return undefined;
+  }
+}
