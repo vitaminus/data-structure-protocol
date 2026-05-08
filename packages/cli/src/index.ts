@@ -21,11 +21,13 @@ import {
   runRepair,
   runSearch,
   runValidate,
+  watchRepository,
   type DSPServices,
   type Entity,
   type EntityKind,
   type LanguageAdapter,
-  type RelationKind
+  type RelationKind,
+  type WatchSummary
 } from "@dsp/core";
 import { createTypeScriptLanguageAdapter } from "@dsp/language-typescript";
 import { createPythonLanguageAdapter } from "@dsp/language-python";
@@ -357,6 +359,26 @@ program
     try {
       const result = runChanged(services);
       printOutput(result, options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
+  .command("watch")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--interval-ms <number>", "poll interval in milliseconds", "1000")
+  .option("--no-initial-index", "skip the initial full index before watching")
+  .action(async (rootDir: string, options: { intervalMs: string; initialIndex?: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      await watchRepository(services, {
+        intervalMs: Number(options.intervalMs),
+        runInitialIndex: options.initialIndex !== false,
+        onCycle: (summary: WatchSummary) => {
+          process.stdout.write(`${JSON.stringify(summary)}\n`);
+        }
+      });
     } finally {
       services.db.close();
     }

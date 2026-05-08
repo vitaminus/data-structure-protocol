@@ -18,6 +18,7 @@ describe("CLI surface", () => {
         bootstrap [options] [rootDir]
         update [options] [rootDir]
         changed [options] [rootDir]
+        watch [options] [rootDir]
         explain [options] <uidOrPath> [rootDir]
         graph [options] <uidOrPath> [rootDir]
         get-entity [options] <uidOrPath> [rootDir]

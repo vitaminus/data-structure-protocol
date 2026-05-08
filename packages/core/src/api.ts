@@ -23,7 +23,8 @@ import { validateGraph } from "./validate/validate.ts";
 import { repairGraph } from "./validate/repair.ts";
 import { insertSourceMarkers } from "./markers/markers.ts";
 import { createEmbeddingProvider, MockEmbeddingProvider } from "./semantic/providers.ts";
-import { contentHash } from "./graph/uid.ts";
+import { contentHash, normalizePath } from "./graph/uid.ts";
+import { discoverFiles } from "./util/fs.ts";
 
 export type DSPServices = {
   rootDir: string;
@@ -31,6 +32,14 @@ export type DSPServices = {
   config: DSPConfig;
   embeddingProvider?: EmbeddingProvider;
   adapters: LanguageAdapter[];
+};
+
+export type WatchSummary = {
+  initialIndexed: boolean;
+  cycles: number;
+  filesIndexed: number;
+  filesDeleted: number;
+  lastSummary?: IndexSummary;
 };
 
 export function initDSP(rootDir: string): { rootDir: string; dbPath: string; createdConfig: boolean } {
@@ -191,4 +200,131 @@ export async function runEmbeddingsUpdate(
     updated += 1;
   }
   return { updated, skipped, provider: providerKey };
+}
+
+function statFingerprint(filePath: string): string {
+  const stat = fs.statSync(filePath);
+  return `${Math.trunc(stat.mtimeMs)}:${stat.size}`;
+}
+
+function currentWatchSnapshot(services: DSPServices): Map<string, string> {
+  const files = discoverFiles(services.rootDir, {
+    excludes: services.config.performance.exclude,
+    maxFileSizeKb: services.config.performance.maxFileSizeKb
+  });
+  const snapshot = new Map<string, string>();
+  for (const absPath of files) {
+    snapshot.set(normalizePath(path.relative(services.rootDir, absPath)), statFingerprint(absPath));
+  }
+  return snapshot;
+}
+
+export async function watchRepository(
+  services: DSPServices,
+  options: {
+    intervalMs?: number;
+    runInitialIndex?: boolean;
+    onCycle?: (summary: WatchSummary) => void;
+  } = {}
+): Promise<void> {
+  const intervalMs = Math.max(100, options.intervalMs ?? 1000);
+  let snapshot = currentWatchSnapshot(services);
+  const summary: WatchSummary = {
+    initialIndexed: false,
+    cycles: 0,
+    filesIndexed: 0,
+    filesDeleted: 0
+  };
+
+  if (options.runInitialIndex ?? true) {
+    summary.lastSummary = await runIndex(services, {
+      rootDir: services.rootDir,
+      full: true
+    });
+    summary.initialIndexed = true;
+    options.onCycle?.({ ...summary });
+    snapshot = currentWatchSnapshot(services);
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    let polling = false;
+    let stopped = false;
+    let timer: NodeJS.Timeout | undefined;
+
+    const stop = () => {
+      stopped = true;
+      if (timer) {
+        clearInterval(timer);
+      }
+      process.off("SIGINT", onSignal);
+      process.off("SIGTERM", onSignal);
+      resolve();
+    };
+
+    const onSignal = () => stop();
+
+    const tick = async () => {
+      if (stopped || polling) {
+        return;
+      }
+      polling = true;
+      try {
+        const nextSnapshot = currentWatchSnapshot(services);
+        const changed = new Set<string>();
+        const deleted: string[] = [];
+
+        for (const [filePath, fingerprint] of nextSnapshot) {
+          if (snapshot.get(filePath) !== fingerprint) {
+            changed.add(filePath);
+          }
+        }
+        for (const filePath of snapshot.keys()) {
+          if (!nextSnapshot.has(filePath)) {
+            deleted.push(filePath);
+          }
+        }
+
+        if (deleted.length > 0) {
+          services.db.transaction(() => {
+            for (const filePath of deleted) {
+              services.db.clearAstDataForPath(filePath);
+              services.db.removeFileHash(filePath);
+            }
+          });
+          summary.filesDeleted += deleted.length;
+        }
+
+        if (changed.size > 0) {
+          const indexSummary = await runIndex(services, {
+            rootDir: services.rootDir,
+            files: [...changed]
+          });
+          summary.lastSummary = indexSummary;
+          summary.filesIndexed += indexSummary.filesIndexed;
+        }
+
+        if (changed.size > 0 || deleted.length > 0) {
+          summary.cycles += 1;
+          options.onCycle?.({ ...summary });
+        }
+        snapshot = nextSnapshot;
+      } catch (error) {
+        stopped = true;
+        if (timer) {
+          clearInterval(timer);
+        }
+        process.off("SIGINT", onSignal);
+        process.off("SIGTERM", onSignal);
+        reject(error);
+      } finally {
+        polling = false;
+      }
+    };
+
+    process.on("SIGINT", onSignal);
+    process.on("SIGTERM", onSignal);
+    timer = setInterval(() => {
+      void tick();
+    }, intervalMs);
+  });
 }

@@ -727,3 +727,11 @@ Status: done
 - Stop `semanticSearch` and context-pack reranking from generating and writing missing entity embeddings inline during user-facing requests.
 - Reuse only precomputed provider-matching embeddings for semantic scoring, and fall back to lexical/graph ranking when fresh vectors are not available yet.
 - Add nearest stored-embedding ranking in the DB layer so semantic candidate selection stays off the write path.
+
+### 90. Add a persistent repository watch mode
+
+Status: done
+
+- Add a long-lived repository watcher that keeps DSP services warm and incrementally reindexes only changed files between polling cycles.
+- Reconcile deletions inside the watch loop by clearing stale AST/file-hash state before the next incremental pass.
+- Expose the new mode in the CLI with structured cycle summaries so local automation can consume watch progress without parsing human text.
