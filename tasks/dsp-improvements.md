@@ -775,3 +775,11 @@ Status: done
 - Replace the full porcelain-status fingerprint with a lighter key built from HEAD, git-index metadata, and a compact dirty-path listing.
 - Keep discovery-manifest invalidation sensitive to untracked and modified paths without forcing a full `git status` walk on every clean scan.
 - Add a focused regression test around the new fingerprint shape so future changes do not quietly reintroduce the heavier status command.
+
+### 96. Add bucketed vector prefiltering for semantic search
+
+Status: done
+
+- Store a lightweight sign-bucket index alongside embeddings so semantic candidate selection can start from a much smaller provider-specific subset.
+- Reuse nearby bucket probes before falling back to the broader provider scan, keeping semantic recall intact while trimming average search work.
+- Clear and maintain the bucket table alongside embeddings so cache resets and entity deletions do not leave stale vector-index rows behind.

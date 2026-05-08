@@ -345,6 +345,20 @@ describe("DSPDatabase", () => {
     expect(db.cacheStats()).toMatchObject({ embeddings: 0, fileHashes: 0, parseCache: 0 });
   });
 
+  it("prefilters nearest embeddings through bucketed candidates", () => {
+    const now = stableNowIso();
+    db.setEmbedding("entity:alpha", "hash-a", [1, 1, 1, 1, 1, 1, 1, 1], "mock", now);
+    db.setEmbedding("entity:beta", "hash-b", [0.8, 0.8, 0.7, 0.9, 1, 0.6, 0.7, 0.9], "mock", now);
+    db.setEmbedding("entity:gamma", "hash-c", [-1, -1, -1, -1, -1, -1, -1, -1], "mock", now);
+
+    const results = db.nearestEmbeddingsByProvider("mock", [1, 1, 1, 1, 1, 1, 1, 1], {
+      topK: 2,
+      scanLimit: 4
+    });
+
+    expect(results.map((row) => row.uid)).toEqual(["entity:alpha", "entity:beta"]);
+  });
+
   it("indexes entities into SQLite FTS for lexical candidate lookup", () => {
     const now = stableNowIso();
     const uid = buildUid("function", "src/users.ts", "createUser");

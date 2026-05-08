@@ -22,6 +22,7 @@ const SQLITE_BUSY_RETRIES = 4;
 const PARSE_CACHE_MAX_ROWS = 20000;
 const PARSE_CACHE_MAX_AGE_DAYS = 30;
 const SQLITE_VACUUM_FREELIST_THRESHOLD = 2000;
+const EMBEDDING_BUCKET_BITS = 8;
 
 function toJson(value: unknown): string {
   return JSON.stringify(value ?? null);
@@ -29,6 +30,23 @@ function toJson(value: unknown): string {
 
 function fromJson<T>(value: string | null): T {
   return value ? (JSON.parse(value) as T) : (null as T);
+}
+
+function embeddingBucketKey(vector: number[]): string {
+  const bits: string[] = [];
+  for (let index = 0; index < EMBEDDING_BUCKET_BITS; index += 1) {
+    bits.push((vector[index] ?? 0) >= 0 ? "1" : "0");
+  }
+  return bits.join("");
+}
+
+function embeddingBucketNeighbors(bucketKey: string): string[] {
+  const neighbors = [bucketKey];
+  for (let index = 0; index < bucketKey.length; index += 1) {
+    const flipped = bucketKey.slice(0, index) + (bucketKey[index] === "1" ? "0" : "1") + bucketKey.slice(index + 1);
+    neighbors.push(flipped);
+  }
+  return neighbors;
 }
 
 function protocolUidForEntity(entity: Entity): string {
@@ -292,6 +310,13 @@ export class DSPDatabase {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS embedding_buckets (
+        provider TEXT NOT NULL,
+        bucket_key TEXT NOT NULL,
+        uid TEXT NOT NULL,
+        PRIMARY KEY(provider, bucket_key, uid)
+      );
+
       CREATE TABLE IF NOT EXISTS unresolved_references (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         path TEXT NOT NULL,
@@ -329,6 +354,7 @@ export class DSPDatabase {
       CREATE INDEX IF NOT EXISTS idx_relations_to_uid ON relations(to_uid);
       CREATE INDEX IF NOT EXISTS idx_relations_kind ON relations(kind);
       CREATE INDEX IF NOT EXISTS idx_unresolved_references_path ON unresolved_references(path);
+      CREATE INDEX IF NOT EXISTS idx_embedding_buckets_uid ON embedding_buckets(uid);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoints_name ON checkpoints(name);
     `);
     this.migrate();
@@ -1121,6 +1147,7 @@ export class DSPDatabase {
     const result = this.db.transaction(() => {
       this.db.prepare("DELETE FROM relations WHERE from_uid = ? OR to_uid = ?").run(uid, uid);
       this.db.prepare("DELETE FROM embeddings WHERE uid = ?").run(uid);
+      this.db.prepare("DELETE FROM embedding_buckets WHERE uid = ?").run(uid);
       this.db.prepare("DELETE FROM entity_fts WHERE uid = ?").run(uid);
       return this.db.prepare("DELETE FROM entities WHERE uid = ?").run(uid).changes;
     })();
@@ -1434,6 +1461,7 @@ export class DSPDatabase {
     for (const chunk of chunks(oldUids)) {
       const placeholders = chunk.map(() => "?").join(", ");
       this.db.prepare(`DELETE FROM embeddings WHERE uid IN (${placeholders})`).run(...chunk);
+      this.db.prepare(`DELETE FROM embedding_buckets WHERE uid IN (${placeholders})`).run(...chunk);
     }
     this.removeFileHash(oldPath);
 
@@ -1919,19 +1947,27 @@ export class DSPDatabase {
   }
 
   setEmbedding(uid: string, hash: string, vector: number[], provider: string, updatedAt: string): void {
-    this.db
-      .prepare(
+    const bucketKey = embeddingBucketKey(vector);
+    this.transaction(() => {
+      this.db
+        .prepare(
+          `
+        INSERT INTO embeddings(uid, content_hash, vector_json, provider, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(uid) DO UPDATE SET
+          content_hash = excluded.content_hash,
+          vector_json = excluded.vector_json,
+          provider = excluded.provider,
+          updated_at = excluded.updated_at
         `
-      INSERT INTO embeddings(uid, content_hash, vector_json, provider, updated_at)
-      VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(uid) DO UPDATE SET
-        content_hash = excluded.content_hash,
-        vector_json = excluded.vector_json,
-        provider = excluded.provider,
-        updated_at = excluded.updated_at
-      `
-      )
-      .run(uid, hash, toJson(vector), provider, updatedAt);
+        )
+        .run(uid, hash, toJson(vector), provider, updatedAt);
+      this.prepareCached("clear-embedding-buckets-for-uid", "DELETE FROM embedding_buckets WHERE uid = ?").run(uid);
+      this.prepareCached(
+        "insert-embedding-bucket",
+        "INSERT OR REPLACE INTO embedding_buckets(provider, bucket_key, uid) VALUES (?, ?, ?)"
+      ).run(provider, bucketKey, uid);
+    });
   }
 
   getEmbedding(uid: string): { hash: string; vector: number[]; provider: string } | undefined {
@@ -1969,6 +2005,51 @@ export class DSPDatabase {
     }));
   }
 
+  getEmbeddingsByBucket(provider: string, bucketKeys: string[], limit = 5000): StoredEmbedding[] {
+    if (bucketKeys.length === 0) {
+      return [];
+    }
+    const seen = new Set<string>();
+    const embeddings: StoredEmbedding[] = [];
+    for (const chunk of chunks([...new Set(bucketKeys)])) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      const rows = this.readDb
+        .prepare(
+          `
+          SELECT embeddings.uid, embeddings.content_hash, embeddings.vector_json, embeddings.provider
+          FROM embedding_buckets
+          JOIN embeddings ON embeddings.uid = embedding_buckets.uid
+          WHERE embedding_buckets.provider = ?
+            AND embedding_buckets.bucket_key IN (${placeholders})
+          ORDER BY embedding_buckets.bucket_key, embeddings.uid
+          LIMIT ?
+          `
+        )
+        .all(provider, ...chunk, limit) as {
+        uid: string;
+        content_hash: string;
+        vector_json: string;
+        provider: string;
+      }[];
+      for (const row of rows) {
+        if (seen.has(row.uid)) {
+          continue;
+        }
+        seen.add(row.uid);
+        embeddings.push({
+          uid: row.uid,
+          hash: row.content_hash,
+          vector: fromJson<number[]>(row.vector_json),
+          provider: row.provider
+        });
+        if (embeddings.length >= limit) {
+          return embeddings;
+        }
+      }
+    }
+    return embeddings;
+  }
+
   nearestEmbeddingsByProvider(
     provider: string,
     queryVector: number[],
@@ -1976,7 +2057,15 @@ export class DSPDatabase {
   ): RankedEmbedding[] {
     const topK = options.topK ?? 100;
     const scanLimit = options.scanLimit ?? Math.max(topK * 20, 2000);
-    return this.getEmbeddingsByProvider(provider, scanLimit)
+    const bucketCandidates = this.getEmbeddingsByBucket(
+      provider,
+      embeddingBucketNeighbors(embeddingBucketKey(queryVector)),
+      scanLimit
+    );
+    const scanSource = bucketCandidates.length >= Math.min(topK, 10)
+      ? bucketCandidates
+      : this.getEmbeddingsByProvider(provider, scanLimit);
+    return scanSource
       .map((embedding) => ({
         ...embedding,
         score: Math.max(0, cosineSimilarity(queryVector, embedding.vector))
@@ -2026,6 +2115,7 @@ export class DSPDatabase {
   clearCache(): void {
     this.db.exec(`
       DELETE FROM embeddings;
+      DELETE FROM embedding_buckets;
       DELETE FROM file_hashes;
       DELETE FROM parse_cache;
     `);
