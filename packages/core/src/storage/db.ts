@@ -17,6 +17,8 @@ const SCHEMA_VERSION = 3;
 const SQLITE_LIST_CHUNK_SIZE = 400;
 const SQLITE_CACHE_SIZE_KB = 32 * 1024;
 const SQLITE_MMAP_SIZE_BYTES = 256 * 1024 * 1024;
+const SQLITE_BUSY_TIMEOUT_MS = 5000;
+const SQLITE_BUSY_RETRIES = 4;
 
 function toJson(value: unknown): string {
   return JSON.stringify(value ?? null);
@@ -138,7 +140,9 @@ export type EntitySearchCandidates = {
 export class DSPDatabase {
   readonly dbPath: string;
   private readonly db: Database.Database;
+  private readonly readDb: Database.Database;
   private readonly statementCache = new Map<string, Database.Statement>();
+  private readonly readStatementCache = new Map<string, Database.Statement>();
 
   constructor(rootDir: string) {
     this.dbPath = path.join(rootDir, ".dsp", "dsp.sqlite");
@@ -150,7 +154,15 @@ export class DSPDatabase {
     this.db.pragma(`cache_size = -${SQLITE_CACHE_SIZE_KB}`);
     this.db.pragma(`mmap_size = ${SQLITE_MMAP_SIZE_BYTES}`);
     this.db.pragma("foreign_keys = ON");
+    this.db.pragma(`busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
     this.initialize();
+    this.readDb = new Database(this.dbPath, { readonly: true, fileMustExist: true });
+    this.readDb.pragma("query_only = ON");
+    this.readDb.pragma("foreign_keys = ON");
+    this.readDb.pragma("temp_store = MEMORY");
+    this.readDb.pragma(`cache_size = -${SQLITE_CACHE_SIZE_KB}`);
+    this.readDb.pragma(`mmap_size = ${SQLITE_MMAP_SIZE_BYTES}`);
+    this.readDb.pragma(`busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
   }
 
   initialize(): void {
@@ -292,6 +304,33 @@ export class DSPDatabase {
     return statement;
   }
 
+  private prepareReadCached(key: string, sql: string): Database.Statement {
+    const existing = this.readStatementCache.get(key);
+    if (existing) {
+      return existing;
+    }
+    const statement = this.readDb.prepare(sql);
+    this.readStatementCache.set(key, statement);
+    return statement;
+  }
+
+  private withBusyRetry<T>(fn: () => T): T {
+    let attempt = 0;
+    while (true) {
+      try {
+        return fn();
+      } catch (error) {
+        const code = (error as { code?: string } | undefined)?.code;
+        if (code !== "SQLITE_BUSY" || attempt >= SQLITE_BUSY_RETRIES) {
+          throw error;
+        }
+        attempt += 1;
+        const waitState = new Int32Array(new SharedArrayBuffer(4));
+        Atomics.wait(waitState, 0, 0, 10 * attempt);
+      }
+    }
+  }
+
   private migrate(): void {
     const current = this.schemaVersion();
     if (current < 2) {
@@ -319,6 +358,9 @@ export class DSPDatabase {
       return;
     }
     this.optimize();
+    if ((this.readDb as Database.Database & { open?: boolean }).open !== false) {
+      this.readDb.close();
+    }
     this.db.close();
   }
 
@@ -330,7 +372,7 @@ export class DSPDatabase {
   }
 
   transaction<T>(fn: () => T): T {
-    return this.db.transaction(fn)();
+    return this.withBusyRetry(() => this.db.transaction(fn)());
   }
 
   beginRun(mode: string, startedAt: string): number {
@@ -338,28 +380,33 @@ export class DSPDatabase {
       "begin-run",
       "INSERT INTO index_runs(started_at, mode, status, metadata_json) VALUES (?, ?, 'running', ?)"
     );
-    const res = stmt.run(startedAt, mode, "{}");
+    const res = this.withBusyRetry(() => stmt.run(startedAt, mode, "{}"));
     return Number(res.lastInsertRowid);
   }
 
   finishRun(runId: number, status: "ok" | "failed", endedAt: string, meta: unknown): void {
-    this.prepareCached(
+    this.withBusyRetry(() =>
+      this.prepareCached(
       "finish-run",
       "UPDATE index_runs SET status = ?, ended_at = ?, metadata_json = ? WHERE id = ?"
     )
-      .run(status, endedAt, toJson(meta), runId);
+        .run(status, endedAt, toJson(meta), runId)
+    );
   }
 
   updateRunProgress(runId: number, filesIndexed: number, filesSkipped: number, meta: unknown): void {
-    this.prepareCached(
+    this.withBusyRetry(() =>
+      this.prepareCached(
       "update-run-progress",
       "UPDATE index_runs SET files_indexed = ?, files_skipped = ?, metadata_json = ? WHERE id = ?"
     )
-      .run(filesIndexed, filesSkipped, toJson(meta), runId);
+        .run(filesIndexed, filesSkipped, toJson(meta), runId)
+    );
   }
 
   saveCheckpoint(name: string, createdAt: string, metadata: Record<string, unknown>): void {
-    this.prepareCached(
+    this.withBusyRetry(() =>
+      this.prepareCached(
       "save-checkpoint",
       `
       INSERT INTO checkpoints(name, metadata_json, created_at)
@@ -369,11 +416,12 @@ export class DSPDatabase {
         created_at = excluded.created_at
       `
     )
-      .run(name, toJson(metadata), createdAt);
+        .run(name, toJson(metadata), createdAt)
+    );
   }
 
   getCheckpoint(name: string): StoredCheckpoint | undefined {
-    const row = this.prepareCached(
+    const row = this.prepareReadCached(
       "get-checkpoint",
       "SELECT id, name, metadata_json, created_at FROM checkpoints WHERE name = ?"
     )
@@ -390,7 +438,7 @@ export class DSPDatabase {
   }
 
   clearCheckpoint(name: string): void {
-    this.prepareCached("clear-checkpoint", "DELETE FROM checkpoints WHERE name = ?").run(name);
+    this.withBusyRetry(() => this.prepareCached("clear-checkpoint", "DELETE FROM checkpoints WHERE name = ?").run(name));
   }
 
   private rowToEntity(row: Record<string, unknown>): Entity {
@@ -477,15 +525,15 @@ export class DSPDatabase {
       return [];
     }
     const filePath = fileUid.slice("file:".length);
-    const rows = this.db
-      .prepare(
-        `
-        SELECT *
-        FROM entities
-        WHERE path = ? AND kind NOT IN ('file', 'directory')
-        ORDER BY uid
-        `
-      )
+    const rows = this.prepareReadCached(
+      "synthetic-contains-from-file",
+      `
+      SELECT *
+      FROM entities
+      WHERE path = ? AND kind NOT IN ('file', 'directory')
+      ORDER BY uid
+      `
+    )
       .all(filePath) as Record<string, unknown>[];
     return rows
       .map((row) => this.syntheticContainsForEntity(this.rowToEntity(row)))
@@ -519,14 +567,14 @@ export class DSPDatabase {
   }
 
   getEntity(uid: string): Entity | undefined {
-    const row = this.prepareCached("get-entity", "SELECT * FROM entities WHERE uid = ?").get(uid) as
+    const row = this.prepareReadCached("get-entity", "SELECT * FROM entities WHERE uid = ?").get(uid) as
       | Record<string, unknown>
       | undefined;
     return row ? this.rowToEntity(row) : undefined;
   }
 
   getEntities(limit = 10000): Entity[] {
-    const rows = this.prepareCached("get-entities-limit", "SELECT * FROM entities ORDER BY uid LIMIT ?").all(limit) as Record<
+    const rows = this.prepareReadCached("get-entities-limit", "SELECT * FROM entities ORDER BY uid LIMIT ?").all(limit) as Record<
       string,
       unknown
     >[];
@@ -534,18 +582,20 @@ export class DSPDatabase {
   }
 
   *iterateEntitiesOrdered(): IterableIterator<Entity> {
-    const rows = this.prepareCached("iterate-entities", "SELECT * FROM entities ORDER BY uid").iterate() as Iterable<Record<string, unknown>>;
+    const rows = this.prepareReadCached("iterate-entities", "SELECT * FROM entities ORDER BY uid").iterate() as Iterable<
+      Record<string, unknown>
+    >;
     for (const row of rows) {
       yield this.rowToEntity(row);
     }
   }
 
   entityCount(): number {
-    return (this.prepareCached("entity-count", "SELECT COUNT(*) AS count FROM entities").get() as { count: number }).count;
+    return (this.prepareReadCached("entity-count", "SELECT COUNT(*) AS count FROM entities").get() as { count: number }).count;
   }
 
   entityCountsByKind(): Record<string, number> {
-    const rows = this.db
+    const rows = this.readDb
       .prepare(
         `
         SELECT kind, COUNT(*) AS count
@@ -559,7 +609,7 @@ export class DSPDatabase {
   }
 
   entityCountsByLanguage(): Record<string, number> {
-    const rows = this.db
+    const rows = this.readDb
       .prepare(
         `
         SELECT language, COUNT(*) AS count
@@ -574,13 +624,15 @@ export class DSPDatabase {
   }
 
   listEntityUids(): string[] {
-    const rows = this.prepareCached("list-entity-uids", "SELECT uid FROM entities ORDER BY uid").all() as { uid: string }[];
+    const rows = this.prepareReadCached("list-entity-uids", "SELECT uid FROM entities ORDER BY uid").all() as {
+      uid: string;
+    }[];
     return rows.map((row) => row.uid);
   }
 
   findEntitiesByPath(sourcePath: string): Entity[] {
     const normalized = sourcePath.replaceAll("\\", "/").replace(/^\.\//, "");
-    const rows = this.db
+    const rows = this.readDb
       .prepare(
         `
         SELECT *
@@ -601,7 +653,7 @@ export class DSPDatabase {
     const byUid = new Map<string, Entity>();
     for (const chunk of chunks([...new Set(uids)])) {
       const placeholders = chunk.map(() => "?").join(", ");
-      const rows = this.db
+      const rows = this.readDb
         .prepare(`SELECT * FROM entities WHERE uid IN (${placeholders})`)
         .all(...chunk) as Record<string, unknown>[];
       for (const row of rows) {
@@ -625,7 +677,7 @@ export class DSPDatabase {
       return { uids, candidatesScanned: uids.length };
     }
     const match = tokens.map((token) => `"${token.replaceAll('"', '""')}"`).join(" OR ");
-    const rows = this.db
+    const rows = this.readDb
       .prepare(
         `
         SELECT uid
@@ -648,10 +700,10 @@ export class DSPDatabase {
 
   relationCount(): number {
     const persistedCount = (
-      this.prepareCached("relation-count", "SELECT COUNT(*) AS count FROM relations").get() as { count: number }
+      this.prepareReadCached("relation-count", "SELECT COUNT(*) AS count FROM relations").get() as { count: number }
     ).count;
     const syntheticCount = (
-      this.db.prepare(
+      this.readDb.prepare(
         `
         SELECT COUNT(*) AS count
         FROM entities
@@ -660,7 +712,7 @@ export class DSPDatabase {
       ).get() as { count: number }
     ).count;
     const duplicateCount = (
-      this.db.prepare(
+      this.readDb.prepare(
         `
         SELECT COUNT(*) AS count
         FROM relations
@@ -677,14 +729,14 @@ export class DSPDatabase {
 
   *iterateRelationsOrdered(): IterableIterator<Relation> {
     const persisted = [
-      ...(this.prepareCached(
-      "iterate-relations",
-      "SELECT * FROM relations ORDER BY from_uid, to_uid, kind"
-    )
+      ...(this.prepareReadCached(
+        "iterate-relations",
+        "SELECT * FROM relations ORDER BY from_uid, to_uid, kind"
+      )
         .iterate() as Iterable<Record<string, unknown>>)
     ].map((row) => this.rowToRelation(row));
     const synthetic = [
-      ...(this.db.prepare(
+      ...(this.readDb.prepare(
         `
         SELECT *
         FROM entities
@@ -701,7 +753,7 @@ export class DSPDatabase {
   }
 
   getFileEntities(limit = 300000): Entity[] {
-    const rows = this.prepareCached(
+    const rows = this.prepareReadCached(
       "get-file-entities-limit",
       "SELECT * FROM entities WHERE kind = 'file' ORDER BY uid LIMIT ?"
     )
@@ -710,7 +762,7 @@ export class DSPDatabase {
   }
 
   *iterateFileEntitiesOrdered(): IterableIterator<Entity> {
-    const rows = this.prepareCached(
+    const rows = this.prepareReadCached(
       "iterate-file-entities",
       "SELECT * FROM entities WHERE kind = 'file' ORDER BY uid"
     )
@@ -721,7 +773,7 @@ export class DSPDatabase {
   }
 
   getDanglingRelations(limit = 600000): Relation[] {
-    const rows = this.db
+    const rows = this.readDb
       .prepare(
         `
         SELECT relations.*
@@ -738,7 +790,7 @@ export class DSPDatabase {
   }
 
   getLowConfidenceCriticalRelations(limit = 600000): Relation[] {
-    const rows = this.db
+    const rows = this.readDb
       .prepare(
         `
         SELECT *
@@ -753,7 +805,7 @@ export class DSPDatabase {
   }
 
   getRelationsFrom(uid: string): Relation[] {
-    const rows = this.prepareCached(
+    const rows = this.prepareReadCached(
       "get-relations-from",
       "SELECT * FROM relations WHERE from_uid = ? ORDER BY to_uid"
     )
@@ -765,7 +817,7 @@ export class DSPDatabase {
   }
 
   getRelationsTo(uid: string): Relation[] {
-    const rows = this.prepareCached(
+    const rows = this.prepareReadCached(
       "get-relations-to",
       "SELECT * FROM relations WHERE to_uid = ? ORDER BY from_uid"
     )
@@ -795,7 +847,7 @@ export class DSPDatabase {
         ${remainingLimit === null ? "" : "LIMIT ?"}
         `;
       const params = remainingLimit === null ? [...chunk, ...chunk] : [...chunk, ...chunk, remainingLimit];
-      rows.push(...(this.db.prepare(sql).all(...params) as Record<string, unknown>[]));
+      rows.push(...(this.readDb.prepare(sql).all(...params) as Record<string, unknown>[]));
     }
     const synthetic = [...new Set(uids)].flatMap((uid) => [
       ...this.syntheticContainsFromFileUid(uid),
@@ -997,7 +1049,7 @@ export class DSPDatabase {
   }
 
   getFileHash(filePath: string): string | undefined {
-    const row = this.prepareCached(
+    const row = this.prepareReadCached(
       "get-file-hash",
       "SELECT content_hash FROM file_hashes WHERE path = ?"
     )
@@ -1006,7 +1058,7 @@ export class DSPDatabase {
   }
 
   getFileHashEntry(filePath: string): FileHashEntry | undefined {
-    const row = this.prepareCached(
+    const row = this.prepareReadCached(
       "get-file-hash-entry",
       "SELECT content_hash, indexed_at, mtime_ms, size_bytes FROM file_hashes WHERE path = ?"
     )
@@ -1028,7 +1080,7 @@ export class DSPDatabase {
     const hashes = new Map<string, FileHashEntry>();
     for (const chunk of chunks([...new Set(filePaths)])) {
       const placeholders = chunk.map(() => "?").join(", ");
-      const rows = this.db
+      const rows = this.readDb
         .prepare(`SELECT path, content_hash, indexed_at, mtime_ms, size_bytes FROM file_hashes WHERE path IN (${placeholders})`)
         .all(...chunk) as {
         path: string;
@@ -1061,7 +1113,7 @@ export class DSPDatabase {
     if (oldPath === newPath) {
       return false;
     }
-    const entityRows = this.db
+    const entityRows = this.readDb
       .prepare("SELECT * FROM entities WHERE path = ? AND source_priority < 100")
       .all(oldPath) as Record<string, unknown>[];
     if (entityRows.length === 0) {
@@ -1072,7 +1124,7 @@ export class DSPDatabase {
     const uidMap = new Map(oldEntities.map((entity) => [entity.uid, rewritePathBasedUid(entity.uid, oldPath, newPath)]));
     const oldUids = [...uidMap.keys()];
     const relations = this.getRelationsTouching(oldUids, null);
-    const unresolvedRows = this.db
+    const unresolvedRows = this.readDb
       .prepare("SELECT from_uid, symbol, kind, reason, confidence FROM unresolved_references WHERE path = ? AND resolved = 0")
       .all(oldPath) as {
       from_uid: string | null;
@@ -1083,7 +1135,7 @@ export class DSPDatabase {
     }[];
     const embeddingRows = chunks(oldUids).flatMap((chunk) => {
       const placeholders = chunk.map(() => "?").join(", ");
-      return this.db
+      return this.readDb
         .prepare(`SELECT uid, content_hash, vector_json, provider, updated_at FROM embeddings WHERE uid IN (${placeholders})`)
         .all(...chunk) as {
         uid: string;
@@ -1188,7 +1240,7 @@ export class DSPDatabase {
   }
 
   getUnresolvedReferences(): UnresolvedReference[] {
-    const rows = this.db
+    const rows = this.readDb
       .prepare(
         `
         SELECT path, from_uid, symbol, kind, reason, confidence
@@ -1202,7 +1254,7 @@ export class DSPDatabase {
   }
 
   *iterateUnresolvedReferencesOrdered(): IterableIterator<UnresolvedReference> {
-    const rows = this.db
+    const rows = this.readDb
       .prepare(
         `
         SELECT path, from_uid, symbol, kind, reason, confidence
@@ -1219,7 +1271,7 @@ export class DSPDatabase {
 
   unresolvedReferenceCount(): number {
     return (
-      this.db.prepare("SELECT COUNT(*) AS count FROM unresolved_references WHERE resolved = 0").get() as {
+      this.readDb.prepare("SELECT COUNT(*) AS count FROM unresolved_references WHERE resolved = 0").get() as {
         count: number;
       }
     ).count;

@@ -623,3 +623,11 @@ Status: done
 - Persist resumable full-index checkpoints keyed by the discovered manifest so interrupted runs can continue from the last committed batch.
 - Track checkpoint progress only after successful batch writes so a resumed run never overcounts or skips unwritten files.
 - Clear stale checkpoints automatically when the file manifest changes or the full run completes successfully.
+
+### 77. Separate SQLite read/write paths and harden busy handling
+
+Status: done
+
+- Open a dedicated readonly SQLite handle for graph reads while keeping writes on the primary WAL connection.
+- Route hot query paths through the readonly statement cache so long-running reads stop contending with index writes as much as possible.
+- Add `busy_timeout` and a bounded retry policy around index-run and checkpoint mutations so transient writer contention fails less often.
