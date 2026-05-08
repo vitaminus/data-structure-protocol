@@ -532,6 +532,7 @@ export async function indexRepository(
   const parserSourceCounts = new Map<string, number>();
   const resolutionCache = new Map<string, string | undefined>();
   const directoryEntityUids = new Set<string>();
+  const renameReconciledPaths = new Set<string>();
   let parsePool: ParseWorkerPool | undefined;
 
   try {
@@ -562,6 +563,9 @@ export async function indexRepository(
                 : contentHash(readFileSync(entry.path, "utf8"));
             if (oldHashEntry?.hash && oldHashEntry.hash === newHash) {
               renameReconciled = db.renameAstDataPath(oldRelPath, newRelPath, stableNowIso());
+              if (renameReconciled) {
+                renameReconciledPaths.add(normalizePath(entry.path));
+              }
             }
           }
           const stalePaths = [
@@ -587,10 +591,14 @@ export async function indexRepository(
         })
       : (requestedFiles ?? changedFromGit ?? []).filter((absPath) => existsSync(absPath));
 
+    if (renameReconciledPaths.size > 0) {
+      selectedFiles = selectedFiles.filter((absPath) => !renameReconciledPaths.has(normalizePath(absPath)));
+    }
+
     if (changedFromGit && changedFromGit.length > 0) {
-      const changedUids = changedFromGit.map((absPath) =>
-        buildUid("file", normalizePath(path.relative(scanRoot, absPath)))
-      );
+      const changedUids = changedFromGit
+        .filter((absPath) => !renameReconciledPaths.has(normalizePath(absPath)))
+        .map((absPath) => buildUid("file", normalizePath(path.relative(scanRoot, absPath))));
       const neighborRelPaths = new Set<string>();
       for (const uid of changedUids) {
         for (const incoming of db.getRelationsTo(uid)) {

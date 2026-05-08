@@ -703,3 +703,11 @@ Status: done
 - Add an adaptive parallelism mode that caps concurrency by both CPU availability and the current run size.
 - Reuse the effective parallelism value for parse workers, async parse fanout, and write-batch sizing so the whole index path stays coordinated.
 - Cover the helper with a regression test that proves tiny runs do not oversubscribe workers.
+
+### 87. Add a dedicated fast path for rename-heavy git updates
+
+Status: done
+
+- Track content-stable rename reconciliations and exclude them from later parse selection during the same git-diff run.
+- Skip neighbor-expansion work for already reconciled pure renames so large move/refactor operations stop paying the normal changed-file tax.
+- Update the rename regression test to assert that pure renames now complete without burning skip slots on files we never need to parse.

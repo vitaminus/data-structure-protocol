@@ -346,7 +346,7 @@ describe("indexer", () => {
     );
 
     expect(summary.filesIndexed).toBe(0);
-    expect(summary.filesSkipped).toBe(1);
+    expect(summary.filesSkipped).toBe(0);
     expect(db.getEntity(buildUid("file", "src/a.ts"))).toBeUndefined();
     expect(db.getFileHash("src/a.ts")).toBeUndefined();
     expect(db.getEntity(buildUid("file", "src/renamed.ts"))).toBeDefined();
