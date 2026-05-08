@@ -2,7 +2,12 @@ export type DSPPerformanceConfig = {
   mode: "default" | "large-repo";
   lazyIndexing: boolean;
   parallelism: number;
+  adaptiveParallelism: boolean;
   maxFileSizeKb: number;
+  workerTimeoutMs: number;
+  workerMaxInputKb: number;
+  workerMaxJobsPerWorker: number;
+  indexMemoryBudgetMb: number;
   exclude: string[];
 };
 
@@ -33,7 +38,12 @@ export const DEFAULT_CONFIG: DSPConfig = {
     mode: "default",
     lazyIndexing: false,
     parallelism: 8,
+    adaptiveParallelism: true,
     maxFileSizeKb: 512,
+    workerTimeoutMs: 15000,
+    workerMaxInputKb: 2048,
+    workerMaxJobsPerWorker: 200,
+    indexMemoryBudgetMb: 128,
     exclude: DEFAULT_EXCLUDES
   },
   embeddings: {

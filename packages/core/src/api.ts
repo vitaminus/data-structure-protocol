@@ -1,5 +1,6 @@
 import path from "node:path";
 import fs from "node:fs";
+import { availableParallelism } from "node:os";
 import type {
   ContextPackRequest,
   ContextPackResponse,
@@ -10,6 +11,7 @@ import type {
   LanguageAdapter,
   RepairResult,
   SearchResult,
+  ValidationOptions,
   ValidationResult
 } from "./graph/types.ts";
 import { DSPDatabase } from "./storage/db.ts";
@@ -23,7 +25,8 @@ import { validateGraph } from "./validate/validate.ts";
 import { repairGraph } from "./validate/repair.ts";
 import { insertSourceMarkers } from "./markers/markers.ts";
 import { createEmbeddingProvider, MockEmbeddingProvider } from "./semantic/providers.ts";
-import { contentHash } from "./graph/uid.ts";
+import { contentHash, normalizePath } from "./graph/uid.ts";
+import { discoverFiles } from "./util/fs.ts";
 
 export type DSPServices = {
   rootDir: string;
@@ -31,6 +34,14 @@ export type DSPServices = {
   config: DSPConfig;
   embeddingProvider?: EmbeddingProvider;
   adapters: LanguageAdapter[];
+};
+
+export type WatchSummary = {
+  initialIndexed: boolean;
+  cycles: number;
+  filesIndexed: number;
+  filesDeleted: number;
+  lastSummary?: IndexSummary;
 };
 
 export function initDSP(rootDir: string): { rootDir: string; dbPath: string; createdConfig: boolean } {
@@ -104,8 +115,11 @@ export function runImpact(services: DSPServices, target: string): ImpactResult {
   return analyzeImpact(services.db, target);
 }
 
-export function runValidate(services: DSPServices): ValidationResult {
-  return validateGraph(services.db, services.rootDir);
+export function runValidate(
+  services: DSPServices,
+  options: ValidationOptions = {}
+): ValidationResult {
+  return validateGraph(services.db, services.rootDir, options);
 }
 
 export async function runRepair(
@@ -166,15 +180,18 @@ export function runImport(
 
 export async function runEmbeddingsUpdate(
   services: DSPServices,
-  options: { changedOnly?: boolean } = {}
+  options: { changedOnly?: boolean; concurrency?: number; maxRetries?: number } = {}
 ): Promise<{ updated: number; skipped: number; provider: string }> {
   const provider = services.embeddingProvider ?? new MockEmbeddingProvider();
   const providerKey = provider.cacheKey?.() ?? provider.constructor.name;
-  const entities = services.db.getEntities(200000);
   let updated = 0;
   let skipped = 0;
   const now = new Date().toISOString();
-  for (const entity of entities) {
+  const concurrency = Math.max(1, options.concurrency ?? Math.min(availableParallelism(), 8));
+  const maxRetries = Math.max(0, options.maxRetries ?? 2);
+  const workItems: { uid: string; semanticText: string; hash: string }[] = [];
+
+  for (const entity of services.db.iterateEntitiesOrdered()) {
     const semanticText = [
       entity.name,
       entity.signature ?? "",
@@ -187,9 +204,179 @@ export async function runEmbeddingsUpdate(
       skipped += 1;
       continue;
     }
-    const vector = await provider.embed(semanticText);
-    services.db.setEmbedding(entity.uid, hash, vector, providerKey, now);
-    updated += 1;
+    workItems.push({ uid: entity.uid, semanticText, hash });
   }
+
+  await mapWithConcurrency(workItems, concurrency, async (item) => {
+    const vector = await embedWithRetry(provider, item.semanticText, maxRetries);
+    services.db.setEmbedding(item.uid, item.hash, vector, providerKey, now);
+    updated += 1;
+  });
+
+  services.db.maintainCaches();
   return { updated, skipped, provider: providerKey };
+}
+
+async function mapWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<void>
+): Promise<void> {
+  const workerCount = Math.max(1, Math.min(items.length, Math.floor(concurrency) || 1));
+  let nextIndex = 0;
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        await mapper(items[currentIndex]!, currentIndex);
+      }
+    })
+  );
+}
+
+async function embedWithRetry(
+  provider: EmbeddingProvider,
+  text: string,
+  maxRetries: number
+): Promise<number[]> {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await provider.embed(text);
+    } catch (error) {
+      if (attempt >= maxRetries) {
+        throw error;
+      }
+      attempt += 1;
+      await new Promise((resolve) => setTimeout(resolve, 50 * attempt));
+    }
+  }
+}
+
+function statFingerprint(filePath: string): string {
+  const stat = fs.statSync(filePath);
+  return `${Math.trunc(stat.mtimeMs)}:${stat.size}`;
+}
+
+function currentWatchSnapshot(services: DSPServices): Map<string, string> {
+  const files = discoverFiles(services.rootDir, {
+    excludes: services.config.performance.exclude,
+    maxFileSizeKb: services.config.performance.maxFileSizeKb
+  });
+  const snapshot = new Map<string, string>();
+  for (const absPath of files) {
+    snapshot.set(normalizePath(path.relative(services.rootDir, absPath)), statFingerprint(absPath));
+  }
+  return snapshot;
+}
+
+export async function watchRepository(
+  services: DSPServices,
+  options: {
+    intervalMs?: number;
+    runInitialIndex?: boolean;
+    onCycle?: (summary: WatchSummary) => void;
+  } = {}
+): Promise<void> {
+  const intervalMs = Math.max(100, options.intervalMs ?? 1000);
+  let snapshot = currentWatchSnapshot(services);
+  const summary: WatchSummary = {
+    initialIndexed: false,
+    cycles: 0,
+    filesIndexed: 0,
+    filesDeleted: 0
+  };
+
+  if (options.runInitialIndex ?? true) {
+    summary.lastSummary = await runIndex(services, {
+      rootDir: services.rootDir,
+      full: true
+    });
+    summary.initialIndexed = true;
+    options.onCycle?.({ ...summary });
+    snapshot = currentWatchSnapshot(services);
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    let polling = false;
+    let stopped = false;
+    let timer: NodeJS.Timeout | undefined;
+
+    const stop = () => {
+      stopped = true;
+      if (timer) {
+        clearInterval(timer);
+      }
+      process.off("SIGINT", onSignal);
+      process.off("SIGTERM", onSignal);
+      resolve();
+    };
+
+    const onSignal = () => stop();
+
+    const tick = async () => {
+      if (stopped || polling) {
+        return;
+      }
+      polling = true;
+      try {
+        const nextSnapshot = currentWatchSnapshot(services);
+        const changed = new Set<string>();
+        const deleted: string[] = [];
+
+        for (const [filePath, fingerprint] of nextSnapshot) {
+          if (snapshot.get(filePath) !== fingerprint) {
+            changed.add(filePath);
+          }
+        }
+        for (const filePath of snapshot.keys()) {
+          if (!nextSnapshot.has(filePath)) {
+            deleted.push(filePath);
+          }
+        }
+
+        if (deleted.length > 0) {
+          services.db.transaction(() => {
+            for (const filePath of deleted) {
+              services.db.clearAstDataForPath(filePath);
+              services.db.removeFileHash(filePath);
+            }
+          });
+          summary.filesDeleted += deleted.length;
+        }
+
+        if (changed.size > 0) {
+          const indexSummary = await runIndex(services, {
+            rootDir: services.rootDir,
+            files: [...changed]
+          });
+          summary.lastSummary = indexSummary;
+          summary.filesIndexed += indexSummary.filesIndexed;
+        }
+
+        if (changed.size > 0 || deleted.length > 0) {
+          summary.cycles += 1;
+          options.onCycle?.({ ...summary });
+        }
+        snapshot = nextSnapshot;
+      } catch (error) {
+        stopped = true;
+        if (timer) {
+          clearInterval(timer);
+        }
+        process.off("SIGINT", onSignal);
+        process.off("SIGTERM", onSignal);
+        reject(error);
+      } finally {
+        polling = false;
+      }
+    };
+
+    process.on("SIGINT", onSignal);
+    process.on("SIGTERM", onSignal);
+    timer = setInterval(() => {
+      void tick();
+    }, intervalMs);
+  });
 }

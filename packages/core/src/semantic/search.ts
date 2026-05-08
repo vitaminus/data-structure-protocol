@@ -1,24 +1,18 @@
-import type { DSPDatabase } from "../storage/db.ts";
+import type { DSPDatabase, RankedEmbedding } from "../storage/db.ts";
 import type { EmbeddingProvider, SearchResult } from "../graph/types.ts";
-import { contentHash } from "../graph/uid.ts";
 
-function cosineSimilarity(a: number[], b: number[]): number {
-  if (a.length === 0 || b.length === 0 || a.length !== b.length) {
-    return 0;
-  }
-  let dot = 0;
-  let normA = 0;
-  let normB = 0;
-  for (let i = 0; i < a.length; i += 1) {
-    dot += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
-  if (normA === 0 || normB === 0) {
-    return 0;
-  }
-  return dot / Math.sqrt(normA * normB);
-}
+const HIGH_SIGNAL_RELATION_KINDS = new Set([
+  "imports",
+  "exports",
+  "calls",
+  "extends",
+  "implements",
+  "uses",
+  "tests",
+  "routes_to",
+  "depends_on",
+  "similar_to"
+]);
 
 function tokenize(text: string): string[] {
   return text
@@ -35,6 +29,21 @@ function normalizedText(text: string): string {
 
 function providerCacheKey(provider: EmbeddingProvider): string {
   return provider.cacheKey?.() ?? provider.constructor.name;
+}
+
+function highSignalRelations(db: DSPDatabase, uid: string, direction: "from" | "to") {
+  const relations = direction === "from" ? db.getRelationsFrom(uid) : db.getRelationsTo(uid);
+  return relations.filter((relation) => {
+    if (!HIGH_SIGNAL_RELATION_KINDS.has(relation.kind)) {
+      return false;
+    }
+    if (relation.metadata?.synthetic) {
+      return false;
+    }
+    const otherUid = direction === "from" ? relation.to : relation.from;
+    const other = db.getEntity(otherUid);
+    return other?.kind !== "file" && other?.kind !== "directory";
+  });
 }
 
 export async function semanticSearch(
@@ -61,28 +70,33 @@ export async function semanticSearch(
   const lexicalCandidateUids = db.searchEntityUids(query, candidateLimit);
   const expandedCandidateUids = new Set(lexicalCandidateUids);
   for (const uid of lexicalCandidateUids) {
-    for (const relation of db.getRelationsFrom(uid).slice(0, 10)) {
+    for (const relation of highSignalRelations(db, uid, "from").slice(0, 10)) {
       expandedCandidateUids.add(relation.to);
     }
-    for (const relation of db.getRelationsTo(uid).slice(0, 10)) {
+    for (const relation of highSignalRelations(db, uid, "to").slice(0, 10)) {
       expandedCandidateUids.add(relation.from);
     }
   }
 
+  let rankedEmbeddings: RankedEmbedding[] = [];
   if (queryVector && providerKey) {
-    const storedEmbeddings = db.getEmbeddingsByProvider(providerKey);
-    for (const embedding of storedEmbeddings) {
+    rankedEmbeddings = db.nearestEmbeddingsByProvider(providerKey, queryVector, {
+      topK: candidateLimit,
+      scanLimit: Math.max(candidateLimit * 20, 5000)
+    });
+    for (const embedding of rankedEmbeddings) {
       expandedCandidateUids.add(embedding.uid);
     }
 
-    if (storedEmbeddings.length < db.entityCount()) {
-      for (const entity of db.getEntities(200000)) {
-        expandedCandidateUids.add(entity.uid);
+    if (lexicalCandidateUids.length === 0) {
+      for (const embedding of rankedEmbeddings) {
+        expandedCandidateUids.add(embedding.uid);
       }
     }
   }
 
   const entities = db.getEntitiesByUid([...expandedCandidateUids]);
+  const semanticScoresByUid = new Map(rankedEmbeddings.map((embedding) => [embedding.uid, embedding.score]));
 
   const scored: SearchResult[] = [];
   for (const entity of entities) {
@@ -112,8 +126,8 @@ export async function semanticSearch(
     lexicalScore = Math.min(1, lexicalScore);
 
     const neighborIds = [
-      ...db.getRelationsFrom(entity.uid).slice(0, 5).map((relation) => relation.to),
-      ...db.getRelationsTo(entity.uid).slice(0, 5).map((relation) => relation.from)
+      ...highSignalRelations(db, entity.uid, "from").slice(0, 5).map((relation) => relation.to),
+      ...highSignalRelations(db, entity.uid, "to").slice(0, 5).map((relation) => relation.from)
     ];
     let neighborScore = 0;
     if (tokens.length > 0 && neighborIds.length > 0) {
@@ -134,22 +148,7 @@ export async function semanticSearch(
 
     let embeddingScore = 0;
     if (queryVector && options.provider && providerKey) {
-      const semanticText = [
-        entity.name,
-        entity.signature ?? "",
-        entity.description ?? "",
-        entity.docstring ?? ""
-      ].join("\n");
-      const hash = contentHash(semanticText);
-      const stored = db.getEmbedding(entity.uid);
-      let vector: number[] | undefined;
-      if (stored && stored.hash === hash && stored.provider === providerKey) {
-        vector = stored.vector;
-      } else {
-        vector = await options.provider.embed(semanticText);
-        db.setEmbedding(entity.uid, hash, vector, providerKey, new Date().toISOString());
-      }
-      embeddingScore = Math.max(0, cosineSimilarity(queryVector, vector));
+      embeddingScore = semanticScoresByUid.get(entity.uid) ?? 0;
     }
 
     const lexicalAndGraphScore = Math.min(1, lexicalScore * 0.85 + neighborScore * 0.15);

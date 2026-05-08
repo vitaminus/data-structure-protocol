@@ -75,49 +75,86 @@ function lineRangeForEntities(entities: Entity[]): { startLine?: number; endLine
   };
 }
 
+function readUtf8Prefix(
+  filePath: string,
+  maxChars: number
+): { content: string; truncated: boolean } {
+  const maxBytes = Math.max(256, maxChars * 4);
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(maxBytes);
+    const bytesRead = fs.readSync(fd, buffer, 0, maxBytes, 0);
+    const content = buffer.subarray(0, bytesRead).toString("utf8").slice(0, maxChars);
+    const stat = fs.fstatSync(fd);
+    return {
+      content,
+      truncated: stat.size > bytesRead || content.length >= maxChars
+    };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function readCodePayload(
   db: DSPDatabase,
   files: string[],
   entities: Entity[],
-  mode: NonNullable<ContextPackRequest["includeCode"]>
+  mode: NonNullable<ContextPackRequest["includeCode"]>,
+  options: { maxCharsPerFile: number; maxTotalChars: number }
 ): NonNullable<ContextPackResponse["code"]> | undefined {
   if (mode === "none") {
     return undefined;
   }
   const rootDir = rootDirForDb(db);
+  let remainingChars = options.maxTotalChars;
   return files.flatMap<CodePayload>((filePath) => {
+    if (remainingChars <= 0) {
+      return [];
+    }
     const absPath = path.resolve(rootDir, filePath);
+    const fileCharBudget = Math.max(160, Math.min(options.maxCharsPerFile, remainingChars));
+    if (mode === "full-files") {
+      try {
+        const prefix = readUtf8Prefix(absPath, fileCharBudget);
+        remainingChars -= prefix.content.length;
+        return [
+          {
+            path: filePath,
+            mode,
+            content: prefix.content,
+            truncated: prefix.truncated
+          }
+        ];
+      } catch {
+        return [];
+      }
+    }
+
     let raw: string;
     try {
       raw = fs.readFileSync(absPath, "utf8");
     } catch {
       return [];
     }
-    if (mode === "full-files") {
-      const maxChars = 24_000;
-      return [
-        {
-          path: filePath,
-          mode,
-          content: raw.slice(0, maxChars),
-          truncated: raw.length > maxChars
-        }
-      ];
+    if (fileCharBudget <= 0) {
+      return [];
     }
-
     const fileEntities = entities.filter((entity) => entity.path === filePath);
     const range = lineRangeForEntities(fileEntities);
     const lines = raw.split(/\r?\n/);
     const startLine = range.startLine ?? 1;
     const endLine = range.endLine ?? Math.min(lines.length, 80);
+    const snippetSource = lines.slice(startLine - 1, endLine).join("\n");
+    const snippet = snippetSource.slice(0, fileCharBudget);
+    remainingChars -= snippet.length;
     return [
       {
         path: filePath,
         mode,
-        content: lines.slice(startLine - 1, endLine).join("\n"),
+        content: snippet,
         startLine,
         endLine,
-        truncated: startLine > 1 || endLine < lines.length
+        truncated: startLine > 1 || endLine < lines.length || snippetSource.length > snippet.length
       }
     ];
   });
@@ -358,13 +395,10 @@ async function rerankContextEntities(
       const vector =
         stored && stored.hash === hash && stored.provider === providerKey
           ? stored.vector
-          : await provider.embed(semanticText);
-      if (!stored || stored.hash !== hash || stored.provider !== providerKey) {
-        db.setEmbedding(entity.uid, hash, vector, providerKey, new Date().toISOString());
-      }
+          : undefined;
       const lexicalGraphScore = searchScores.get(entity.uid) ?? 0;
       const graphScore = graphScores.get(entity.uid) ?? 0;
-      const semanticScore = Math.max(0, cosineSimilarity(queryVector, vector));
+      const semanticScore = vector ? Math.max(0, cosineSimilarity(queryVector, vector)) : 0;
       const score = lexicalGraphScore * 0.45 + graphScore * 0.2 + semanticScore * 0.35;
       return {
         entity: {
@@ -420,9 +454,17 @@ export async function buildContextPack(
     .filter((entity) => includeTests || entity.kind !== "test");
   const selectedEntities = rankedEntities.slice(0, maxFiles * 3);
   const selectedUids = new Set(selectedEntities.map((entity) => entity.uid));
+  const maxTraversalEntities = Math.min(
+    Math.max(maxFiles * 8, selectedUids.size),
+    Math.max(48, Math.floor(maxTokens / 40))
+  );
+  const maxTraversalRelations = Math.min(
+    Math.max(maxFiles * 40, 300),
+    Math.max(120, Math.floor(maxTokens / 12))
+  );
   const graphSlice = await relationDepthFilter(db, selectedUids, maxDepth, {
-    maxEntities: Math.max(maxFiles * 8, selectedUids.size),
-    maxRelations: Math.max(maxFiles * 40, 300)
+    maxEntities: maxTraversalEntities,
+    maxRelations: maxTraversalRelations
   });
   const contextEntities = [...selectedEntities];
   const contextEntityUids = new Set(contextEntities.map((entity) => entity.uid));
@@ -457,7 +499,13 @@ export async function buildContextPack(
     maxFiles
   ) as string[];
   const tests = includeTests ? rankedContextEntities.filter((entity) => entity.kind === "test").slice(0, 20) : [];
-  const code = readCodePayload(db, files, rankedContextEntities, includeCode);
+  const maxCodeTokens = includeCode === "full-files" ? Math.max(400, Math.floor(maxTokens * 0.45)) : Math.max(240, Math.floor(maxTokens * 0.25));
+  const maxCodeChars = Math.max(320, maxCodeTokens * 4);
+  const maxCharsPerFile = Math.max(160, Math.floor(maxCodeChars / Math.max(1, files.length)));
+  const code = readCodePayload(db, files, rankedContextEntities, includeCode, {
+    maxCharsPerFile,
+    maxTotalChars: maxCodeChars
+  });
   const riskNotes = [
     dependencies.some((rel) => rel.kind === "exports")
       ? "Public API nodes involved in context."

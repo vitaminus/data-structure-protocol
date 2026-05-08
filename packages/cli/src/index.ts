@@ -21,11 +21,13 @@ import {
   runRepair,
   runSearch,
   runValidate,
+  watchRepository,
   type DSPServices,
   type Entity,
   type EntityKind,
   type LanguageAdapter,
-  type RelationKind
+  type RelationKind,
+  type WatchSummary
 } from "@dsp/core";
 import { createTypeScriptLanguageAdapter } from "@dsp/language-typescript";
 import { createPythonLanguageAdapter } from "@dsp/language-python";
@@ -107,33 +109,18 @@ function directedTree(
 }
 
 function graphStats(services: DSPServices): unknown {
-  const entities = services.db.getEntities(300000);
-  const relations = services.db.getRelations(600000);
-  const byKind = Object.fromEntries(
-    [...new Set(entities.map((entity) => entity.kind))]
-      .sort()
-      .map((kind) => [kind, entities.filter((entity) => entity.kind === kind).length])
-  );
-  const byLanguage = Object.fromEntries(
-    [...new Set(entities.map((entity) => entity.language).filter(Boolean) as string[])]
-      .sort()
-      .map((language) => [language, entities.filter((entity) => entity.language === language).length])
-  );
   return {
-    entities: entities.length,
-    relations: relations.length,
-    unresolvedReferences: services.db.getUnresolvedReferences().length,
-    byKind,
-    byLanguage,
+    entities: services.db.entityCount(),
+    relations: services.db.relationCount(),
+    unresolvedReferences: services.db.unresolvedReferenceCount(),
+    byKind: services.db.entityCountsByKind(),
+    byLanguage: services.db.entityCountsByLanguage(),
     cache: services.db.cacheStats()
   };
 }
 
 function findSourceEntities(services: DSPServices, sourcePath: string): Entity[] {
-  const normalized = sourcePath.replaceAll("\\", "/").replace(/^\.\//, "");
-  return services.db
-    .getEntities(300000)
-    .filter((entity) => entity.path === normalized || entity.path?.endsWith(`/${normalized}`));
+  return services.db.findEntitiesByPath(sourcePath);
 }
 
 function shortestPath(services: DSPServices, fromUid: string, toUid: string): string[] | undefined {
@@ -160,8 +147,21 @@ function detectCycles(services: DSPServices): string[][] {
   const visiting = new Set<string>();
   const visited = new Set<string>();
   const stack: string[] = [];
-  const entities = services.db.getEntities(300000);
   const seenCycles = new Set<string>();
+  const nodes = new Set<string>();
+  const adjacency = new Map<string, string[]>();
+
+  for (const entity of services.db.iterateEntitiesOrdered()) {
+    nodes.add(entity.uid);
+  }
+  for (const relation of services.db.iterateRelationsOrdered()) {
+    if (!TRAVERSAL_KINDS.has(relation.kind)) {
+      continue;
+    }
+    const bucket = adjacency.get(relation.from) ?? [];
+    bucket.push(relation.to);
+    adjacency.set(relation.from, bucket);
+  }
 
   const dfs = (uid: string): void => {
     if (visiting.has(uid)) {
@@ -179,31 +179,22 @@ function detectCycles(services: DSPServices): string[][] {
     }
     visiting.add(uid);
     stack.push(uid);
-    for (const relation of services.db.getRelationsFrom(uid).filter((rel) => TRAVERSAL_KINDS.has(rel.kind))) {
-      dfs(relation.to);
+    for (const toUid of adjacency.get(uid) ?? []) {
+      dfs(toUid);
     }
     stack.pop();
     visiting.delete(uid);
     visited.add(uid);
   };
 
-  for (const entity of entities) {
-    dfs(entity.uid);
+  for (const uid of nodes) {
+    dfs(uid);
   }
   return cycles;
 }
 
 function orphans(services: DSPServices): Entity[] {
-  const entities = services.db.getEntities(300000);
-  return entities.filter((entity) => {
-    if (["repository", "directory", "file"].includes(entity.kind)) {
-      return false;
-    }
-    return services.db
-      .getRelationsTo(entity.uid)
-      .filter((relation) => relation.kind !== "contains")
-      .length === 0;
-  });
+  return services.db.getOrphanEntities(300000);
 }
 
 function manualUid(prefix: "obj" | "func", requested?: string): string {
@@ -336,7 +327,7 @@ program
         noEmbeddings: options.embeddings === false,
         dryRun: options.dryRun
       });
-      const validation = runValidate(services);
+      const validation = runValidate(services, { deep: true });
       printOutput({ summary, validation }, options.json);
     } finally {
       services.db.close();
@@ -372,6 +363,26 @@ program
     try {
       const result = runChanged(services);
       printOutput(result, options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
+  .command("watch")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--interval-ms <number>", "poll interval in milliseconds", "1000")
+  .option("--no-initial-index", "skip the initial full index before watching")
+  .action(async (rootDir: string, options: { intervalMs: string; initialIndex?: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      await watchRepository(services, {
+        intervalMs: Number(options.intervalMs),
+        runInitialIndex: options.initialIndex !== false,
+        onCycle: (summary: WatchSummary) => {
+          process.stdout.write(`${JSON.stringify(summary)}\n`);
+        }
+      });
     } finally {
       services.db.close();
     }
@@ -537,7 +548,7 @@ program
     }
     const services = openDSP(resolvedRoot, adapters());
     try {
-      const toc = services.db.getEntities(300000).map((entity) => entity.uid);
+      const toc = services.db.listEntityUids();
       printOutput({ protocol: false, toc }, options.json);
     } finally {
       services.db.close();
@@ -884,12 +895,35 @@ program
 program
   .command("validate")
   .argument("[rootDir]", "root directory", ".")
+  .option("--changed-only", "only validate files and graph issues touched by changed files", false)
+  .option("--deep", "include graph-wide consistency checks", false)
   .option("--json", "machine-readable output", false)
-  .action((rootDir: string, options: { json: boolean }) => {
+  .action((rootDir: string, options: { changedOnly: boolean; deep: boolean; json: boolean }) => {
     const services = openDSP(path.resolve(rootDir), adapters());
     try {
-      const result = runValidate(services);
+      const result = runValidate(services, {
+        changedOnly: options.changedOnly,
+        deep: options.deep
+      });
       printOutput(result, options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
+  .command("doctor")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--deep", "include graph validation in the report", false)
+  .option("--json", "machine-readable output", false)
+  .action((rootDir: string, options: { deep: boolean; json: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      const report = {
+        db: services.db.doctor(),
+        ...(options.deep ? { validation: runValidate(services, { deep: true }) } : {})
+      };
+      printOutput(report, options.json);
     } finally {
       services.db.close();
     }
@@ -958,7 +992,7 @@ program
     try {
       const changed = runChanged(services);
       const impacts = changed.map((target) => runImpact(services, target));
-      const validation = runValidate(services);
+      const validation = runValidate(services, { changedOnly: true, deep: true });
       printOutput({ changed, impacts, validation }, options.json);
     } finally {
       services.db.close();
@@ -1002,12 +1036,16 @@ embeddings
   .command("update")
   .argument("[rootDir]", "root directory", ".")
   .option("--changed-only", "embed only changed entities", false)
+  .option("--concurrency <number>", "maximum concurrent embedding requests", "4")
+  .option("--max-retries <number>", "retries for transient embedding failures", "2")
   .option("--json", "machine-readable output", false)
-  .action(async (rootDir: string, options: { changedOnly: boolean; json: boolean }) => {
+  .action(async (rootDir: string, options: { changedOnly: boolean; concurrency: string; maxRetries: string; json: boolean }) => {
     const services = openDSP(path.resolve(rootDir), adapters());
     try {
       const result = await runEmbeddingsUpdate(services, {
-        changedOnly: options.changedOnly
+        changedOnly: options.changedOnly,
+        concurrency: Number(options.concurrency),
+        maxRetries: Number(options.maxRetries)
       });
       printOutput(result, options.json);
     } finally {
@@ -1049,7 +1087,7 @@ ci
   .action((rootDir: string, options: { json: boolean }) => {
     const services = openDSP(path.resolve(rootDir), adapters());
     try {
-      const validation = runValidate(services);
+      const validation = runValidate(services, { deep: true });
       printOutput(validation, options.json);
       process.exitCode = validation.ok ? 0 : 1;
     } finally {

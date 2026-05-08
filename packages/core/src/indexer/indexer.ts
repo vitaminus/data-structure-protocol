@@ -1,5 +1,6 @@
 import path from "node:path";
-import { existsSync, readFileSync } from "node:fs";
+import os from "node:os";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import type {
   Entity,
   FileIndexRequest,
@@ -11,7 +12,8 @@ import type {
 import { buildUid, contentHash, normalizePath, stableNowIso } from "../graph/uid.ts";
 import { discoverFiles, findRepoRoot } from "../util/fs.ts";
 import { changedFileEntriesFromGit, changedFilesFromGit } from "../util/git.ts";
-import type { DSPDatabase } from "../storage/db.ts";
+import { ParseWorkerPool } from "./parse-pool.ts";
+import type { DSPDatabase, FileHashEntry, IndexedAstFile } from "../storage/db.ts";
 import type { DSPConfig } from "../config/types.ts";
 
 function languageFromFile(filePath: string): string | undefined {
@@ -188,25 +190,6 @@ function applyStableMarkers(
   };
 }
 
-function containsRelations(fileUid: string, entities: Entity[], nowIso: string): Relation[] {
-  return entities
-    .filter((entity) => entity.uid !== fileUid)
-    .map((entity) => ({
-      from: fileUid,
-      to: entity.uid,
-      kind: "contains" as const,
-      confidence: 1,
-      provenance: [
-        {
-          source: "ast",
-          tool: "dsp-indexer",
-          timestamp: nowIso,
-          confidence: 1
-        }
-      ]
-    }));
-}
-
 function filePathFromFileUid(uid: string): string | undefined {
   if (!uid.startsWith("file:") || uid.includes("#")) {
     return undefined;
@@ -240,22 +223,59 @@ function pathCandidates(targetRelPath: string, fromRelPath?: string): string[] {
   return [...new Set(candidates)];
 }
 
+function buildPathResolutionIndex(availableRelPaths: Iterable<string>): Map<string, string> {
+  const index = new Map<string, string>();
+  for (const relPath of availableRelPaths) {
+    const normalized = normalizePath(relPath);
+    index.set(normalized, normalized);
+
+    const extension = path.posix.extname(normalized);
+    if (extension) {
+      index.set(normalized.slice(0, -extension.length), normalized);
+    }
+    if (/\/index\.[^.]+$/.test(normalized)) {
+      const withoutIndex = normalized.replace(/\/index\.[^.]+$/, "");
+      index.set(withoutIndex, normalized);
+    }
+    if (normalized.endsWith("/mod.rs")) {
+      index.set(normalized.slice(0, -"/mod.rs".length), normalized);
+    }
+  }
+  return index;
+}
+
 function canonicalFilePath(
   targetRelPath: string,
   fromRelPath: string | undefined,
-  availableFiles: Set<string>
+  scanRoot: string,
+  resolutionCache: Map<string, string | undefined>,
+  pathIndex: Map<string, string>
 ): string | undefined {
-  return pathCandidates(targetRelPath, fromRelPath).find((candidate) => availableFiles.has(candidate));
+  const cacheKey = `${fromRelPath ?? ""}\0${targetRelPath}`;
+  const cached = resolutionCache.get(cacheKey);
+  if (resolutionCache.has(cacheKey)) {
+    return cached;
+  }
+  const candidates = pathCandidates(targetRelPath, fromRelPath);
+  const resolvedFromIndex = candidates.map((candidate) => pathIndex.get(candidate)).find(Boolean);
+  const resolved = resolvedFromIndex ?? candidates.find((candidate) => existsSync(path.resolve(scanRoot, candidate)));
+  resolutionCache.set(cacheKey, resolved);
+  return resolved;
 }
 
-function canonicalizeFileRelations(relations: Relation[], availableFiles: Set<string>): Relation[] {
+function canonicalizeFileRelations(
+  relations: Relation[],
+  scanRoot: string,
+  resolutionCache: Map<string, string | undefined>,
+  pathIndex: Map<string, string>
+): Relation[] {
   return relations.map((relation) => {
     const targetRelPath = filePathFromFileUid(relation.to);
     if (!targetRelPath) {
       return relation;
     }
     const fromRelPath = filePathFromFileUid(relation.from);
-    const resolvedPath = canonicalFilePath(targetRelPath, fromRelPath, availableFiles);
+    const resolvedPath = canonicalFilePath(targetRelPath, fromRelPath, scanRoot, resolutionCache, pathIndex);
     if (!resolvedPath || resolvedPath === targetRelPath) {
       return relation;
     }
@@ -285,11 +305,101 @@ type ParseOneResult =
       relPath: string;
       language: string;
       hash: string;
+      mtimeMs: number;
+      sizeBytes: number;
       nowIso: string;
       entities: Entity[];
       relations: Relation[];
       unresolved: UnresolvedReference[];
+      parserSources: string[];
+      usedFallback: boolean;
     };
+
+function sameCachedFileState(
+  cached: FileHashEntry | undefined,
+  mtimeMs: number,
+  sizeBytes: number
+): boolean {
+  return cached?.mtimeMs !== undefined && cached.sizeBytes !== undefined && cached.mtimeMs === mtimeMs && cached.sizeBytes === sizeBytes;
+}
+
+function persistedRelationsForFile(fileUid: string, relations: Relation[]): Relation[] {
+  return relations.filter((relation) => !(relation.kind === "contains" && relation.from === fileUid));
+}
+
+export function effectiveParallelismForIndex(config: DSPConfig["performance"], fileCount: number): number {
+  const configured = Math.max(1, config.parallelism);
+  if (!config.adaptiveParallelism) {
+    return configured;
+  }
+  const cpuCount = typeof os.availableParallelism === "function" ? os.availableParallelism() : os.cpus().length;
+  const cpuBound = config.mode === "large-repo" ? Math.max(2, Math.floor(cpuCount * 0.75)) : Math.max(2, cpuCount - 1);
+  return Math.max(1, Math.min(configured, fileCount, cpuBound));
+}
+
+function parseWorkerPoolFor(
+  adapters: LanguageAdapter[],
+  config: DSPConfig["performance"],
+  parallelism: number
+): ParseWorkerPool | undefined {
+  if (parallelism <= 1 || !adapters.some((adapter) => adapter.worker)) {
+    return undefined;
+  }
+  const useTsxLoader = adapters.some((adapter) => /\.tsx?$/.test(adapter.worker?.moduleUrl ?? ""));
+  return new ParseWorkerPool(parallelism, useTsxLoader, {
+    timeoutMs: config.workerTimeoutMs,
+    maxInputBytes: config.workerMaxInputKb * 1024,
+    maxJobsPerWorker: config.workerMaxJobsPerWorker
+  });
+}
+
+function chunkItems<T>(items: T[], chunkSize: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += chunkSize) {
+    chunks.push(items.slice(index, index + chunkSize));
+  }
+  return chunks;
+}
+
+export function chunkEntriesByByteBudget<T>(
+  items: T[],
+  byteBudget: number,
+  byteSizeOf: (item: T) => number
+): T[][] {
+  const chunks: T[][] = [];
+  const effectiveBudget = Math.max(1, byteBudget);
+  let currentChunk: T[] = [];
+  let currentBytes = 0;
+
+  for (const item of items) {
+    const itemBytes = Math.max(1, byteSizeOf(item));
+    if (currentChunk.length > 0 && currentBytes + itemBytes > effectiveBudget) {
+      chunks.push(currentChunk);
+      currentChunk = [];
+      currentBytes = 0;
+    }
+    currentChunk.push(item);
+    currentBytes += itemBytes;
+  }
+
+  if (currentChunk.length > 0) {
+    chunks.push(currentChunk);
+  }
+
+  return chunks;
+}
+
+type CheckpointState = {
+  manifestHash: string;
+  completedFiles: string[];
+  filesIndexed: number;
+  filesSkipped: number;
+  languages: string[];
+  entities: number;
+  relations: number;
+  unresolvedReferences: number;
+  lowConfidenceRelations: number;
+};
 
 async function mapWithConcurrency<T, R>(
   items: T[],
@@ -318,8 +428,11 @@ async function parseOne(
   scanRoot: string,
   db: DSPDatabase,
   adapters: LanguageAdapter[],
-  availableRelPaths: Set<string>,
-  full: boolean
+  cachedHash: FileHashEntry | undefined,
+  resolutionCache: Map<string, string | undefined>,
+  pathIndex: Map<string, string>,
+  full: boolean,
+  workerPool?: ParseWorkerPool
 ): Promise<ParseOneResult> {
   const relPath = normalizePath(path.relative(scanRoot, absPath));
   const language = languageFromFile(relPath);
@@ -331,28 +444,56 @@ async function parseOne(
     return { kind: "unsupported", relPath };
   }
 
-  const content = readFileSync(absPath, "utf8");
-  const hash = contentHash(content);
-  const oldHash = db.getFileHash(relPath);
-  if (!full && oldHash === hash) {
+  const stat = statSync(absPath);
+  const mtimeMs = Math.trunc(stat.mtimeMs);
+  const sizeBytes = stat.size;
+  if (!full && sameCachedFileState(cachedHash, mtimeMs, sizeBytes)) {
     return { kind: "skipped", relPath, language: adapter.language };
   }
 
-  const parsed = await adapter.parseFile(relPath, content);
+  const content = readFileSync(absPath, "utf8");
+  const hash = contentHash(content);
+  if (!full && cachedHash?.hash === hash) {
+    return { kind: "skipped", relPath, language: adapter.language };
+  }
+
+  const cachedParse = db.getCachedParseResult(adapter.language, relPath, hash);
+  const parsed =
+    cachedParse ??
+    (workerPool && adapter.worker
+      ? await workerPool.run(adapter.worker, relPath, content)
+      : await adapter.parseFile(relPath, content));
+  if (!cachedParse) {
+    db.setCachedParseResult(
+      adapter.language,
+      relPath,
+      hash,
+      {
+        entities: parsed.entities,
+        relations: parsed.relations,
+        unresolvedReferences: parsed.unresolvedReferences ?? []
+      },
+      stableNowIso()
+    );
+  }
   const parsedEntities = adapter.extractEntities(parsed);
   const parsedRelations = adapter.extractRelations(parsed, parsedEntities);
   const extracted = applyStableMarkers(content, parsedEntities, parsedRelations);
-  const extractedEntities = extracted.entities;
-  const extractedRelations = canonicalizeFileRelations(extracted.relations, availableRelPaths);
-  const unresolved = parsed.unresolvedReferences ?? [];
   const nowIso = stableNowIso();
 
   const fileNode = fileEntity(relPath, adapter.language, nowIso);
   const testNode = testEntityForFile(relPath, nowIso);
   const directories = dirEntitiesForFile(relPath, nowIso);
+  const extractedEntities = extracted.entities;
+  const extractedRelations = canonicalizeFileRelations(
+    persistedRelationsForFile(fileNode.uid, extracted.relations),
+    scanRoot,
+    resolutionCache,
+    pathIndex
+  );
+  const unresolved = parsed.unresolvedReferences ?? [];
   const allEntities = [fileNode, ...directories, ...(testNode ? [testNode] : []), ...extractedEntities];
   const allRelations = [
-    ...containsRelations(fileNode.uid, allEntities, nowIso),
     ...extractedRelations,
     ...(testNode
       ? [
@@ -374,16 +515,26 @@ async function parseOne(
         ]
       : [])
   ];
+  const parserSources = [
+    ...new Set(
+      [...extractedEntities.flatMap((entity) => entity.provenance.map((provenance) => provenance.source)),
+      ...allRelations.flatMap((relation) => relation.provenance.map((provenance) => provenance.source))]
+    )
+  ];
 
   return {
     kind: "parsed",
     relPath,
     language: adapter.language,
     hash,
+    mtimeMs,
+    sizeBytes,
     nowIso,
     entities: allEntities,
     relations: allRelations,
-    unresolved
+    unresolved,
+    parserSources,
+    usedFallback: parserSources.some((source) => source !== "ast" && source !== "test" && source !== "human")
   };
 }
 
@@ -404,15 +555,15 @@ export async function indexRepository(
   let relationCount = 0;
   let unresolvedCount = 0;
   let lowConfidenceCount = 0;
+  let parserFallbackFiles = 0;
+  const fallbackByLanguage = new Map<string, number>();
+  const parserSourceCounts = new Map<string, number>();
+  const resolutionCache = new Map<string, string | undefined>();
+  const directoryEntityUids = new Set<string>();
+  const renameReconciledPaths = new Set<string>();
+  let parsePool: ParseWorkerPool | undefined;
 
   try {
-    const discovered = discoverFiles(scanRoot, {
-      excludes: config.performance.exclude,
-      maxFileSizeKb: config.performance.maxFileSizeKb
-    });
-    const availableRelPaths = new Set(
-      discovered.map((absPath) => normalizePath(path.relative(scanRoot, absPath)))
-    );
     const requestedFiles = request.files?.map((file) => path.resolve(scanRoot, file));
     const changedEntries =
       request.fromGitDiff || request.changedOnly
@@ -422,6 +573,8 @@ export async function indexRepository(
           })
         : undefined;
     const changedFromGit = changedEntries?.map((entry) => entry.path);
+    const requiresFullDiscovery =
+      !requestedFiles?.length && (!changedFromGit || changedFromGit.length === 0) && !request.changedOnly;
 
     if (changedEntries) {
       db.transaction(() => {
@@ -430,10 +583,17 @@ export async function indexRepository(
           if (entry.oldPath && entry.oldPath !== entry.path && existsSync(entry.path)) {
             const oldRelPath = normalizePath(path.relative(scanRoot, entry.oldPath));
             const newRelPath = normalizePath(path.relative(scanRoot, entry.path));
-            const oldHash = db.getFileHash(oldRelPath);
-            const newHash = contentHash(readFileSync(entry.path, "utf8"));
-            if (oldHash && oldHash === newHash) {
+            const oldHashEntry = db.getFileHashEntry(oldRelPath);
+            const currentStat = statSync(entry.path);
+            const newHash =
+              oldHashEntry && sameCachedFileState(oldHashEntry, Math.trunc(currentStat.mtimeMs), currentStat.size)
+                ? oldHashEntry.hash
+                : contentHash(readFileSync(entry.path, "utf8"));
+            if (oldHashEntry?.hash && oldHashEntry.hash === newHash) {
               renameReconciled = db.renameAstDataPath(oldRelPath, newRelPath, stableNowIso());
+              if (renameReconciled) {
+                renameReconciledPaths.add(normalizePath(entry.path));
+              }
             }
           }
           const stalePaths = [
@@ -452,20 +612,21 @@ export async function indexRepository(
       });
     }
 
-    let selectedFiles = discovered.filter((absPath) => {
-      if (requestedFiles && requestedFiles.length > 0) {
-        return requestedFiles.includes(absPath);
-      }
-      if (changedFromGit) {
-        return changedFromGit.includes(absPath);
-      }
-      return true;
-    });
+    let selectedFiles = requiresFullDiscovery
+      ? discoverFiles(scanRoot, {
+          excludes: config.performance.exclude,
+          maxFileSizeKb: config.performance.maxFileSizeKb
+        })
+      : (requestedFiles ?? changedFromGit ?? []).filter((absPath) => existsSync(absPath));
+
+    if (renameReconciledPaths.size > 0) {
+      selectedFiles = selectedFiles.filter((absPath) => !renameReconciledPaths.has(normalizePath(absPath)));
+    }
 
     if (changedFromGit && changedFromGit.length > 0) {
-      const changedUids = changedFromGit.map((absPath) =>
-        buildUid("file", normalizePath(path.relative(scanRoot, absPath)))
-      );
+      const changedUids = changedFromGit
+        .filter((absPath) => !renameReconciledPaths.has(normalizePath(absPath)))
+        .map((absPath) => buildUid("file", normalizePath(path.relative(scanRoot, absPath))));
       const neighborRelPaths = new Set<string>();
       for (const uid of changedUids) {
         for (const incoming of db.getRelationsTo(uid)) {
@@ -481,54 +642,169 @@ export async function indexRepository(
       selectedFiles = [...new Set(selectedFiles)];
     }
 
-    const parsedResults = await mapWithConcurrency(
-      selectedFiles,
-      config.performance.parallelism,
-      (absPath) =>
-        parseOne(
-          absPath,
-          scanRoot,
-          db,
-          adapters,
-          availableRelPaths,
-          request.full ?? false
-        )
+    selectedFiles = selectedFiles.sort();
+    const checkpointName = `index:${scanRoot}`;
+    const selectedRelPaths = selectedFiles.map((absPath) => normalizePath(path.relative(scanRoot, absPath)));
+    const checkpointEligible =
+      Boolean(request.full) &&
+      !requestedFiles?.length &&
+      !request.changedOnly &&
+      !request.fromGitDiff &&
+      !changedEntries;
+    const manifestHash = checkpointEligible ? contentHash(JSON.stringify(selectedRelPaths)) : undefined;
+    if (checkpointEligible && manifestHash) {
+      const checkpoint = db.getCheckpoint(checkpointName);
+      const checkpointMeta = checkpoint?.metadata as Partial<CheckpointState> | undefined;
+      if (checkpointMeta?.manifestHash === manifestHash) {
+        const completedFiles = new Set(
+          Array.isArray(checkpointMeta.completedFiles)
+            ? checkpointMeta.completedFiles.filter((value): value is string => typeof value === "string")
+            : []
+        );
+        if (completedFiles.size > 0) {
+          selectedFiles = selectedFiles.filter(
+            (absPath) => !completedFiles.has(normalizePath(path.relative(scanRoot, absPath)))
+          );
+          filesIndexed = Number(checkpointMeta.filesIndexed ?? 0);
+          filesSkipped = Number(checkpointMeta.filesSkipped ?? 0);
+          entityCount = Number(checkpointMeta.entities ?? 0);
+          relationCount = Number(checkpointMeta.relations ?? 0);
+          unresolvedCount = Number(checkpointMeta.unresolvedReferences ?? 0);
+          lowConfidenceCount = Number(checkpointMeta.lowConfidenceRelations ?? 0);
+          for (const language of checkpointMeta.languages ?? []) {
+            if (typeof language === "string") {
+              languageSet.add(language);
+            }
+          }
+        }
+      } else if (checkpoint) {
+        db.clearCheckpoint(checkpointName);
+      }
+    }
+
+    const selectedEntries = selectedFiles.map((absPath) => ({
+      absPath,
+      relPath: normalizePath(path.relative(scanRoot, absPath)),
+      sizeBytes: statSync(absPath).size
+    }));
+    const activeSelectedRelPaths = selectedEntries.map((entry) => entry.relPath);
+    const pathIndex = buildPathResolutionIndex(new Set([...db.listFilesInHashTable(), ...activeSelectedRelPaths]));
+    const effectiveParallelism = effectiveParallelismForIndex(config.performance, selectedFiles.length);
+    const knownHashes = db.getFileHashEntries(activeSelectedRelPaths);
+    parsePool = parseWorkerPoolFor(adapters, config.performance, effectiveParallelism);
+    const completedFiles = new Set<string>(
+      checkpointEligible && manifestHash
+        ? (((db.getCheckpoint(checkpointName)?.metadata as Partial<CheckpointState> | undefined)?.completedFiles as
+            | string[]
+            | undefined) ?? [])
+        : []
     );
 
-    for (const result of parsedResults) {
-      if (result.kind === "unsupported") {
-        filesSkipped += 1;
-        continue;
-      }
-      languageSet.add(result.language);
-      if (result.kind === "skipped") {
-        filesSkipped += 1;
-        continue;
-      }
-      db.transaction(() => {
-        db.clearAstDataForPath(result.relPath);
-        for (const entity of result.entities) {
-          db.upsertEntity(entity);
-        }
-        for (const relation of result.relations) {
-          db.upsertRelation(relation);
-        }
-        for (const ref of result.unresolved) {
-          db.upsertUnresolvedReference(ref, result.nowIso);
-        }
-        db.markFileHash(result.relPath, result.hash, result.nowIso);
-      });
+    try {
+      const parseWindows = chunkEntriesByByteBudget(
+        selectedEntries,
+        config.performance.indexMemoryBudgetMb * 1024 * 1024,
+        (entry) => entry.sizeBytes
+      );
+      for (const windowEntries of parseWindows) {
+        const parsedResults = await mapWithConcurrency(
+          windowEntries,
+          effectiveParallelism,
+          (entry) =>
+            parseOne(
+              entry.absPath,
+              scanRoot,
+              db,
+              adapters,
+              knownHashes.get(entry.relPath),
+              resolutionCache,
+              pathIndex,
+              request.full ?? false,
+              parsePool
+            )
+        );
 
-      for (const relation of result.relations) {
-        if (relation.confidence < 0.4) {
-          lowConfidenceCount += 1;
+        const writableFiles: IndexedAstFile[] = [];
+        for (const result of parsedResults) {
+          if (result.kind === "unsupported") {
+            filesSkipped += 1;
+            continue;
+          }
+          languageSet.add(result.language);
+          if (result.kind === "skipped") {
+            filesSkipped += 1;
+            continue;
+          }
+          const entitiesToWrite = result.entities.filter((entity) => {
+            if (entity.kind !== "directory") {
+              return true;
+            }
+            if (directoryEntityUids.has(entity.uid)) {
+              return false;
+            }
+            directoryEntityUids.add(entity.uid);
+            return true;
+          });
+          writableFiles.push({
+            relPath: result.relPath,
+            language: result.language,
+            hash: result.hash,
+            indexedAt: result.nowIso,
+            mtimeMs: result.mtimeMs,
+            sizeBytes: result.sizeBytes,
+            entities: entitiesToWrite,
+            relations: result.relations,
+            unresolved: result.unresolved
+          });
+          if (result.usedFallback) {
+            parserFallbackFiles += 1;
+            fallbackByLanguage.set(result.language, (fallbackByLanguage.get(result.language) ?? 0) + 1);
+          }
+          for (const source of result.parserSources) {
+            parserSourceCounts.set(source, (parserSourceCounts.get(source) ?? 0) + 1);
+          }
+        }
+
+        const writeBatchSize = Math.max(32, effectiveParallelism * 8);
+        for (const batch of chunkItems(writableFiles, writeBatchSize)) {
+          db.transaction(() => {
+            db.replaceAstFiles(batch);
+            for (const file of batch) {
+              languageSet.add(file.language);
+              filesIndexed += 1;
+              entityCount += file.entities.length;
+              relationCount += file.relations.length;
+              unresolvedCount += file.unresolved.length;
+              for (const relation of file.relations) {
+                if (relation.confidence < 0.4) {
+                  lowConfidenceCount += 1;
+                }
+              }
+            }
+            if (checkpointEligible && manifestHash) {
+              for (const file of batch) {
+                completedFiles.add(file.relPath);
+              }
+              const checkpointState: CheckpointState = {
+                manifestHash,
+                completedFiles: [...completedFiles].sort(),
+                filesIndexed,
+                filesSkipped,
+                languages: [...languageSet].sort(),
+                entities: entityCount,
+                relations: relationCount,
+                unresolvedReferences: unresolvedCount,
+                lowConfidenceRelations: lowConfidenceCount
+              };
+              db.saveCheckpoint(checkpointName, stableNowIso(), checkpointState);
+              db.updateRunProgress(runId, filesIndexed, filesSkipped, checkpointState);
+            }
+          });
         }
       }
-
-      filesIndexed += 1;
-      entityCount += result.entities.length;
-      relationCount += result.relations.length;
-      unresolvedCount += result.unresolved.length;
+    } finally {
+      await parsePool?.close();
+      parsePool = undefined;
     }
 
     const allFiles = filesIndexed + filesSkipped;
@@ -543,11 +819,22 @@ export async function indexRepository(
       relations: relationCount,
       unresolvedReferences: unresolvedCount,
       lowConfidenceRelations: lowConfidenceCount,
-      estimatedCoverage
+      estimatedCoverage,
+      telemetry: {
+        parserFallbackFiles,
+        fallbackByLanguage: Object.fromEntries([...fallbackByLanguage.entries()].sort(([a], [b]) => a.localeCompare(b))),
+        parserSourceCounts: Object.fromEntries([...parserSourceCounts.entries()].sort(([a], [b]) => a.localeCompare(b)))
+      }
     };
+    db.maintainCaches();
+    db.optimize();
+    if (checkpointEligible) {
+      db.clearCheckpoint(checkpointName);
+    }
     db.finishRun(runId, "ok", stableNowIso(), summary);
     return summary;
   } catch (error) {
+    await parsePool?.close();
     db.finishRun(runId, "failed", stableNowIso(), {
       message: error instanceof Error ? error.message : String(error)
     });

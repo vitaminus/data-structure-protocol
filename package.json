@@ -6,7 +6,7 @@
   "type": "module",
   "packageManager": "pnpm@10.17.0",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=20.0.0 <23.0.0"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
@@ -19,8 +19,10 @@
     "test": "pnpm -r run test",
     "lint": "pnpm -r run lint",
     "bench:smoke": "tsx bench/scripts/bench-smoke.ts",
+    "bench:soak": "tsx bench/scripts/bench-soak.ts",
     "bench:compare": "tsx bench/scripts/bench-compare.ts",
     "coverage:summary": "tsx scripts/coverage-summary.ts",
+    "doctor": "tsx scripts/runtime-doctor.ts",
     "dsp": "tsx packages/cli/src/index.ts"
   },
   "devDependencies": {

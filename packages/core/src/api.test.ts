@@ -4,9 +4,9 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DEFAULT_CONFIG } from "./config/types.ts";
 import type { DSPServices } from "./api.ts";
-import { runSearch } from "./api.ts";
+import { runEmbeddingsUpdate, runSearch } from "./api.ts";
 import type { EmbeddingProvider } from "./graph/types.ts";
-import { buildUid, stableNowIso } from "./graph/uid.ts";
+import { buildUid, contentHash, stableNowIso } from "./graph/uid.ts";
 import { DSPDatabase } from "./storage/db.ts";
 
 class KeywordEmbeddingProvider implements EmbeddingProvider {
@@ -20,6 +20,29 @@ class KeywordEmbeddingProvider implements EmbeddingProvider {
       return [1, 0];
     }
     return [0, 1];
+  }
+}
+
+class FlakyEmbeddingProvider implements EmbeddingProvider {
+  maxConcurrent = 0;
+  private active = 0;
+  private readonly attempts = new Map<string, number>();
+
+  cacheKey(): string {
+    return "api-flaky-test";
+  }
+
+  async embed(text: string): Promise<number[]> {
+    this.active += 1;
+    this.maxConcurrent = Math.max(this.maxConcurrent, this.active);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    this.active -= 1;
+    const current = (this.attempts.get(text) ?? 0) + 1;
+    this.attempts.set(text, current);
+    if (current === 1) {
+      throw new Error(`temporary failure for ${text}`);
+    }
+    return [current, text.length];
   }
 }
 
@@ -63,6 +86,14 @@ describe("api", () => {
   }
 
   it("uses configured embeddings for search unless explicitly disabled", async () => {
+    const semanticText = ["settleInvoice", "", "payment settlement", ""].join("\n");
+    db.setEmbedding(
+      buildUid("function", "src/checkout.ts", "settleInvoice"),
+      contentHash(semanticText),
+      await services().embeddingProvider!.embed(semanticText),
+      services().embeddingProvider!.cacheKey!(),
+      stableNowIso()
+    );
     const semanticResults = await runSearch(services(), "billing", { topK: 3 });
     expect(semanticResults.map((result) => result.uid)).toContain(
       buildUid("function", "src/checkout.ts", "settleInvoice")
@@ -73,5 +104,33 @@ describe("api", () => {
       embeddingsEnabled: false
     });
     expect(lexicalOnlyResults).toEqual([]);
+  });
+
+  it("updates embeddings with bounded concurrency and retries transient failures", async () => {
+    const flaky = new FlakyEmbeddingProvider();
+    const now = stableNowIso();
+    db.upsertEntity({
+      uid: buildUid("function", "src/checkout.ts", "queueRefund"),
+      kind: "function",
+      name: "queueRefund",
+      path: "src/checkout.ts",
+      description: "refund queue",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+
+    const result = await runEmbeddingsUpdate(
+      {
+        ...services(),
+        embeddingProvider: flaky
+      },
+      { concurrency: 2, maxRetries: 1 }
+    );
+
+    expect(result).toMatchObject({ updated: 2, skipped: 0, provider: "api-flaky-test" });
+    expect(flaky.maxConcurrent).toBeLessThanOrEqual(2);
+    expect(db.embeddingStats()).toMatchObject({ total: 2, byProvider: { "api-flaky-test": 2 } });
   });
 });

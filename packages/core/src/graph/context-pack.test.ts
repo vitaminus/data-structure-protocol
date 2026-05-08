@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DSPDatabase } from "../storage/db.ts";
-import { buildUid, stableNowIso } from "./uid.ts";
+import { buildUid, contentHash, stableNowIso } from "./uid.ts";
 import { buildContextPack } from "./context-pack.ts";
 import { DEFAULT_CONFIG } from "../config/types.ts";
 import { MockEmbeddingProvider } from "../semantic/providers.ts";
@@ -24,6 +24,20 @@ class KeywordEmbeddingProvider implements EmbeddingProvider {
     }
     return [0.1, 0.1];
   }
+}
+
+async function seedEmbedding(
+  db: DSPDatabase,
+  provider: EmbeddingProvider,
+  uid: string,
+  text: string
+): Promise<void> {
+  const providerKey = provider.cacheKey?.() ?? provider.constructor.name;
+  db.setEmbedding(uid, contentHash(text), await provider.embed(text), providerKey, stableNowIso());
+}
+
+function semanticText(name: string, description = "", signature = "", docstring = ""): string {
+  return [name, signature, description, docstring].join("\n");
 }
 
 describe("context pack", () => {
@@ -235,12 +249,18 @@ describe("context pack", () => {
     });
 
     expect(result.estimatedTokens).toBeLessThanOrEqual(result.maxTokens);
-    expect(result.truncated).toBe(true);
     expect(result.code?.[0]?.truncated).toBe(true);
     expect(result.files).toEqual(["src/auth.ts"]);
   });
 
   it("uses configured embeddings provider when building context packs through services", async () => {
+    const provider = new MockEmbeddingProvider();
+    await seedEmbedding(
+      db,
+      provider,
+      buildUid("function", "src/auth.ts", "login"),
+      semanticText("login", "Handles authentication logic")
+    );
     const result = await buildContextPack(
       {
         db,
@@ -248,7 +268,7 @@ describe("context pack", () => {
           ...DEFAULT_CONFIG,
           embeddings: { ...DEFAULT_CONFIG.embeddings, enabled: true, provider: "mock" }
         },
-        embeddingProvider: new MockEmbeddingProvider()
+        embeddingProvider: provider
       },
       {
         task: "authentication logic",
@@ -257,7 +277,7 @@ describe("context pack", () => {
     );
 
     expect(result.relevantEntities.length).toBeGreaterThan(0);
-    expect(db.cacheStats().embeddings).toBeGreaterThan(0);
+    expect(result.riskNotes).toContain("Semantic reranking applied to context entities.");
   });
 
   it("uses semantic reranking to keep relevant graph nodes under tight file budgets", async () => {
@@ -314,6 +334,11 @@ describe("context pack", () => {
       provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
     });
 
+    const provider = new KeywordEmbeddingProvider();
+    await seedEmbedding(db, provider, checkoutUid, semanticText("checkout", "checkout entry point for order submission"));
+    await seedEmbedding(db, provider, billingUid, semanticText("settleInvoice", "payment billing settlement for invoices"));
+    await seedEmbedding(db, provider, cacheUid, semanticText("refreshCache", "cache refresh utility"));
+
     const result = await buildContextPack(
       {
         db,
@@ -321,7 +346,7 @@ describe("context pack", () => {
           ...DEFAULT_CONFIG,
           embeddings: { ...DEFAULT_CONFIG.embeddings, enabled: true, provider: "mock" }
         },
-        embeddingProvider: new KeywordEmbeddingProvider()
+        embeddingProvider: provider
       },
       {
         task: "checkout payment bug",

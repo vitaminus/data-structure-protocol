@@ -1,4 +1,5 @@
-import { execSync } from "node:child_process";
+import * as childProcess from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
 
 function splitLines(input: string): string[] {
@@ -16,7 +17,7 @@ export type GitChangedFile = {
 
 export function changedFileEntriesFromGit(rootDir: string, baseRef = "HEAD"): GitChangedFile[] {
   try {
-    const output = execSync(`git diff --name-status ${baseRef}`, {
+    const output = childProcess.execSync(`git diff --name-status ${baseRef}`, {
       cwd: rootDir,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"]
@@ -46,7 +47,7 @@ export function changedFilesFromGit(rootDir: string, baseRef = "HEAD"): string[]
 
 export function changedFilesStaged(rootDir: string): string[] {
   try {
-    const output = execSync("git diff --cached --name-only", {
+    const output = childProcess.execSync("git diff --cached --name-only", {
       cwd: rootDir,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"]
@@ -54,5 +55,34 @@ export function changedFilesStaged(rootDir: string): string[] {
     return splitLines(output).map((p) => path.resolve(rootDir, p));
   } catch {
     return [];
+  }
+}
+
+export function workingTreeFingerprint(rootDir: string): string | undefined {
+  try {
+    const head = childProcess.execSync("git rev-parse HEAD", {
+      cwd: rootDir,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    }).trim();
+    const gitDir = childProcess.execSync("git rev-parse --git-dir", {
+      cwd: rootDir,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    }).trim();
+    const indexPath = path.resolve(rootDir, gitDir, "index");
+    const indexStat = fs.existsSync(indexPath) ? fs.statSync(indexPath) : undefined;
+    const dirtyPaths = childProcess.execSync("git ls-files -m -d -o --exclude-standard --directory -z", {
+      cwd: rootDir,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    });
+    return [
+      head,
+      `${Math.trunc(indexStat?.mtimeMs ?? 0)}:${indexStat?.size ?? 0}`,
+      dirtyPaths
+    ].join("\0");
+  } catch {
+    return undefined;
   }
 }

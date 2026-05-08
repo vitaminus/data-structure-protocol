@@ -88,8 +88,14 @@ export type ParseResult = {
   unresolvedReferences?: UnresolvedReference[];
 };
 
+export type LanguageAdapterWorkerSpec = {
+  moduleUrl: string;
+  exportName: string;
+};
+
 export type LanguageAdapter = {
   language: string;
+  worker?: LanguageAdapterWorkerSpec;
   canHandle(filePath: string): boolean;
   parseFile(filePath: string, content: string): Promise<ParseResult>;
   extractEntities(parseResult: ParseResult): Entity[];
@@ -152,6 +158,11 @@ export type ValidationResult = {
   ok: boolean;
   issues: ValidationIssue[];
   summary: ValidationSummary;
+};
+
+export type ValidationOptions = {
+  changedOnly?: boolean;
+  deep?: boolean;
 };
 
 export type RepairAction = {
@@ -223,4 +234,9 @@ export type IndexSummary = {
   unresolvedReferences: number;
   lowConfidenceRelations: number;
   estimatedCoverage: number;
+  telemetry?: {
+    parserFallbackFiles: number;
+    fallbackByLanguage: Record<string, number>;
+    parserSourceCounts: Record<string, number>;
+  };
 };

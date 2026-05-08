@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DSPDatabase } from "../storage/db.ts";
-import { buildUid, stableNowIso } from "../graph/uid.ts";
+import { buildUid, contentHash, stableNowIso } from "../graph/uid.ts";
 import { semanticSearch } from "./search.ts";
 import type { EmbeddingProvider } from "../graph/types.ts";
 
@@ -43,6 +43,16 @@ class OppositeVectorProvider implements EmbeddingProvider {
   async embed(text: string): Promise<number[]> {
     return text.trim().toLowerCase() === "auth" ? [1, 0] : [-1, 0];
   }
+}
+
+async function seedEmbedding(
+  db: DSPDatabase,
+  provider: EmbeddingProvider,
+  uid: string,
+  text: string
+): Promise<void> {
+  const providerKey = provider.cacheKey?.() ?? provider.constructor.name;
+  db.setEmbedding(uid, contentHash(text), await provider.embed(text), providerKey, stableNowIso());
 }
 
 describe("semantic search", () => {
@@ -127,7 +137,7 @@ describe("semantic search", () => {
     expect(results.find((result) => result.uid === login)?.explanation).toContain("neighbors=");
   });
 
-  it("invalidates cached embeddings when the provider cache key changes", async () => {
+  it("does not reuse embeddings from a different provider cache key", async () => {
     const now = stableNowIso();
     const uid = buildUid("function", "src/auth.ts", "login");
     db.upsertEntity({
@@ -143,14 +153,15 @@ describe("semantic search", () => {
     });
 
     const first = new CountingProvider("mock:v1");
-    await semanticSearch(db, "auth token", { embeddingsEnabled: true, provider: first });
+    await seedEmbedding(db, first, uid, ["login", "", "auth token validation", ""].join("\n"));
     expect(db.getEmbedding(uid)?.provider).toBe("mock:v1");
 
     const second = new CountingProvider("mock:v2");
-    await semanticSearch(db, "auth token", { embeddingsEnabled: true, provider: second });
+    const results = await semanticSearch(db, "signin", { embeddingsEnabled: true, provider: second });
 
-    expect(second.calls).toBeGreaterThan(1);
-    expect(db.getEmbedding(uid)?.provider).toBe("mock:v2");
+    expect(second.calls).toBe(1);
+    expect(results).toEqual([]);
+    expect(db.getEmbedding(uid)?.provider).toBe("mock:v1");
   });
 
   it("finds embedding-only matches when lexical FTS has no candidates", async () => {
@@ -182,6 +193,9 @@ describe("semantic search", () => {
 
     expect(db.searchEntityUids("signin", 10)).toEqual([]);
 
+    await seedEmbedding(db, new SynonymProvider(), loginUid, ["login", "", "password session entrypoint", ""].join("\n"));
+    await seedEmbedding(db, new SynonymProvider(), billingUid, ["chargeCard", "", "payment capture", ""].join("\n"));
+
     const results = await semanticSearch(db, "signin", {
       topK: 2,
       embeddingsEnabled: true,
@@ -206,6 +220,8 @@ describe("semantic search", () => {
       updatedAt: now
     });
 
+    await seedEmbedding(db, new OppositeVectorProvider(), uid, ["validateToken", "", "auth token validation", ""].join("\n"));
+
     const results = await semanticSearch(db, "auth", {
       topK: 1,
       embeddingsEnabled: true,
@@ -215,5 +231,63 @@ describe("semantic search", () => {
     expect(results[0]?.uid).toBe(uid);
     expect(results[0]?.score).toBeGreaterThan(0);
     expect(results[0]?.explanation).toContain("lexical=");
+  });
+
+  it("ignores low-signal file containment relations during graph expansion", async () => {
+    const now = stableNowIso();
+    const tokenUid = buildUid("function", "src/session.ts", "createToken");
+    const loginUid = buildUid("function", "src/auth.ts", "login");
+    const tokenFileUid = buildUid("file", "src/session.ts");
+
+    for (const entity of [
+      {
+        uid: tokenFileUid,
+        kind: "file" as const,
+        name: "session.ts",
+        path: "src/session.ts"
+      },
+      {
+        uid: tokenUid,
+        kind: "function" as const,
+        name: "createToken",
+        path: "src/session.ts",
+        description: "issues access token"
+      },
+      {
+        uid: loginUid,
+        kind: "function" as const,
+        name: "login",
+        path: "src/auth.ts"
+      }
+    ]) {
+      db.upsertEntity({
+        confidence: 1,
+        provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+        createdAt: now,
+        updatedAt: now,
+        ...entity
+      });
+    }
+
+    db.upsertRelation({
+      from: tokenFileUid,
+      to: tokenUid,
+      kind: "contains",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      metadata: { synthetic: true }
+    });
+    db.upsertRelation({
+      from: loginUid,
+      to: tokenUid,
+      kind: "calls",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+
+    const results = await semanticSearch(db, "token", { topK: 5 });
+
+    expect(results.some((result) => result.uid === loginUid)).toBe(true);
+    expect(results.some((result) => result.uid === tokenFileUid)).toBe(false);
   });
 });

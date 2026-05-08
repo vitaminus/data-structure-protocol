@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { LanguageAdapter, ParseResult } from "../graph/types.ts";
 import { DEFAULT_CONFIG } from "../config/types.ts";
 import { DSPDatabase } from "../storage/db.ts";
-import { indexRepository } from "./indexer.ts";
+import { chunkEntriesByByteBudget, effectiveParallelismForIndex, indexRepository } from "./indexer.ts";
 import { buildUid, stableNowIso } from "../graph/uid.ts";
 
 class MockAdapter implements LanguageAdapter {
@@ -143,6 +143,39 @@ describe("indexer", () => {
     const summary = await indexRepository(db, [new GemfileAdapter()], { rootDir: tempDir }, DEFAULT_CONFIG);
     expect(summary.languages).toContain("ruby");
     expect(db.getEntity(buildUid("file", "Gemfile"))).toBeDefined();
+  });
+
+  it("caps adaptive parallelism by the number of files in the run", () => {
+    expect(
+      effectiveParallelismForIndex(
+        {
+          ...DEFAULT_CONFIG.performance,
+          parallelism: 8,
+          adaptiveParallelism: true
+        },
+        2
+      )
+    ).toBe(2);
+  });
+
+  it("chunks parse work by a byte budget", () => {
+    const chunks = chunkEntriesByByteBudget(
+      [
+        { name: "a", size: 5 },
+        { name: "b", size: 5 },
+        { name: "c", size: 5 }
+      ],
+      10,
+      (entry) => entry.size
+    );
+
+    expect(chunks).toEqual([
+      [
+        { name: "a", size: 5 },
+        { name: "b", size: 5 }
+      ],
+      [{ name: "c", size: 5 }]
+    ]);
   });
 
   it("skips unchanged files on second run", async () => {
@@ -333,7 +366,7 @@ describe("indexer", () => {
     );
 
     expect(summary.filesIndexed).toBe(0);
-    expect(summary.filesSkipped).toBe(1);
+    expect(summary.filesSkipped).toBe(0);
     expect(db.getEntity(buildUid("file", "src/a.ts"))).toBeUndefined();
     expect(db.getFileHash("src/a.ts")).toBeUndefined();
     expect(db.getEntity(buildUid("file", "src/renamed.ts"))).toBeDefined();
@@ -423,5 +456,95 @@ describe("indexer", () => {
     expect(db.getEntity(buildUid("file", "src/a.ts"))).toBeDefined();
     expect(db.getEntity(buildUid("function", "src/a.ts", "demo"))).toBeDefined();
     expect(db.getFileHash("src/a.ts")).toBe(oldHash);
+  });
+
+  it("reports parser fallback telemetry in index summaries", async () => {
+    class RegexAdapter extends MockAdapter {
+      override async parseFile(filePath: string): Promise<ParseResult> {
+        const now = stableNowIso();
+        return {
+          entities: [
+            {
+              uid: buildUid("unknown", filePath, "regex-fallback"),
+              kind: "unknown",
+              name: "regex-fallback",
+              path: filePath,
+              language: "typescript",
+              confidence: 0.5,
+              provenance: [{ source: "regex", timestamp: now, confidence: 0.5 }],
+              createdAt: now,
+              updatedAt: now
+            }
+          ],
+          relations: [],
+          unresolvedReferences: []
+        };
+      }
+    }
+
+    const summary = await indexRepository(db, [new RegexAdapter()], { rootDir: tempDir, full: true }, DEFAULT_CONFIG);
+
+    expect(summary.telemetry?.parserFallbackFiles).toBe(1);
+    expect(summary.telemetry?.fallbackByLanguage.typescript).toBe(1);
+    expect(summary.telemetry?.parserSourceCounts.regex).toBe(1);
+  });
+
+  it("reuses cached parse payloads after AST data is cleared", async () => {
+    class CountingAdapter extends MockAdapter {
+      calls = 0;
+
+      override async parseFile(filePath: string): Promise<ParseResult> {
+        this.calls += 1;
+        return super.parseFile(filePath);
+      }
+    }
+
+    const adapter = new CountingAdapter();
+    await indexRepository(db, [adapter], { rootDir: tempDir, full: true }, DEFAULT_CONFIG);
+    expect(adapter.calls).toBe(1);
+
+    db.clearAstDataForPath("src/a.ts");
+    db.removeFileHash("src/a.ts");
+
+    await indexRepository(db, [adapter], { rootDir: tempDir, full: true }, DEFAULT_CONFIG);
+    expect(adapter.calls).toBe(1);
+    expect(db.getEntity(buildUid("function", "src/a.ts", "demo"))).toBeDefined();
+  });
+
+  it("resumes full indexing from the last completed checkpoint batch", async () => {
+    for (let index = 0; index < 40; index += 1) {
+      fs.writeFileSync(path.join(tempDir, "src", `file-${index}.ts`), `export const value${index} = ${index};\n`, "utf8");
+    }
+
+    const adapter = new MockAdapter();
+    const config = {
+      ...DEFAULT_CONFIG,
+      performance: { ...DEFAULT_CONFIG.performance, parallelism: 4 }
+    };
+    const originalReplaceAstFiles = db.replaceAstFiles.bind(db);
+    let replaceCalls = 0;
+    db.replaceAstFiles = ((files) => {
+      replaceCalls += 1;
+      if (replaceCalls === 2) {
+        throw new Error("simulated batch write failure");
+      }
+      originalReplaceAstFiles(files);
+    }) as typeof db.replaceAstFiles;
+
+    await expect(indexRepository(db, [adapter], { rootDir: tempDir, full: true }, config)).rejects.toThrow(
+      "simulated batch write failure"
+    );
+
+    const checkpoint = db.getCheckpoint(`index:${path.resolve(tempDir)}`);
+    expect(checkpoint?.metadata.manifestHash).toBeTruthy();
+    expect((checkpoint?.metadata.completedFiles as string[] | undefined)?.length).toBe(32);
+
+    db.replaceAstFiles = originalReplaceAstFiles;
+    const summary = await indexRepository(db, [adapter], { rootDir: tempDir, full: true }, config);
+
+    expect(summary.filesIndexed).toBe(41);
+    expect(db.getCheckpoint(`index:${path.resolve(tempDir)}`)).toBeUndefined();
+    expect(db.getEntity(buildUid("file", "src/file-0.ts"))).toBeDefined();
+    expect(db.getEntity(buildUid("file", "src/file-39.ts"))).toBeDefined();
   });
 });

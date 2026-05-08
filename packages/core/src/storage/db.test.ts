@@ -238,6 +238,127 @@ describe("DSPDatabase", () => {
     );
   });
 
+  it("finds non-container orphans with a direct SQL query", () => {
+    const now = stableNowIso();
+    const fileUid = buildUid("file", "src/auth.ts");
+    const orphanUid = buildUid("function", "src/auth.ts", "orphan");
+    const linkedUid = buildUid("function", "src/auth.ts", "linked");
+    const callerUid = buildUid("function", "src/auth.ts", "caller");
+
+    for (const entity of [
+      {
+        uid: fileUid,
+        kind: "file" as const,
+        name: "auth.ts"
+      },
+      {
+        uid: orphanUid,
+        kind: "function" as const,
+        name: "orphan"
+      },
+      {
+        uid: linkedUid,
+        kind: "function" as const,
+        name: "linked"
+      },
+      {
+        uid: callerUid,
+        kind: "function" as const,
+        name: "caller"
+      }
+    ]) {
+      db.upsertEntity({
+        ...entity,
+        path: "src/auth.ts",
+        confidence: 1,
+        provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+        createdAt: now,
+        updatedAt: now
+      });
+    }
+
+    db.upsertRelation({
+      from: fileUid,
+      to: orphanUid,
+      kind: "contains",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+    db.upsertRelation({
+      from: callerUid,
+      to: linkedUid,
+      kind: "calls",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+
+    expect(db.getOrphanEntities().map((entity) => entity.uid)).toEqual([callerUid, orphanUid].sort());
+  });
+
+  it("reports database integrity and orphaned records", () => {
+    const sqlite = new Database(db.dbPath);
+    sqlite
+      .prepare(
+        "INSERT INTO embeddings(uid, content_hash, vector_json, provider, updated_at) VALUES (?, ?, ?, ?, ?)"
+      )
+      .run("missing:entity", "hash", "[1,2,3]", "test", stableNowIso());
+    sqlite
+      .prepare(
+        "INSERT INTO unresolved_references(path, from_uid, symbol, kind, reason, confidence, created_at, resolved) VALUES (?, ?, ?, ?, ?, ?, ?, 0)"
+      )
+      .run("src/missing.ts", null, "GhostType", "type", null, 0.5, stableNowIso());
+    sqlite
+      .prepare("INSERT INTO file_hashes(path, content_hash, indexed_at) VALUES (?, ?, ?)")
+      .run("src/missing.ts", "hash", stableNowIso());
+    sqlite
+      .prepare(
+        "INSERT INTO parse_cache(language, file_path, content_hash, payload_json, updated_at) VALUES (?, ?, ?, ?, ?)"
+      )
+      .run("typescript", "src/ghost.ts", "hash", "{\"entities\":[],\"relations\":[],\"unresolvedReferences\":[]}", stableNowIso());
+    sqlite.close();
+
+    const report = db.doctor();
+
+    expect(report.integrity.ok).toBe(true);
+    expect(report.orphanedEmbeddings).toContain("missing:entity");
+    expect(report.orphanedFileHashes).toContain("src/missing.ts");
+    expect(report.danglingUnresolvedPaths).toContain("src/missing.ts");
+    expect(report.parseCache.entries).toBe(1);
+    expect(report.parseCache.stalePaths).toContain("src/ghost.ts");
+    expect(report.maintenance.freelistPages).toBeGreaterThanOrEqual(0);
+  });
+
+  it("clears parse cache alongside other cache tables", () => {
+    const now = stableNowIso();
+    db.setEmbedding("uid:test", "hash", [1, 2, 3], "mock", now);
+    db.markFileHash("src/auth.ts", "hash", now, { mtimeMs: 1, sizeBytes: 2 });
+    db.setCachedParseResult("typescript", "src/auth.ts", "hash", {
+      entities: [],
+      relations: [],
+      unresolvedReferences: []
+    }, now);
+
+    expect(db.cacheStats()).toMatchObject({ embeddings: 1, fileHashes: 1, parseCache: 1 });
+
+    db.clearCache();
+
+    expect(db.cacheStats()).toMatchObject({ embeddings: 0, fileHashes: 0, parseCache: 0 });
+  });
+
+  it("prefilters nearest embeddings through bucketed candidates", () => {
+    const now = stableNowIso();
+    db.setEmbedding("entity:alpha", "hash-a", [1, 1, 1, 1, 1, 1, 1, 1], "mock", now);
+    db.setEmbedding("entity:beta", "hash-b", [0.8, 0.8, 0.7, 0.9, 1, 0.6, 0.7, 0.9], "mock", now);
+    db.setEmbedding("entity:gamma", "hash-c", [-1, -1, -1, -1, -1, -1, -1, -1], "mock", now);
+
+    const results = db.nearestEmbeddingsByProvider("mock", [1, 1, 1, 1, 1, 1, 1, 1], {
+      topK: 2,
+      scanLimit: 4
+    });
+
+    expect(results.map((row) => row.uid)).toEqual(["entity:alpha", "entity:beta"]);
+  });
+
   it("indexes entities into SQLite FTS for lexical candidate lookup", () => {
     const now = stableNowIso();
     const uid = buildUid("function", "src/users.ts", "createUser");
