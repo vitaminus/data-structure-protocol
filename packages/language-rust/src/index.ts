@@ -248,6 +248,10 @@ function resolveUsePath(filePath: string, spec: string): { path: string; confide
 
 export class RustLanguageAdapter implements LanguageAdapter {
   language = "rust";
+  worker = {
+    moduleUrl: import.meta.url,
+    exportName: "parseRustFile"
+  };
 
   canHandle(filePath: string): boolean {
     return path.extname(filePath).toLowerCase() === ".rs" || path.basename(filePath) === "Cargo.toml";
@@ -823,6 +827,10 @@ export class RustLanguageAdapter implements LanguageAdapter {
   extractPublicAPI(entities: Entity[]): Entity[] {
     return entities.filter((entity) => Boolean(entity.metadata?.public));
   }
+}
+
+export async function parseRustFile(filePath: string, content: string): Promise<ParseResult> {
+  return new RustLanguageAdapter().parseFile(filePath, content);
 }
 
 export function createRustLanguageAdapter(): LanguageAdapter {

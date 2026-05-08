@@ -153,83 +153,91 @@ function resolveRelativeModule(filePath: string, moduleName: string): string {
   return `${moduleName.replaceAll(".", "/")}.py`;
 }
 
+export async function parsePythonFile(filePath: string, content: string): Promise<ParseResult> {
+  const parsedFromAst = parseWithPythonAst(content);
+  const parsed = parsedFromAst ?? fallbackParse(content);
+  const usedFallback = !parsedFromAst;
+  const now = stableNowIso();
+  const fileUid = buildUid("file", filePath);
+  const entities: Entity[] = [];
+  const relations: Relation[] = [];
+  const unresolvedReferences: UnresolvedReference[] = [];
+
+  for (const symbol of parsed.symbols) {
+    const uid =
+      symbol.kind === "method"
+        ? buildUid("method", filePath, `${symbol.className}.${symbol.name}`)
+        : buildUid(symbol.kind, filePath, symbol.name);
+    entities.push({
+      uid,
+      kind: symbol.kind,
+      name: symbol.name,
+      path: filePath,
+      language: "python",
+      startLine: symbol.startLine,
+      endLine: symbol.endLine,
+      docstring: symbol.docstring,
+      confidence: usedFallback ? 0.72 : 0.95,
+      provenance: prov(usedFallback ? 0.72 : 0.95, symbol.kind),
+      metadata: {
+        public: !symbol.name.startsWith("_"),
+        className: symbol.className
+      },
+      createdAt: now,
+      updatedAt: now
+    });
+    relations.push({
+      from: fileUid,
+      to: uid,
+      kind: "contains",
+      confidence: 1,
+      provenance: prov(1, "file contains symbol")
+    });
+  }
+
+  for (const imp of parsed.imports) {
+    const modulePath = resolveRelativeModule(filePath, imp);
+    const confidence = imp.startsWith(".") ? (usedFallback ? 0.6 : 0.9) : usedFallback ? 0.5 : 0.65;
+    relations.push({
+      from: fileUid,
+      to: buildUid("file", modulePath),
+      kind: "imports",
+      reason: imp,
+      confidence,
+      provenance: prov(confidence, `import ${imp}`)
+    });
+    if (!imp.startsWith(".")) {
+      unresolvedReferences.push({
+        path: filePath,
+        fromUid: fileUid,
+        symbol: imp,
+        kind: "import",
+        reason: "could be external python package",
+        confidence: 0.6
+      });
+    }
+  }
+
+  return {
+    entities,
+    relations,
+    unresolvedReferences
+  };
+}
+
 export class PythonLanguageAdapter implements LanguageAdapter {
   language = "python";
+  worker = {
+    moduleUrl: import.meta.url,
+    exportName: "parsePythonFile"
+  };
 
   canHandle(filePath: string): boolean {
     return path.extname(filePath).toLowerCase() === ".py";
   }
 
   async parseFile(filePath: string, content: string): Promise<ParseResult> {
-    const parsedFromAst = parseWithPythonAst(content);
-    const parsed = parsedFromAst ?? fallbackParse(content);
-    const usedFallback = !parsedFromAst;
-    const now = stableNowIso();
-    const fileUid = buildUid("file", filePath);
-    const entities: Entity[] = [];
-    const relations: Relation[] = [];
-    const unresolvedReferences: UnresolvedReference[] = [];
-
-    for (const symbol of parsed.symbols) {
-      const uid =
-        symbol.kind === "method"
-          ? buildUid("method", filePath, `${symbol.className}.${symbol.name}`)
-          : buildUid(symbol.kind, filePath, symbol.name);
-      entities.push({
-        uid,
-        kind: symbol.kind,
-        name: symbol.name,
-        path: filePath,
-        language: "python",
-        startLine: symbol.startLine,
-        endLine: symbol.endLine,
-        docstring: symbol.docstring,
-        confidence: usedFallback ? 0.72 : 0.95,
-        provenance: prov(usedFallback ? 0.72 : 0.95, symbol.kind),
-        metadata: {
-          public: !symbol.name.startsWith("_"),
-          className: symbol.className
-        },
-        createdAt: now,
-        updatedAt: now
-      });
-      relations.push({
-        from: fileUid,
-        to: uid,
-        kind: "contains",
-        confidence: 1,
-        provenance: prov(1, "file contains symbol")
-      });
-    }
-
-    for (const imp of parsed.imports) {
-      const modulePath = resolveRelativeModule(filePath, imp);
-      const confidence = imp.startsWith(".") ? (usedFallback ? 0.6 : 0.9) : usedFallback ? 0.5 : 0.65;
-      relations.push({
-        from: fileUid,
-        to: buildUid("file", modulePath),
-        kind: "imports",
-        reason: imp,
-        confidence,
-        provenance: prov(confidence, `import ${imp}`)
-      });
-      if (!imp.startsWith(".")) {
-        unresolvedReferences.push({
-          path: filePath,
-          fromUid: fileUid,
-          symbol: imp,
-          kind: "import",
-          reason: "could be external python package",
-          confidence: 0.6
-        });
-      }
-    }
-
-    return {
-      entities,
-      relations,
-      unresolvedReferences
-    };
+    return parsePythonFile(filePath, content);
   }
 
   extractEntities(parseResult: ParseResult): Entity[] {

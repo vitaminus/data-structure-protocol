@@ -95,33 +95,26 @@ function resolveImport(fromPath: string, specifier: string): string | undefined 
   return candidate;
 }
 
-export class TypeScriptLanguageAdapter implements LanguageAdapter {
-  language = "typescript";
+export async function parseTypeScriptFile(filePath: string, content: string): Promise<ParseResult> {
+  const now = stableNowIso();
+  const source = ts.createSourceFile(filePath, content, ts.ScriptTarget.Latest, true);
+  const entities: Entity[] = [];
+  const relations: Relation[] = [];
+  const unresolvedReferences: UnresolvedReference[] = [];
+  const callEdges: { from: string; name: string; line: number }[] = [];
+  const fileUid = buildUid("file", filePath);
+  const lang = inferKindFromFile(filePath);
 
-  canHandle(filePath: string): boolean {
-    return [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"].includes(path.extname(filePath).toLowerCase());
-  }
-
-  async parseFile(filePath: string, content: string): Promise<ParseResult> {
-    const now = stableNowIso();
-    const source = ts.createSourceFile(filePath, content, ts.ScriptTarget.Latest, true);
-    const entities: Entity[] = [];
-    const relations: Relation[] = [];
-    const unresolvedReferences: UnresolvedReference[] = [];
-    const callEdges: { from: string; name: string; line: number }[] = [];
-    const fileUid = buildUid("file", filePath);
-    const lang = inferKindFromFile(filePath);
-
-    const addEntity = (entity: Entity) => {
-      entities.push(entity);
-      relations.push({
-        from: fileUid,
-        to: entity.uid,
-        kind: "contains",
-        confidence: 1,
-        provenance: withProv(1, "file contains symbol")
-      });
-    };
+  const addEntity = (entity: Entity) => {
+    entities.push(entity);
+    relations.push({
+      from: fileUid,
+      to: entity.uid,
+      kind: "contains",
+      confidence: 1,
+      provenance: withProv(1, "file contains symbol")
+    });
+  };
 
     const collectCalls = (node: ts.Node | undefined, fromUid: string): void => {
       if (!node) {
@@ -456,11 +449,26 @@ export class TypeScriptLanguageAdapter implements LanguageAdapter {
       });
     }
 
-    return {
-      entities,
-      relations,
-      unresolvedReferences
-    };
+  return {
+    entities,
+    relations,
+    unresolvedReferences
+  };
+}
+
+export class TypeScriptLanguageAdapter implements LanguageAdapter {
+  language = "typescript";
+  worker = {
+    moduleUrl: import.meta.url,
+    exportName: "parseTypeScriptFile"
+  };
+
+  canHandle(filePath: string): boolean {
+    return [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"].includes(path.extname(filePath).toLowerCase());
+  }
+
+  async parseFile(filePath: string, content: string): Promise<ParseResult> {
+    return parseTypeScriptFile(filePath, content);
   }
 
   extractEntities(parseResult: ParseResult): Entity[] {

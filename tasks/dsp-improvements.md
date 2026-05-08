@@ -471,3 +471,139 @@ Status: done
 - Treat negative cosine similarity as zero so embeddings cannot penalize lexical matches.
 - Keep ContextPack reranking and search scoring consistent.
 - Add coverage for an embedding provider that returns an opposite vector.
+
+### 58. Pin supported local Node runtimes
+
+Status: done
+
+- Restrict supported local Node.js versions to 20.x and 22.x instead of any future major.
+- Add `.nvmrc` / `.node-version` defaults and a `pnpm doctor` runtime check for native dependency drift.
+- Fail installer setup early when the local Node runtime is outside the supported range.
+
+### 59. Skip full discovery during changed-only indexing
+
+Status: done
+
+- Make `changedOnly`, `fromGitDiff`, and explicit file indexing build the worklist directly instead of scanning the whole repo first.
+- Keep git rename cleanup and neighbor expansion behavior intact.
+- Preserve deterministic selected-file ordering for stable index results.
+
+### 60. Prune ignored directories during file discovery
+
+Status: done
+
+- Replace recursive whole-tree walking with an iterative walker that skips ignored directories before descending.
+- Ignore symlinked directories during discovery to avoid accidental loops and extra IO.
+- Keep deterministic sorted file output after pruning.
+
+### 61. Bound semantic-search fallback work
+
+Status: done
+
+- Stop semantic search from auto-expanding to the full entity set when embeddings are enabled.
+- Limit embedding-backed fallback candidates to bounded lexical, neighbor, stored-embedding, and capped semantic-only seeds.
+- Remove the hard `200000` entity ceiling from embedding refresh by iterating the full entity stream.
+
+### 62. Stream heavy export and stats paths
+
+Status: done
+
+- Add ordered entity, relation, file, and unresolved-reference iterators in the database layer.
+- Remove silent entity/relation export caps in snapshot, JSONL, protocol, and DSP export flows.
+- Switch common CLI stats and path lookups to aggregated database queries instead of full-graph scans.
+
+### 63. Apply earlier ContextPack budgeting
+
+Status: done
+
+- Tie traversal budgets to the request token budget before graph expansion gets too large.
+- Cap total code payload size and per-file code reads before assembly instead of trimming only at the end.
+- Limit full-file payload reads to bounded prefixes so very large files do not overrun the code budget path.
+
+### 64. Reduce validation full-graph memory pressure
+
+Status: done
+
+- Iterate file entities and annotation-conflict candidates directly from SQLite during validation.
+- Preserve existing validation semantics while avoiding another large eager entity snapshot.
+- Keep unresolved, dangling, and low-confidence checks on their ordered database paths.
+
+### 65. Accelerate full-tree discovery with git-aware enumeration
+
+Status: done
+
+- Use `git ls-files --cached --others --exclude-standard` as the fast path for repository file discovery.
+- Keep subtree filtering and size limits intact when indexing a nested path inside a larger repo.
+- Fall back to filesystem walking only when git-aware discovery is unavailable.
+
+### 66. Cache fixed SQLite statements across index passes
+
+Status: done
+
+- Reuse prepared statements for hot entity, relation, hash, and run metadata operations instead of preparing SQL for every mutation.
+- Keep dynamic chunked `IN (...)` queries unchanged where statement reuse is not practical.
+- Preserve the existing public DB API while reducing per-entity and per-relation overhead.
+
+### 67. Prefetch file hashes before parsing
+
+Status: done
+
+- Batch-load known file hashes for the selected file set before parse workers start.
+- Remove per-file hash lookups from the parser hot path.
+- Preserve unchanged-file skipping behavior for full, incremental, and explicit file runs.
+
+### 68. Deduplicate repeated directory upserts and import resolution work
+
+Status: done
+
+- Avoid rewriting the same directory entities repeatedly during one index pass.
+- Cache extensionless/internal file import resolution results across files in the same run.
+- Keep relation output and index summaries stable while reducing duplicate work during tree recalculation.
+
+### 69. Add real parser worker parallelism for builtin adapters
+
+Status: done
+
+- Add a reusable worker-thread parse pool in core indexing and wire builtin language adapters through worker-aware entrypoints.
+- Keep custom adapters on the existing in-process path so external integrations do not break.
+- Verify the worker path with a focused non-SQLite test that parses TypeScript through the pool.
+
+### 70. Skip warm-scan file hashing when stat metadata is unchanged
+
+Status: done
+
+- Store file `mtime` and size alongside content hashes in the file-hash cache table.
+- Short-circuit unchanged files by stat metadata before reading and hashing file contents.
+- Fall back to content hashing when metadata is missing or suspicious so correctness stays intact.
+
+### 71. Batch index write transactions across files
+
+Status: done
+
+- Replace per-file write transactions with chunked batched AST write commits during index runs.
+- Preserve the existing parse-first, write-after-parse failure model so parse errors do not partially refresh the graph.
+- Keep deterministic file ordering while reducing transaction and SQLite commit overhead.
+
+### 72. Add a fast AST replace path in SQLite
+
+Status: done
+
+- Add batched `clearAstDataForPaths` and `replaceAstFiles` storage APIs for full AST refreshes.
+- Use direct conflict-aware inserts for AST entities and relations instead of read-before-write merges on the hot path.
+- Preserve higher-priority manual data by letting fast-path updates yield to stronger existing source priorities.
+
+### 73. Tune SQLite pragmas for indexing workloads
+
+Status: done
+
+- Keep WAL, and add `synchronous=NORMAL`, `temp_store=MEMORY`, a larger negative cache size, and `mmap_size`.
+- Run `PRAGMA optimize` after successful indexing work and before DB close.
+- Keep the tuning local to the database layer so callers do not need special handling.
+
+### 74. Stop persisting file-level contains edges and derive them on demand
+
+Status: done
+
+- Filter file-to-symbol `contains` edges out of persisted index writes while preserving class/module containment edges.
+- Synthesize file containment relations on read/export paths from entity ownership instead of storing every one in SQLite.
+- Drop redundant file-to-directory containment noise while keeping higher-level APIs and tests able to observe file containment.

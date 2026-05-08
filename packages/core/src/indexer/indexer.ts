@@ -1,5 +1,5 @@
 import path from "node:path";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import type {
   Entity,
   FileIndexRequest,
@@ -11,7 +11,8 @@ import type {
 import { buildUid, contentHash, normalizePath, stableNowIso } from "../graph/uid.ts";
 import { discoverFiles, findRepoRoot } from "../util/fs.ts";
 import { changedFileEntriesFromGit, changedFilesFromGit } from "../util/git.ts";
-import type { DSPDatabase } from "../storage/db.ts";
+import { ParseWorkerPool } from "./parse-pool.ts";
+import type { DSPDatabase, FileHashEntry, IndexedAstFile } from "../storage/db.ts";
 import type { DSPConfig } from "../config/types.ts";
 
 function languageFromFile(filePath: string): string | undefined {
@@ -188,25 +189,6 @@ function applyStableMarkers(
   };
 }
 
-function containsRelations(fileUid: string, entities: Entity[], nowIso: string): Relation[] {
-  return entities
-    .filter((entity) => entity.uid !== fileUid)
-    .map((entity) => ({
-      from: fileUid,
-      to: entity.uid,
-      kind: "contains" as const,
-      confidence: 1,
-      provenance: [
-        {
-          source: "ast",
-          tool: "dsp-indexer",
-          timestamp: nowIso,
-          confidence: 1
-        }
-      ]
-    }));
-}
-
 function filePathFromFileUid(uid: string): string | undefined {
   if (!uid.startsWith("file:") || uid.includes("#")) {
     return undefined;
@@ -243,19 +225,33 @@ function pathCandidates(targetRelPath: string, fromRelPath?: string): string[] {
 function canonicalFilePath(
   targetRelPath: string,
   fromRelPath: string | undefined,
-  availableFiles: Set<string>
+  scanRoot: string,
+  resolutionCache: Map<string, string | undefined>
 ): string | undefined {
-  return pathCandidates(targetRelPath, fromRelPath).find((candidate) => availableFiles.has(candidate));
+  const cacheKey = `${fromRelPath ?? ""}\0${targetRelPath}`;
+  const cached = resolutionCache.get(cacheKey);
+  if (resolutionCache.has(cacheKey)) {
+    return cached;
+  }
+  const resolved = pathCandidates(targetRelPath, fromRelPath).find((candidate) =>
+    existsSync(path.resolve(scanRoot, candidate))
+  );
+  resolutionCache.set(cacheKey, resolved);
+  return resolved;
 }
 
-function canonicalizeFileRelations(relations: Relation[], availableFiles: Set<string>): Relation[] {
+function canonicalizeFileRelations(
+  relations: Relation[],
+  scanRoot: string,
+  resolutionCache: Map<string, string | undefined>
+): Relation[] {
   return relations.map((relation) => {
     const targetRelPath = filePathFromFileUid(relation.to);
     if (!targetRelPath) {
       return relation;
     }
     const fromRelPath = filePathFromFileUid(relation.from);
-    const resolvedPath = canonicalFilePath(targetRelPath, fromRelPath, availableFiles);
+    const resolvedPath = canonicalFilePath(targetRelPath, fromRelPath, scanRoot, resolutionCache);
     if (!resolvedPath || resolvedPath === targetRelPath) {
       return relation;
     }
@@ -285,11 +281,41 @@ type ParseOneResult =
       relPath: string;
       language: string;
       hash: string;
+      mtimeMs: number;
+      sizeBytes: number;
       nowIso: string;
       entities: Entity[];
       relations: Relation[];
       unresolved: UnresolvedReference[];
     };
+
+function sameCachedFileState(
+  cached: FileHashEntry | undefined,
+  mtimeMs: number,
+  sizeBytes: number
+): boolean {
+  return cached?.mtimeMs !== undefined && cached.sizeBytes !== undefined && cached.mtimeMs === mtimeMs && cached.sizeBytes === sizeBytes;
+}
+
+function persistedRelationsForFile(fileUid: string, relations: Relation[]): Relation[] {
+  return relations.filter((relation) => !(relation.kind === "contains" && relation.from === fileUid));
+}
+
+function parseWorkerPoolFor(adapters: LanguageAdapter[], parallelism: number): ParseWorkerPool | undefined {
+  if (parallelism <= 1 || !adapters.some((adapter) => adapter.worker)) {
+    return undefined;
+  }
+  const useTsxLoader = adapters.some((adapter) => /\.tsx?$/.test(adapter.worker?.moduleUrl ?? ""));
+  return new ParseWorkerPool(parallelism, useTsxLoader);
+}
+
+function chunkItems<T>(items: T[], chunkSize: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += chunkSize) {
+    chunks.push(items.slice(index, index + chunkSize));
+  }
+  return chunks;
+}
 
 async function mapWithConcurrency<T, R>(
   items: T[],
@@ -316,10 +342,11 @@ async function mapWithConcurrency<T, R>(
 async function parseOne(
   absPath: string,
   scanRoot: string,
-  db: DSPDatabase,
   adapters: LanguageAdapter[],
-  availableRelPaths: Set<string>,
-  full: boolean
+  cachedHash: FileHashEntry | undefined,
+  resolutionCache: Map<string, string | undefined>,
+  full: boolean,
+  workerPool?: ParseWorkerPool
 ): Promise<ParseOneResult> {
   const relPath = normalizePath(path.relative(scanRoot, absPath));
   const language = languageFromFile(relPath);
@@ -331,28 +358,40 @@ async function parseOne(
     return { kind: "unsupported", relPath };
   }
 
-  const content = readFileSync(absPath, "utf8");
-  const hash = contentHash(content);
-  const oldHash = db.getFileHash(relPath);
-  if (!full && oldHash === hash) {
+  const stat = statSync(absPath);
+  const mtimeMs = Math.trunc(stat.mtimeMs);
+  const sizeBytes = stat.size;
+  if (!full && sameCachedFileState(cachedHash, mtimeMs, sizeBytes)) {
     return { kind: "skipped", relPath, language: adapter.language };
   }
 
-  const parsed = await adapter.parseFile(relPath, content);
+  const content = readFileSync(absPath, "utf8");
+  const hash = contentHash(content);
+  if (!full && cachedHash?.hash === hash) {
+    return { kind: "skipped", relPath, language: adapter.language };
+  }
+
+  const parsed =
+    workerPool && adapter.worker
+      ? await workerPool.run(adapter.worker, relPath, content)
+      : await adapter.parseFile(relPath, content);
   const parsedEntities = adapter.extractEntities(parsed);
   const parsedRelations = adapter.extractRelations(parsed, parsedEntities);
   const extracted = applyStableMarkers(content, parsedEntities, parsedRelations);
-  const extractedEntities = extracted.entities;
-  const extractedRelations = canonicalizeFileRelations(extracted.relations, availableRelPaths);
-  const unresolved = parsed.unresolvedReferences ?? [];
   const nowIso = stableNowIso();
 
   const fileNode = fileEntity(relPath, adapter.language, nowIso);
   const testNode = testEntityForFile(relPath, nowIso);
   const directories = dirEntitiesForFile(relPath, nowIso);
+  const extractedEntities = extracted.entities;
+  const extractedRelations = canonicalizeFileRelations(
+    persistedRelationsForFile(fileNode.uid, extracted.relations),
+    scanRoot,
+    resolutionCache
+  );
+  const unresolved = parsed.unresolvedReferences ?? [];
   const allEntities = [fileNode, ...directories, ...(testNode ? [testNode] : []), ...extractedEntities];
   const allRelations = [
-    ...containsRelations(fileNode.uid, allEntities, nowIso),
     ...extractedRelations,
     ...(testNode
       ? [
@@ -380,6 +419,8 @@ async function parseOne(
     relPath,
     language: adapter.language,
     hash,
+    mtimeMs,
+    sizeBytes,
     nowIso,
     entities: allEntities,
     relations: allRelations,
@@ -404,15 +445,11 @@ export async function indexRepository(
   let relationCount = 0;
   let unresolvedCount = 0;
   let lowConfidenceCount = 0;
+  const resolutionCache = new Map<string, string | undefined>();
+  const directoryEntityUids = new Set<string>();
+  const parsePool = parseWorkerPoolFor(adapters, config.performance.parallelism);
 
   try {
-    const discovered = discoverFiles(scanRoot, {
-      excludes: config.performance.exclude,
-      maxFileSizeKb: config.performance.maxFileSizeKb
-    });
-    const availableRelPaths = new Set(
-      discovered.map((absPath) => normalizePath(path.relative(scanRoot, absPath)))
-    );
     const requestedFiles = request.files?.map((file) => path.resolve(scanRoot, file));
     const changedEntries =
       request.fromGitDiff || request.changedOnly
@@ -422,6 +459,8 @@ export async function indexRepository(
           })
         : undefined;
     const changedFromGit = changedEntries?.map((entry) => entry.path);
+    const requiresFullDiscovery =
+      !requestedFiles?.length && (!changedFromGit || changedFromGit.length === 0) && !request.changedOnly;
 
     if (changedEntries) {
       db.transaction(() => {
@@ -430,9 +469,13 @@ export async function indexRepository(
           if (entry.oldPath && entry.oldPath !== entry.path && existsSync(entry.path)) {
             const oldRelPath = normalizePath(path.relative(scanRoot, entry.oldPath));
             const newRelPath = normalizePath(path.relative(scanRoot, entry.path));
-            const oldHash = db.getFileHash(oldRelPath);
-            const newHash = contentHash(readFileSync(entry.path, "utf8"));
-            if (oldHash && oldHash === newHash) {
+            const oldHashEntry = db.getFileHashEntry(oldRelPath);
+            const currentStat = statSync(entry.path);
+            const newHash =
+              oldHashEntry && sameCachedFileState(oldHashEntry, Math.trunc(currentStat.mtimeMs), currentStat.size)
+                ? oldHashEntry.hash
+                : contentHash(readFileSync(entry.path, "utf8"));
+            if (oldHashEntry?.hash && oldHashEntry.hash === newHash) {
               renameReconciled = db.renameAstDataPath(oldRelPath, newRelPath, stableNowIso());
             }
           }
@@ -452,15 +495,12 @@ export async function indexRepository(
       });
     }
 
-    let selectedFiles = discovered.filter((absPath) => {
-      if (requestedFiles && requestedFiles.length > 0) {
-        return requestedFiles.includes(absPath);
-      }
-      if (changedFromGit) {
-        return changedFromGit.includes(absPath);
-      }
-      return true;
-    });
+    let selectedFiles = requiresFullDiscovery
+      ? discoverFiles(scanRoot, {
+          excludes: config.performance.exclude,
+          maxFileSizeKb: config.performance.maxFileSizeKb
+        })
+      : (requestedFiles ?? changedFromGit ?? []).filter((absPath) => existsSync(absPath));
 
     if (changedFromGit && changedFromGit.length > 0) {
       const changedUids = changedFromGit.map((absPath) =>
@@ -481,19 +521,32 @@ export async function indexRepository(
       selectedFiles = [...new Set(selectedFiles)];
     }
 
-    const parsedResults = await mapWithConcurrency(
-      selectedFiles,
-      config.performance.parallelism,
-      (absPath) =>
-        parseOne(
-          absPath,
-          scanRoot,
-          db,
-          adapters,
-          availableRelPaths,
-          request.full ?? false
-        )
-    );
+    selectedFiles = selectedFiles.sort();
+    const selectedRelPaths = selectedFiles.map((absPath) => normalizePath(path.relative(scanRoot, absPath)));
+    const knownHashes = db.getFileHashEntries(selectedRelPaths);
+
+    const parsedResults = await (async () => {
+      try {
+        return await mapWithConcurrency(
+          selectedFiles,
+          config.performance.parallelism,
+          (absPath, index) =>
+            parseOne(
+              absPath,
+              scanRoot,
+              adapters,
+              knownHashes.get(selectedRelPaths[index]!),
+              resolutionCache,
+              request.full ?? false,
+              parsePool
+            )
+        );
+      } finally {
+        await parsePool?.close();
+      }
+    })();
+
+    const writableFiles: IndexedAstFile[] = [];
 
     for (const result of parsedResults) {
       if (result.kind === "unsupported") {
@@ -505,18 +558,25 @@ export async function indexRepository(
         filesSkipped += 1;
         continue;
       }
-      db.transaction(() => {
-        db.clearAstDataForPath(result.relPath);
-        for (const entity of result.entities) {
-          db.upsertEntity(entity);
+      const entitiesToWrite = result.entities.filter((entity) => {
+        if (entity.kind !== "directory") {
+          return true;
         }
-        for (const relation of result.relations) {
-          db.upsertRelation(relation);
+        if (directoryEntityUids.has(entity.uid)) {
+          return false;
         }
-        for (const ref of result.unresolved) {
-          db.upsertUnresolvedReference(ref, result.nowIso);
-        }
-        db.markFileHash(result.relPath, result.hash, result.nowIso);
+        directoryEntityUids.add(entity.uid);
+        return true;
+      });
+      writableFiles.push({
+        relPath: result.relPath,
+        hash: result.hash,
+        indexedAt: result.nowIso,
+        mtimeMs: result.mtimeMs,
+        sizeBytes: result.sizeBytes,
+        entities: entitiesToWrite,
+        relations: result.relations,
+        unresolved: result.unresolved
       });
 
       for (const relation of result.relations) {
@@ -529,6 +589,13 @@ export async function indexRepository(
       entityCount += result.entities.length;
       relationCount += result.relations.length;
       unresolvedCount += result.unresolved.length;
+    }
+
+    const writeBatchSize = Math.max(32, config.performance.parallelism * 8);
+    for (const batch of chunkItems(writableFiles, writeBatchSize)) {
+      db.transaction(() => {
+        db.replaceAstFiles(batch);
+      });
     }
 
     const allFiles = filesIndexed + filesSkipped;
@@ -545,9 +612,11 @@ export async function indexRepository(
       lowConfidenceRelations: lowConfidenceCount,
       estimatedCoverage
     };
+    db.optimize();
     db.finishRun(runId, "ok", stableNowIso(), summary);
     return summary;
   } catch (error) {
+    await parsePool?.close();
     db.finishRun(runId, "failed", stableNowIso(), {
       message: error instanceof Error ? error.message : String(error)
     });

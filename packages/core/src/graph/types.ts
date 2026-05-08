@@ -88,8 +88,14 @@ export type ParseResult = {
   unresolvedReferences?: UnresolvedReference[];
 };
 
+export type LanguageAdapterWorkerSpec = {
+  moduleUrl: string;
+  exportName: string;
+};
+
 export type LanguageAdapter = {
   language: string;
+  worker?: LanguageAdapterWorkerSpec;
   canHandle(filePath: string): boolean;
   parseFile(filePath: string, content: string): Promise<ParseResult>;
   extractEntities(parseResult: ParseResult): Entity[];

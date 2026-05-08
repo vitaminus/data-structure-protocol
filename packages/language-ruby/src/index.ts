@@ -534,6 +534,10 @@ function railsConstantForPath(filePath: string): string | undefined {
 
 export class RubyLanguageAdapter implements LanguageAdapter {
   language = "ruby";
+  worker = {
+    moduleUrl: import.meta.url,
+    exportName: "parseRubyFile"
+  };
 
   canHandle(filePath: string): boolean {
     const basename = path.basename(filePath);
@@ -810,6 +814,10 @@ export class RubyLanguageAdapter implements LanguageAdapter {
   extractPublicAPI(entities: Entity[]): Entity[] {
     return entities.filter((entity) => !entity.name.startsWith("_"));
   }
+}
+
+export async function parseRubyFile(filePath: string, content: string): Promise<ParseResult> {
+  return new RubyLanguageAdapter().parseFile(filePath, content);
 }
 
 export function createRubyLanguageAdapter(): LanguageAdapter {
