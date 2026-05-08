@@ -1,5 +1,6 @@
 import path from "node:path";
 import fs from "node:fs";
+import { availableParallelism } from "node:os";
 import type {
   ContextPackRequest,
   ContextPackResponse,
@@ -179,13 +180,17 @@ export function runImport(
 
 export async function runEmbeddingsUpdate(
   services: DSPServices,
-  options: { changedOnly?: boolean } = {}
+  options: { changedOnly?: boolean; concurrency?: number; maxRetries?: number } = {}
 ): Promise<{ updated: number; skipped: number; provider: string }> {
   const provider = services.embeddingProvider ?? new MockEmbeddingProvider();
   const providerKey = provider.cacheKey?.() ?? provider.constructor.name;
   let updated = 0;
   let skipped = 0;
   const now = new Date().toISOString();
+  const concurrency = Math.max(1, options.concurrency ?? Math.min(availableParallelism(), 8));
+  const maxRetries = Math.max(0, options.maxRetries ?? 2);
+  const workItems: { uid: string; semanticText: string; hash: string }[] = [];
+
   for (const entity of services.db.iterateEntitiesOrdered()) {
     const semanticText = [
       entity.name,
@@ -199,11 +204,54 @@ export async function runEmbeddingsUpdate(
       skipped += 1;
       continue;
     }
-    const vector = await provider.embed(semanticText);
-    services.db.setEmbedding(entity.uid, hash, vector, providerKey, now);
-    updated += 1;
+    workItems.push({ uid: entity.uid, semanticText, hash });
   }
+
+  await mapWithConcurrency(workItems, concurrency, async (item) => {
+    const vector = await embedWithRetry(provider, item.semanticText, maxRetries);
+    services.db.setEmbedding(item.uid, item.hash, vector, providerKey, now);
+    updated += 1;
+  });
+
+  services.db.maintainCaches();
   return { updated, skipped, provider: providerKey };
+}
+
+async function mapWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<void>
+): Promise<void> {
+  const workerCount = Math.max(1, Math.min(items.length, Math.floor(concurrency) || 1));
+  let nextIndex = 0;
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        await mapper(items[currentIndex]!, currentIndex);
+      }
+    })
+  );
+}
+
+async function embedWithRetry(
+  provider: EmbeddingProvider,
+  text: string,
+  maxRetries: number
+): Promise<number[]> {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await provider.embed(text);
+    } catch (error) {
+      if (attempt >= maxRetries) {
+        throw error;
+      }
+      attempt += 1;
+      await new Promise((resolve) => setTimeout(resolve, 50 * attempt));
+    }
+  }
 }
 
 function statFingerprint(filePath: string): string {

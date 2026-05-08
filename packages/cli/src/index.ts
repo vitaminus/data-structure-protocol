@@ -1036,12 +1036,16 @@ embeddings
   .command("update")
   .argument("[rootDir]", "root directory", ".")
   .option("--changed-only", "embed only changed entities", false)
+  .option("--concurrency <number>", "maximum concurrent embedding requests", "4")
+  .option("--max-retries <number>", "retries for transient embedding failures", "2")
   .option("--json", "machine-readable output", false)
-  .action(async (rootDir: string, options: { changedOnly: boolean; json: boolean }) => {
+  .action(async (rootDir: string, options: { changedOnly: boolean; concurrency: string; maxRetries: string; json: boolean }) => {
     const services = openDSP(path.resolve(rootDir), adapters());
     try {
       const result = await runEmbeddingsUpdate(services, {
-        changedOnly: options.changedOnly
+        changedOnly: options.changedOnly,
+        concurrency: Number(options.concurrency),
+        maxRetries: Number(options.maxRetries)
       });
       printOutput(result, options.json);
     } finally {

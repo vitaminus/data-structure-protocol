@@ -759,3 +759,11 @@ Status: done
 - Track parse-cache volume in normal cache stats and `doctor`, including stale cache paths that no longer line up with indexed files.
 - Prune parse-cache rows by age and total row budget during maintenance, and run WAL checkpointing plus conditional `VACUUM` from the same path.
 - Make `clearCache()` actually clear `parse_cache` too so manual cache resets return the database to a clean state.
+
+### 94. Parallelize and harden embeddings refreshes
+
+Status: done
+
+- Run embeddings refreshes with bounded concurrency instead of strict one-by-one provider calls.
+- Add retry-with-backoff for transient provider failures so long refresh jobs are less brittle.
+- Expose concurrency and retry knobs in the CLI while reusing the normal cache-maintenance path after the refresh completes.
