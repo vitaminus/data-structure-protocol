@@ -655,3 +655,11 @@ Status: done
 - Track how many indexed files relied on fallback-style provenance instead of pure AST extraction.
 - Break fallback counts out by language and aggregate observed parser provenance sources in the index summary metadata.
 - Cover the telemetry with a regression test so fallback visibility stays present across future indexer refactors.
+
+### 81. Cache parse payloads by content hash for rebuilds
+
+Status: done
+
+- Persist parsed payloads by language, file path, and content hash so AST data can be rebuilt without reparsing unchanged files.
+- Consult the parse cache after hashing but before parser execution, then repopulate the graph from the cached payload when it is still valid.
+- Keep a regression test that clears AST state and proves the second rebuild avoids another adapter parse call.

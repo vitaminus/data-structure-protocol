@@ -361,6 +361,7 @@ async function mapWithConcurrency<T, R>(
 async function parseOne(
   absPath: string,
   scanRoot: string,
+  db: DSPDatabase,
   adapters: LanguageAdapter[],
   cachedHash: FileHashEntry | undefined,
   resolutionCache: Map<string, string | undefined>,
@@ -390,10 +391,25 @@ async function parseOne(
     return { kind: "skipped", relPath, language: adapter.language };
   }
 
+  const cachedParse = db.getCachedParseResult(adapter.language, relPath, hash);
   const parsed =
-    workerPool && adapter.worker
+    cachedParse ??
+    (workerPool && adapter.worker
       ? await workerPool.run(adapter.worker, relPath, content)
-      : await adapter.parseFile(relPath, content);
+      : await adapter.parseFile(relPath, content));
+  if (!cachedParse) {
+    db.setCachedParseResult(
+      adapter.language,
+      relPath,
+      hash,
+      {
+        entities: parsed.entities,
+        relations: parsed.relations,
+        unresolvedReferences: parsed.unresolvedReferences ?? []
+      },
+      stableNowIso()
+    );
+  }
   const parsedEntities = adapter.extractEntities(parsed);
   const parsedRelations = adapter.extractRelations(parsed, parsedEntities);
   const extracted = applyStableMarkers(content, parsedEntities, parsedRelations);
@@ -603,6 +619,7 @@ export async function indexRepository(
             parseOne(
               absPath,
               scanRoot,
+              db,
               adapters,
               knownHashes.get(activeSelectedRelPaths[index]!),
               resolutionCache,

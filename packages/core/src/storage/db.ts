@@ -144,6 +144,12 @@ export type DatabaseDoctorReport = {
   checkpoints: number;
 };
 
+export type CachedParseResult = {
+  entities: Entity[];
+  relations: Relation[];
+  unresolvedReferences: UnresolvedReference[];
+};
+
 export type EntitySearchCandidates = {
   uids: string[];
   candidatesScanned: number;
@@ -271,6 +277,15 @@ export class DSPDatabase {
         name TEXT NOT NULL,
         metadata_json TEXT,
         created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS parse_cache (
+        language TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(language, file_path, content_hash)
       );
 
       CREATE VIRTUAL TABLE IF NOT EXISTS entity_fts
@@ -519,6 +534,36 @@ export class DSPDatabase {
       runningIndexRuns,
       checkpoints
     };
+  }
+
+  getCachedParseResult(language: string, filePath: string, hash: string): CachedParseResult | undefined {
+    const row = this.readDb
+      .prepare(
+        `
+        SELECT payload_json
+        FROM parse_cache
+        WHERE language = ? AND file_path = ? AND content_hash = ?
+        `
+      )
+      .get(language, filePath, hash) as { payload_json: string } | undefined;
+    if (!row) {
+      return undefined;
+    }
+    return fromJson<CachedParseResult>(row.payload_json);
+  }
+
+  setCachedParseResult(language: string, filePath: string, hash: string, payload: CachedParseResult, updatedAt: string): void {
+    this.prepareCached(
+      "upsert-parse-cache",
+      `
+      INSERT INTO parse_cache(language, file_path, content_hash, payload_json, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(language, file_path, content_hash) DO UPDATE SET
+        payload_json = excluded.payload_json,
+        updated_at = excluded.updated_at
+      `
+    )
+      .run(language, filePath, hash, toJson(payload), updatedAt);
   }
 
   private rowToEntity(row: Record<string, unknown>): Entity {

@@ -456,6 +456,28 @@ describe("indexer", () => {
     expect(summary.telemetry?.parserSourceCounts.regex).toBe(1);
   });
 
+  it("reuses cached parse payloads after AST data is cleared", async () => {
+    class CountingAdapter extends MockAdapter {
+      calls = 0;
+
+      override async parseFile(filePath: string): Promise<ParseResult> {
+        this.calls += 1;
+        return super.parseFile(filePath);
+      }
+    }
+
+    const adapter = new CountingAdapter();
+    await indexRepository(db, [adapter], { rootDir: tempDir, full: true }, DEFAULT_CONFIG);
+    expect(adapter.calls).toBe(1);
+
+    db.clearAstDataForPath("src/a.ts");
+    db.removeFileHash("src/a.ts");
+
+    await indexRepository(db, [adapter], { rootDir: tempDir, full: true }, DEFAULT_CONFIG);
+    expect(adapter.calls).toBe(1);
+    expect(db.getEntity(buildUid("function", "src/a.ts", "demo"))).toBeDefined();
+  });
+
   it("resumes full indexing from the last completed checkpoint batch", async () => {
     for (let index = 0; index < 40; index += 1) {
       fs.writeFileSync(path.join(tempDir, "src", `file-${index}.ts`), `export const value${index} = ${index};\n`, "utf8");
