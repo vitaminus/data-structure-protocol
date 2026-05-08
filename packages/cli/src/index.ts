@@ -881,6 +881,24 @@ program
   });
 
 program
+  .command("doctor")
+  .argument("[rootDir]", "root directory", ".")
+  .option("--deep", "include graph validation in the report", false)
+  .option("--json", "machine-readable output", false)
+  .action((rootDir: string, options: { deep: boolean; json: boolean }) => {
+    const services = openDSP(path.resolve(rootDir), adapters());
+    try {
+      const report = {
+        db: services.db.doctor(),
+        ...(options.deep ? { validation: runValidate(services) } : {})
+      };
+      printOutput(report, options.json);
+    } finally {
+      services.db.close();
+    }
+  });
+
+program
   .command("repair")
   .argument("[rootDir]", "root directory", ".")
   .option("--dry-run", "show planned repairs without writing", false)

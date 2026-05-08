@@ -238,6 +238,31 @@ describe("DSPDatabase", () => {
     );
   });
 
+  it("reports database integrity and orphaned records", () => {
+    const sqlite = new Database(db.dbPath);
+    sqlite
+      .prepare(
+        "INSERT INTO embeddings(uid, content_hash, vector_json, provider, updated_at) VALUES (?, ?, ?, ?, ?)"
+      )
+      .run("missing:entity", "hash", "[1,2,3]", "test", stableNowIso());
+    sqlite
+      .prepare(
+        "INSERT INTO unresolved_references(path, from_uid, symbol, kind, reason, confidence, created_at, resolved) VALUES (?, ?, ?, ?, ?, ?, ?, 0)"
+      )
+      .run("src/missing.ts", null, "GhostType", "type", null, 0.5, stableNowIso());
+    sqlite
+      .prepare("INSERT INTO file_hashes(path, content_hash, indexed_at) VALUES (?, ?, ?)")
+      .run("src/missing.ts", "hash", stableNowIso());
+    sqlite.close();
+
+    const report = db.doctor();
+
+    expect(report.integrity.ok).toBe(true);
+    expect(report.orphanedEmbeddings).toContain("missing:entity");
+    expect(report.orphanedFileHashes).toContain("src/missing.ts");
+    expect(report.danglingUnresolvedPaths).toContain("src/missing.ts");
+  });
+
   it("indexes entities into SQLite FTS for lexical candidate lookup", () => {
     const now = stableNowIso();
     const uid = buildUid("function", "src/users.ts", "createUser");

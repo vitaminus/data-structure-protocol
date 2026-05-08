@@ -132,6 +132,18 @@ export type StoredCheckpoint = {
   createdAt: string;
 };
 
+export type DatabaseDoctorReport = {
+  integrity: {
+    ok: boolean;
+    rows: string[];
+  };
+  orphanedFileHashes: string[];
+  orphanedEmbeddings: string[];
+  danglingUnresolvedPaths: string[];
+  runningIndexRuns: number;
+  checkpoints: number;
+};
+
 export type EntitySearchCandidates = {
   uids: string[];
   candidatesScanned: number;
@@ -439,6 +451,74 @@ export class DSPDatabase {
 
   clearCheckpoint(name: string): void {
     this.withBusyRetry(() => this.prepareCached("clear-checkpoint", "DELETE FROM checkpoints WHERE name = ?").run(name));
+  }
+
+  integrityCheck(): { ok: boolean; rows: string[] } {
+    const rows = this.readDb.prepare("PRAGMA integrity_check").all() as { integrity_check: string }[];
+    const values = rows.map((row) => row.integrity_check);
+    return {
+      ok: values.length === 1 && values[0] === "ok",
+      rows: values
+    };
+  }
+
+  doctor(limit = 100): DatabaseDoctorReport {
+    const integrity = this.integrityCheck();
+    const orphanedFileHashes = this.readDb
+      .prepare(
+        `
+        SELECT file_hashes.path
+        FROM file_hashes
+        LEFT JOIN entities ON entities.uid = ('file:' || file_hashes.path)
+        WHERE entities.uid IS NULL
+        ORDER BY file_hashes.path
+        LIMIT ?
+        `
+      )
+      .all(limit) as { path: string }[];
+    const orphanedEmbeddings = this.readDb
+      .prepare(
+        `
+        SELECT embeddings.uid
+        FROM embeddings
+        LEFT JOIN entities ON entities.uid = embeddings.uid
+        WHERE entities.uid IS NULL
+        ORDER BY embeddings.uid
+        LIMIT ?
+        `
+      )
+      .all(limit) as { uid: string }[];
+    const danglingUnresolvedPaths = this.readDb
+      .prepare(
+        `
+        SELECT DISTINCT unresolved_references.path
+        FROM unresolved_references
+        LEFT JOIN entities ON entities.uid = ('file:' || unresolved_references.path)
+        WHERE unresolved_references.resolved = 0
+          AND entities.uid IS NULL
+        ORDER BY unresolved_references.path
+        LIMIT ?
+        `
+      )
+      .all(limit) as { path: string }[];
+    const runningIndexRuns = (
+      this.readDb.prepare("SELECT COUNT(*) AS count FROM index_runs WHERE status = 'running'").get() as {
+        count: number;
+      }
+    ).count;
+    const checkpoints = (
+      this.readDb.prepare("SELECT COUNT(*) AS count FROM checkpoints").get() as {
+        count: number;
+      }
+    ).count;
+    return {
+      integrity,
+      orphanedFileHashes: orphanedFileHashes.map((row) => row.path),
+      orphanedEmbeddings: orphanedEmbeddings.map((row) => row.uid),
+      danglingUnresolvedPaths: danglingUnresolvedPaths.map((row) => row.path),
+      runningIndexRuns,
+      checkpoints
+    };
   }
 
   private rowToEntity(row: Record<string, unknown>): Entity {

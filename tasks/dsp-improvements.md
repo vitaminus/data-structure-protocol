@@ -631,3 +631,11 @@ Status: done
 - Open a dedicated readonly SQLite handle for graph reads while keeping writes on the primary WAL connection.
 - Route hot query paths through the readonly statement cache so long-running reads stop contending with index writes as much as possible.
 - Add `busy_timeout` and a bounded retry policy around index-run and checkpoint mutations so transient writer contention fails less often.
+
+### 78. Add a deep database doctor command
+
+Status: done
+
+- Expose a `doctor` report that checks SQLite integrity plus orphaned file hashes, embeddings, unresolved paths, and lingering checkpoints/runs.
+- Surface the report through the CLI so reliability debugging does not require ad hoc SQL.
+- Keep an optional deep mode that layers full graph validation on top of the low-level DB health report.
