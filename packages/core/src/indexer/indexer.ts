@@ -222,20 +222,42 @@ function pathCandidates(targetRelPath: string, fromRelPath?: string): string[] {
   return [...new Set(candidates)];
 }
 
+function buildPathResolutionIndex(availableRelPaths: Iterable<string>): Map<string, string> {
+  const index = new Map<string, string>();
+  for (const relPath of availableRelPaths) {
+    const normalized = normalizePath(relPath);
+    index.set(normalized, normalized);
+
+    const extension = path.posix.extname(normalized);
+    if (extension) {
+      index.set(normalized.slice(0, -extension.length), normalized);
+    }
+    if (/\/index\.[^.]+$/.test(normalized)) {
+      const withoutIndex = normalized.replace(/\/index\.[^.]+$/, "");
+      index.set(withoutIndex, normalized);
+    }
+    if (normalized.endsWith("/mod.rs")) {
+      index.set(normalized.slice(0, -"/mod.rs".length), normalized);
+    }
+  }
+  return index;
+}
+
 function canonicalFilePath(
   targetRelPath: string,
   fromRelPath: string | undefined,
   scanRoot: string,
-  resolutionCache: Map<string, string | undefined>
+  resolutionCache: Map<string, string | undefined>,
+  pathIndex: Map<string, string>
 ): string | undefined {
   const cacheKey = `${fromRelPath ?? ""}\0${targetRelPath}`;
   const cached = resolutionCache.get(cacheKey);
   if (resolutionCache.has(cacheKey)) {
     return cached;
   }
-  const resolved = pathCandidates(targetRelPath, fromRelPath).find((candidate) =>
-    existsSync(path.resolve(scanRoot, candidate))
-  );
+  const candidates = pathCandidates(targetRelPath, fromRelPath);
+  const resolvedFromIndex = candidates.map((candidate) => pathIndex.get(candidate)).find(Boolean);
+  const resolved = resolvedFromIndex ?? candidates.find((candidate) => existsSync(path.resolve(scanRoot, candidate)));
   resolutionCache.set(cacheKey, resolved);
   return resolved;
 }
@@ -243,7 +265,8 @@ function canonicalFilePath(
 function canonicalizeFileRelations(
   relations: Relation[],
   scanRoot: string,
-  resolutionCache: Map<string, string | undefined>
+  resolutionCache: Map<string, string | undefined>,
+  pathIndex: Map<string, string>
 ): Relation[] {
   return relations.map((relation) => {
     const targetRelPath = filePathFromFileUid(relation.to);
@@ -251,7 +274,7 @@ function canonicalizeFileRelations(
       return relation;
     }
     const fromRelPath = filePathFromFileUid(relation.from);
-    const resolvedPath = canonicalFilePath(targetRelPath, fromRelPath, scanRoot, resolutionCache);
+    const resolvedPath = canonicalFilePath(targetRelPath, fromRelPath, scanRoot, resolutionCache, pathIndex);
     if (!resolvedPath || resolvedPath === targetRelPath) {
       return relation;
     }
@@ -365,6 +388,7 @@ async function parseOne(
   adapters: LanguageAdapter[],
   cachedHash: FileHashEntry | undefined,
   resolutionCache: Map<string, string | undefined>,
+  pathIndex: Map<string, string>,
   full: boolean,
   workerPool?: ParseWorkerPool
 ): Promise<ParseOneResult> {
@@ -422,7 +446,8 @@ async function parseOne(
   const extractedRelations = canonicalizeFileRelations(
     persistedRelationsForFile(fileNode.uid, extracted.relations),
     scanRoot,
-    resolutionCache
+    resolutionCache,
+    pathIndex
   );
   const unresolved = parsed.unresolvedReferences ?? [];
   const allEntities = [fileNode, ...directories, ...(testNode ? [testNode] : []), ...extractedEntities];
@@ -608,6 +633,7 @@ export async function indexRepository(
     }
 
     const activeSelectedRelPaths = selectedFiles.map((absPath) => normalizePath(path.relative(scanRoot, absPath)));
+    const pathIndex = buildPathResolutionIndex(new Set([...db.listFilesInHashTable(), ...activeSelectedRelPaths]));
     const knownHashes = db.getFileHashEntries(activeSelectedRelPaths);
 
     const parsedResults = await (async () => {
@@ -623,6 +649,7 @@ export async function indexRepository(
               adapters,
               knownHashes.get(activeSelectedRelPaths[index]!),
               resolutionCache,
+              pathIndex,
               request.full ?? false,
               parsePool
             )

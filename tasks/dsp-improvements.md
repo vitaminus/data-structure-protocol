@@ -663,3 +663,11 @@ Status: done
 - Persist parsed payloads by language, file path, and content hash so AST data can be rebuilt without reparsing unchanged files.
 - Consult the parse cache after hashing but before parser execution, then repopulate the graph from the cached payload when it is still valid.
 - Keep a regression test that clears AST state and proves the second rebuild avoids another adapter parse call.
+
+### 82. Build an in-memory import-resolution path index
+
+Status: done
+
+- Construct a path-resolution index from known file paths so extensionless and index-style imports resolve from memory before hitting the filesystem.
+- Feed the index into canonical import rewriting during parsing while keeping `existsSync` as a fallback for uncached edge cases.
+- Reuse the existing import canonicalization tests to guard the new fast path without changing outward behavior.
