@@ -6,7 +6,7 @@ import { DEFAULT_CONFIG } from "./config/types.ts";
 import type { DSPServices } from "./api.ts";
 import { runSearch } from "./api.ts";
 import type { EmbeddingProvider } from "./graph/types.ts";
-import { buildUid, stableNowIso } from "./graph/uid.ts";
+import { buildUid, contentHash, stableNowIso } from "./graph/uid.ts";
 import { DSPDatabase } from "./storage/db.ts";
 
 class KeywordEmbeddingProvider implements EmbeddingProvider {
@@ -63,6 +63,14 @@ describe("api", () => {
   }
 
   it("uses configured embeddings for search unless explicitly disabled", async () => {
+    const semanticText = ["settleInvoice", "", "payment settlement", ""].join("\n");
+    db.setEmbedding(
+      buildUid("function", "src/checkout.ts", "settleInvoice"),
+      contentHash(semanticText),
+      await services().embeddingProvider!.embed(semanticText),
+      services().embeddingProvider!.cacheKey!(),
+      stableNowIso()
+    );
     const semanticResults = await runSearch(services(), "billing", { topK: 3 });
     expect(semanticResults.map((result) => result.uid)).toContain(
       buildUid("function", "src/checkout.ts", "settleInvoice")

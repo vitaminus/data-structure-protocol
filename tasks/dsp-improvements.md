@@ -719,3 +719,11 @@ Status: done
 - Add an index memory budget setting and chunk parse work into byte-bounded windows instead of holding every parsed result in memory at once.
 - Reuse the same checkpointing and write-batch logic inside each memory window so reliability stays intact while RSS stays flatter.
 - Cover the new chunking helper with a regression test that proves byte budgets split work deterministically.
+
+### 89. Remove inline entity embedding work from request paths
+
+Status: done
+
+- Stop `semanticSearch` and context-pack reranking from generating and writing missing entity embeddings inline during user-facing requests.
+- Reuse only precomputed provider-matching embeddings for semantic scoring, and fall back to lexical/graph ranking when fresh vectors are not available yet.
+- Add nearest stored-embedding ranking in the DB layer so semantic candidate selection stays off the write path.

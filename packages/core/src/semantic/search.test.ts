@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DSPDatabase } from "../storage/db.ts";
-import { buildUid, stableNowIso } from "../graph/uid.ts";
+import { buildUid, contentHash, stableNowIso } from "../graph/uid.ts";
 import { semanticSearch } from "./search.ts";
 import type { EmbeddingProvider } from "../graph/types.ts";
 
@@ -43,6 +43,16 @@ class OppositeVectorProvider implements EmbeddingProvider {
   async embed(text: string): Promise<number[]> {
     return text.trim().toLowerCase() === "auth" ? [1, 0] : [-1, 0];
   }
+}
+
+async function seedEmbedding(
+  db: DSPDatabase,
+  provider: EmbeddingProvider,
+  uid: string,
+  text: string
+): Promise<void> {
+  const providerKey = provider.cacheKey?.() ?? provider.constructor.name;
+  db.setEmbedding(uid, contentHash(text), await provider.embed(text), providerKey, stableNowIso());
 }
 
 describe("semantic search", () => {
@@ -127,7 +137,7 @@ describe("semantic search", () => {
     expect(results.find((result) => result.uid === login)?.explanation).toContain("neighbors=");
   });
 
-  it("invalidates cached embeddings when the provider cache key changes", async () => {
+  it("does not reuse embeddings from a different provider cache key", async () => {
     const now = stableNowIso();
     const uid = buildUid("function", "src/auth.ts", "login");
     db.upsertEntity({
@@ -143,14 +153,15 @@ describe("semantic search", () => {
     });
 
     const first = new CountingProvider("mock:v1");
-    await semanticSearch(db, "auth token", { embeddingsEnabled: true, provider: first });
+    await seedEmbedding(db, first, uid, ["login", "", "auth token validation", ""].join("\n"));
     expect(db.getEmbedding(uid)?.provider).toBe("mock:v1");
 
     const second = new CountingProvider("mock:v2");
-    await semanticSearch(db, "auth token", { embeddingsEnabled: true, provider: second });
+    const results = await semanticSearch(db, "signin", { embeddingsEnabled: true, provider: second });
 
-    expect(second.calls).toBeGreaterThan(1);
-    expect(db.getEmbedding(uid)?.provider).toBe("mock:v2");
+    expect(second.calls).toBe(1);
+    expect(results).toEqual([]);
+    expect(db.getEmbedding(uid)?.provider).toBe("mock:v1");
   });
 
   it("finds embedding-only matches when lexical FTS has no candidates", async () => {
@@ -182,6 +193,9 @@ describe("semantic search", () => {
 
     expect(db.searchEntityUids("signin", 10)).toEqual([]);
 
+    await seedEmbedding(db, new SynonymProvider(), loginUid, ["login", "", "password session entrypoint", ""].join("\n"));
+    await seedEmbedding(db, new SynonymProvider(), billingUid, ["chargeCard", "", "payment capture", ""].join("\n"));
+
     const results = await semanticSearch(db, "signin", {
       topK: 2,
       embeddingsEnabled: true,
@@ -205,6 +219,8 @@ describe("semantic search", () => {
       createdAt: now,
       updatedAt: now
     });
+
+    await seedEmbedding(db, new OppositeVectorProvider(), uid, ["validateToken", "", "auth token validation", ""].join("\n"));
 
     const results = await semanticSearch(db, "auth", {
       topK: 1,

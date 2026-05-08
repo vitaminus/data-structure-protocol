@@ -67,6 +67,24 @@ function searchableText(value: string | undefined): string {
     .toLowerCase();
 }
 
+function cosineSimilarity(a: number[], b: number[]): number {
+  if (a.length === 0 || b.length === 0 || a.length !== b.length) {
+    return 0;
+  }
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let index = 0; index < a.length; index += 1) {
+    dot += a[index]! * b[index]!;
+    normA += a[index]! * a[index]!;
+    normB += b[index]! * b[index]!;
+  }
+  if (normA === 0 || normB === 0) {
+    return 0;
+  }
+  return dot / Math.sqrt(normA * normB);
+}
+
 function chunks<T>(items: T[], chunkSize = SQLITE_LIST_CHUNK_SIZE): T[][] {
   const result: T[][] = [];
   for (let index = 0; index < items.length; index += chunkSize) {
@@ -104,6 +122,10 @@ export type StoredEmbedding = {
   hash: string;
   vector: number[];
   provider: string;
+};
+
+export type RankedEmbedding = StoredEmbedding & {
+  score: number;
 };
 
 export type FileHashEntry = {
@@ -1829,6 +1851,23 @@ export class DSPDatabase {
       vector: fromJson<number[]>(row.vector_json),
       provider: row.provider
     }));
+  }
+
+  nearestEmbeddingsByProvider(
+    provider: string,
+    queryVector: number[],
+    options: { topK?: number; scanLimit?: number } = {}
+  ): RankedEmbedding[] {
+    const topK = options.topK ?? 100;
+    const scanLimit = options.scanLimit ?? Math.max(topK * 20, 2000);
+    return this.getEmbeddingsByProvider(provider, scanLimit)
+      .map((embedding) => ({
+        ...embedding,
+        score: Math.max(0, cosineSimilarity(queryVector, embedding.vector))
+      }))
+      .filter((embedding) => embedding.score > 0)
+      .sort((left, right) => right.score - left.score)
+      .slice(0, topK);
   }
 
   cacheStats(): {

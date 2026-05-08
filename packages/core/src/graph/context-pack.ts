@@ -395,13 +395,10 @@ async function rerankContextEntities(
       const vector =
         stored && stored.hash === hash && stored.provider === providerKey
           ? stored.vector
-          : await provider.embed(semanticText);
-      if (!stored || stored.hash !== hash || stored.provider !== providerKey) {
-        db.setEmbedding(entity.uid, hash, vector, providerKey, new Date().toISOString());
-      }
+          : undefined;
       const lexicalGraphScore = searchScores.get(entity.uid) ?? 0;
       const graphScore = graphScores.get(entity.uid) ?? 0;
-      const semanticScore = Math.max(0, cosineSimilarity(queryVector, vector));
+      const semanticScore = vector ? Math.max(0, cosineSimilarity(queryVector, vector)) : 0;
       const score = lexicalGraphScore * 0.45 + graphScore * 0.2 + semanticScore * 0.35;
       return {
         entity: {
