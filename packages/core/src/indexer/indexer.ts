@@ -301,12 +301,17 @@ function persistedRelationsForFile(fileUid: string, relations: Relation[]): Rela
   return relations.filter((relation) => !(relation.kind === "contains" && relation.from === fileUid));
 }
 
-function parseWorkerPoolFor(adapters: LanguageAdapter[], parallelism: number): ParseWorkerPool | undefined {
+function parseWorkerPoolFor(adapters: LanguageAdapter[], config: DSPConfig["performance"]): ParseWorkerPool | undefined {
+  const parallelism = config.parallelism;
   if (parallelism <= 1 || !adapters.some((adapter) => adapter.worker)) {
     return undefined;
   }
   const useTsxLoader = adapters.some((adapter) => /\.tsx?$/.test(adapter.worker?.moduleUrl ?? ""));
-  return new ParseWorkerPool(parallelism, useTsxLoader);
+  return new ParseWorkerPool(parallelism, useTsxLoader, {
+    timeoutMs: config.workerTimeoutMs,
+    maxInputBytes: config.workerMaxInputKb * 1024,
+    maxJobsPerWorker: config.workerMaxJobsPerWorker
+  });
 }
 
 function chunkItems<T>(items: T[], chunkSize: number): T[][] {
@@ -459,7 +464,7 @@ export async function indexRepository(
   let lowConfidenceCount = 0;
   const resolutionCache = new Map<string, string | undefined>();
   const directoryEntityUids = new Set<string>();
-  const parsePool = parseWorkerPoolFor(adapters, config.performance.parallelism);
+  const parsePool = parseWorkerPoolFor(adapters, config.performance);
 
   try {
     const requestedFiles = request.files?.map((file) => path.resolve(scanRoot, file));

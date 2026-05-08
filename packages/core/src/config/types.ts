@@ -3,6 +3,9 @@ export type DSPPerformanceConfig = {
   lazyIndexing: boolean;
   parallelism: number;
   maxFileSizeKb: number;
+  workerTimeoutMs: number;
+  workerMaxInputKb: number;
+  workerMaxJobsPerWorker: number;
   exclude: string[];
 };
 
@@ -34,6 +37,9 @@ export const DEFAULT_CONFIG: DSPConfig = {
     lazyIndexing: false,
     parallelism: 8,
     maxFileSizeKb: 512,
+    workerTimeoutMs: 15000,
+    workerMaxInputKb: 2048,
+    workerMaxJobsPerWorker: 200,
     exclude: DEFAULT_EXCLUDES
   },
   embeddings: {

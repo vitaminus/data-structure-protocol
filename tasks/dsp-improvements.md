@@ -639,3 +639,11 @@ Status: done
 - Expose a `doctor` report that checks SQLite integrity plus orphaned file hashes, embeddings, unresolved paths, and lingering checkpoints/runs.
 - Surface the report through the CLI so reliability debugging does not require ad hoc SQL.
 - Keep an optional deep mode that layers full graph validation on top of the low-level DB health report.
+
+### 79. Add worker-pool guardrails for parsing
+
+Status: done
+
+- Add parser worker timeouts, maximum input-size checks, and worker recycling after a configurable number of jobs.
+- Thread the guardrail settings through the performance config so large repos can tune them without code changes.
+- Verify that timed-out workers restart cleanly and that oversized files fail fast before they pressure the worker pool.

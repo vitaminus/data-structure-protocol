@@ -13,6 +13,8 @@ type ParseJob = {
 type WorkerSlot = {
   worker: Worker;
   currentJobId?: number;
+  jobsCompleted: number;
+  currentTimeout?: NodeJS.Timeout;
 };
 
 type WorkerReply =
@@ -83,15 +85,29 @@ function toError(payload: { name?: string; message: string; stack?: string }): E
 export class ParseWorkerPool {
   private readonly size: number;
   private readonly useTsxLoader: boolean;
+  private readonly timeoutMs: number;
+  private readonly maxInputBytes: number;
+  private readonly maxJobsPerWorker: number;
   private readonly slots: WorkerSlot[] = [];
   private readonly pendingJobs = new Map<number, ParseJob>();
   private readonly queue: ParseJob[] = [];
   private nextJobId = 1;
   private closing = false;
 
-  constructor(size: number, useTsxLoader: boolean) {
+  constructor(
+    size: number,
+    useTsxLoader: boolean,
+    options: {
+      timeoutMs?: number;
+      maxInputBytes?: number;
+      maxJobsPerWorker?: number;
+    } = {}
+  ) {
     this.size = Math.max(0, size);
     this.useTsxLoader = useTsxLoader;
+    this.timeoutMs = Math.max(1000, options.timeoutMs ?? 15000);
+    this.maxInputBytes = Math.max(16 * 1024, options.maxInputBytes ?? 2 * 1024 * 1024);
+    this.maxJobsPerWorker = Math.max(1, options.maxJobsPerWorker ?? 200);
     for (let index = 0; index < this.size; index += 1) {
       this.slots.push(this.createSlot());
     }
@@ -103,6 +119,11 @@ export class ParseWorkerPool {
 
   run(spec: LanguageAdapterWorkerSpec, filePath: string, content: string): Promise<ParseResult> {
     return new Promise<ParseResult>((resolve, reject) => {
+      const inputBytes = Buffer.byteLength(content, "utf8");
+      if (inputBytes > this.maxInputBytes) {
+        reject(new Error(`Parse worker input too large for ${filePath}: ${inputBytes} bytes`));
+        return;
+      }
       const job: ParseJob = {
         id: this.nextJobId++,
         spec,
@@ -132,19 +153,28 @@ export class ParseWorkerPool {
     const worker = new Worker(new URL(`data:text/javascript,${encodeURIComponent(WORKER_SOURCE)}`), {
       execArgv: this.useTsxLoader ? ["--import", "tsx"] : undefined
     });
-    const slot: WorkerSlot = { worker };
+    const slot: WorkerSlot = { worker, jobsCompleted: 0 };
     worker.on("message", (reply: WorkerReply) => {
       const job = this.pendingJobs.get(reply.jobId);
+      if (slot.currentTimeout) {
+        clearTimeout(slot.currentTimeout);
+        slot.currentTimeout = undefined;
+      }
       if (!job) {
         slot.currentJobId = undefined;
         return;
       }
       this.pendingJobs.delete(reply.jobId);
       slot.currentJobId = undefined;
+      slot.jobsCompleted += 1;
       if ("error" in reply) {
         job.reject(toError(reply.error));
       } else {
         job.resolve(reply.result);
+      }
+      if (!this.closing && slot.jobsCompleted >= this.maxJobsPerWorker) {
+        this.recycleSlot(slot);
+        return;
       }
       this.dispatch();
     });
@@ -161,6 +191,10 @@ export class ParseWorkerPool {
 
   private failSlot(slot: WorkerSlot, error: Error): void {
     const currentJobId = slot.currentJobId;
+    if (slot.currentTimeout) {
+      clearTimeout(slot.currentTimeout);
+      slot.currentTimeout = undefined;
+    }
     slot.currentJobId = undefined;
     if (currentJobId !== undefined) {
       const job = this.pendingJobs.get(currentJobId);
@@ -179,6 +213,19 @@ export class ParseWorkerPool {
     this.dispatch();
   }
 
+  private recycleSlot(slot: WorkerSlot): void {
+    if (this.closing) {
+      return;
+    }
+    const slotIndex = this.slots.indexOf(slot);
+    if (slotIndex === -1) {
+      return;
+    }
+    slot.worker.terminate().catch(() => undefined);
+    this.slots.splice(slotIndex, 1, this.createSlot());
+    this.dispatch();
+  }
+
   private dispatch(): void {
     if (this.closing || this.queue.length === 0) {
       return;
@@ -193,6 +240,10 @@ export class ParseWorkerPool {
       const job = this.queue.shift()!;
       slot.currentJobId = job.id;
       this.pendingJobs.set(job.id, job);
+      slot.currentTimeout = setTimeout(() => {
+        this.failSlot(slot, new Error(`Parse worker timed out after ${this.timeoutMs}ms for ${job.filePath}`));
+        slot.worker.terminate().catch(() => undefined);
+      }, this.timeoutMs);
       slot.worker.postMessage({
         jobId: job.id,
         moduleUrl: job.spec.moduleUrl,
