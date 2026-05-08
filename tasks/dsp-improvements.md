@@ -767,3 +767,11 @@ Status: done
 - Run embeddings refreshes with bounded concurrency instead of strict one-by-one provider calls.
 - Add retry-with-backoff for transient provider failures so long refresh jobs are less brittle.
 - Expose concurrency and retry knobs in the CLI while reusing the normal cache-maintenance path after the refresh completes.
+
+### 95. Use a cheaper git fingerprint for discovery invalidation
+
+Status: done
+
+- Replace the full porcelain-status fingerprint with a lighter key built from HEAD, git-index metadata, and a compact dirty-path listing.
+- Keep discovery-manifest invalidation sensitive to untracked and modified paths without forcing a full `git status` walk on every clean scan.
+- Add a focused regression test around the new fingerprint shape so future changes do not quietly reintroduce the heavier status command.
