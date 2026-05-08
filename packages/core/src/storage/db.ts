@@ -19,6 +19,9 @@ const SQLITE_CACHE_SIZE_KB = 32 * 1024;
 const SQLITE_MMAP_SIZE_BYTES = 256 * 1024 * 1024;
 const SQLITE_BUSY_TIMEOUT_MS = 5000;
 const SQLITE_BUSY_RETRIES = 4;
+const PARSE_CACHE_MAX_ROWS = 20000;
+const PARSE_CACHE_MAX_AGE_DAYS = 30;
+const SQLITE_VACUUM_FREELIST_THRESHOLD = 2000;
 
 function toJson(value: unknown): string {
   return JSON.stringify(value ?? null);
@@ -164,6 +167,13 @@ export type DatabaseDoctorReport = {
   danglingUnresolvedPaths: string[];
   runningIndexRuns: number;
   checkpoints: number;
+  parseCache: {
+    entries: number;
+    stalePaths: string[];
+  };
+  maintenance: {
+    freelistPages: number;
+  };
 };
 
 export type CachedParseResult = {
@@ -420,6 +430,43 @@ export class DSPDatabase {
     this.db.pragma("optimize");
   }
 
+  maintainCaches(options: { maxEntries?: number; maxAgeDays?: number; vacuumFreelistThreshold?: number } = {}): void {
+    const maxEntries = Math.max(0, options.maxEntries ?? PARSE_CACHE_MAX_ROWS);
+    const maxAgeDays = Math.max(0, options.maxAgeDays ?? PARSE_CACHE_MAX_AGE_DAYS);
+    const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000).toISOString();
+    this.withBusyRetry(() => {
+      if (maxAgeDays > 0) {
+        this.prepareCached("prune-parse-cache-by-age", "DELETE FROM parse_cache WHERE updated_at < ?").run(cutoff);
+      }
+      const row = this.prepareCached("count-parse-cache", "SELECT COUNT(*) AS count FROM parse_cache").get() as {
+        count: number;
+      };
+      if (maxEntries > 0 && row.count > maxEntries) {
+        this.db
+          .prepare(
+            `
+            DELETE FROM parse_cache
+            WHERE rowid IN (
+              SELECT rowid
+              FROM parse_cache
+              ORDER BY updated_at ASC
+              LIMIT ?
+            )
+            `
+          )
+          .run(row.count - maxEntries);
+      }
+      this.db.pragma("wal_checkpoint(PASSIVE)");
+      this.optimize();
+      const freelistPages = (
+        this.db.prepare("PRAGMA freelist_count").get() as { freelist_count?: number; count?: number } | undefined
+      )?.freelist_count ?? 0;
+      if (freelistPages >= (options.vacuumFreelistThreshold ?? SQLITE_VACUUM_FREELIST_THRESHOLD)) {
+        this.db.exec("VACUUM");
+      }
+    });
+  }
+
   transaction<T>(fn: () => T): T {
     return this.withBusyRetry(() => this.db.transaction(fn)());
   }
@@ -548,13 +595,40 @@ export class DSPDatabase {
         count: number;
       }
     ).count;
+    const parseCacheEntries = (
+      this.readDb.prepare("SELECT COUNT(*) AS count FROM parse_cache").get() as {
+        count: number;
+      }
+    ).count;
+    const staleParseCachePaths = this.readDb
+      .prepare(
+        `
+        SELECT DISTINCT parse_cache.file_path
+        FROM parse_cache
+        LEFT JOIN file_hashes ON file_hashes.path = parse_cache.file_path
+        WHERE file_hashes.path IS NULL
+        ORDER BY parse_cache.file_path
+        LIMIT ?
+        `
+      )
+      .all(limit) as { file_path: string }[];
+    const freelistPages = (
+      this.readDb.prepare("PRAGMA freelist_count").get() as { freelist_count?: number; count?: number } | undefined
+    )?.freelist_count ?? 0;
     return {
       integrity,
       orphanedFileHashes: orphanedFileHashes.map((row) => row.path),
       orphanedEmbeddings: orphanedEmbeddings.map((row) => row.uid),
       danglingUnresolvedPaths: danglingUnresolvedPaths.map((row) => row.path),
       runningIndexRuns,
-      checkpoints
+      checkpoints,
+      parseCache: {
+        entries: parseCacheEntries,
+        stalePaths: staleParseCachePaths.map((row) => row.file_path)
+      },
+      maintenance: {
+        freelistPages
+      }
     };
   }
 
@@ -1916,6 +1990,7 @@ export class DSPDatabase {
     fileHashes: number;
     embeddings: number;
     unresolvedReferences: number;
+    parseCache: number;
   } {
     const fileHashes = (this.db.prepare("SELECT COUNT(*) as count FROM file_hashes").get() as { count: number })
       .count;
@@ -1926,7 +2001,9 @@ export class DSPDatabase {
         count: number;
       }
     ).count;
-    return { fileHashes, embeddings, unresolvedReferences };
+    const parseCache = (this.db.prepare("SELECT COUNT(*) as count FROM parse_cache").get() as { count: number })
+      .count;
+    return { fileHashes, embeddings, unresolvedReferences, parseCache };
   }
 
   embeddingStats(): EmbeddingStats {
@@ -1950,6 +2027,8 @@ export class DSPDatabase {
     this.db.exec(`
       DELETE FROM embeddings;
       DELETE FROM file_hashes;
+      DELETE FROM parse_cache;
     `);
+    this.maintainCaches({ maxEntries: 0, maxAgeDays: 0, vacuumFreelistThreshold: 0 });
   }
 }

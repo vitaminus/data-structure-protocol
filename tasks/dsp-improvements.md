@@ -751,3 +751,11 @@ Status: done
 - Rewrite JSONL and DSP text exports to write rows incrementally instead of materializing the entire graph into arrays first.
 - Rework protocol export bookkeeping around iterator-driven maps so entity and relation passes stay linear without snapshot copies.
 - Replace CLI orphan detection with a direct SQL query and switch cycle detection to a single adjacency build from ordered iterators.
+
+### 93. Add parse-cache lifecycle controls and DB maintenance
+
+Status: done
+
+- Track parse-cache volume in normal cache stats and `doctor`, including stale cache paths that no longer line up with indexed files.
+- Prune parse-cache rows by age and total row budget during maintenance, and run WAL checkpointing plus conditional `VACUUM` from the same path.
+- Make `clearCache()` actually clear `parse_cache` too so manual cache resets return the database to a clean state.

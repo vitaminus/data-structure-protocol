@@ -310,6 +310,11 @@ describe("DSPDatabase", () => {
     sqlite
       .prepare("INSERT INTO file_hashes(path, content_hash, indexed_at) VALUES (?, ?, ?)")
       .run("src/missing.ts", "hash", stableNowIso());
+    sqlite
+      .prepare(
+        "INSERT INTO parse_cache(language, file_path, content_hash, payload_json, updated_at) VALUES (?, ?, ?, ?, ?)"
+      )
+      .run("typescript", "src/ghost.ts", "hash", "{\"entities\":[],\"relations\":[],\"unresolvedReferences\":[]}", stableNowIso());
     sqlite.close();
 
     const report = db.doctor();
@@ -318,6 +323,26 @@ describe("DSPDatabase", () => {
     expect(report.orphanedEmbeddings).toContain("missing:entity");
     expect(report.orphanedFileHashes).toContain("src/missing.ts");
     expect(report.danglingUnresolvedPaths).toContain("src/missing.ts");
+    expect(report.parseCache.entries).toBe(1);
+    expect(report.parseCache.stalePaths).toContain("src/ghost.ts");
+    expect(report.maintenance.freelistPages).toBeGreaterThanOrEqual(0);
+  });
+
+  it("clears parse cache alongside other cache tables", () => {
+    const now = stableNowIso();
+    db.setEmbedding("uid:test", "hash", [1, 2, 3], "mock", now);
+    db.markFileHash("src/auth.ts", "hash", now, { mtimeMs: 1, sizeBytes: 2 });
+    db.setCachedParseResult("typescript", "src/auth.ts", "hash", {
+      entities: [],
+      relations: [],
+      unresolvedReferences: []
+    }, now);
+
+    expect(db.cacheStats()).toMatchObject({ embeddings: 1, fileHashes: 1, parseCache: 1 });
+
+    db.clearCache();
+
+    expect(db.cacheStats()).toMatchObject({ embeddings: 0, fileHashes: 0, parseCache: 0 });
   });
 
   it("indexes entities into SQLite FTS for lexical candidate lookup", () => {

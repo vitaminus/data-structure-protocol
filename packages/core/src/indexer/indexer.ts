@@ -826,6 +826,7 @@ export async function indexRepository(
         parserSourceCounts: Object.fromEntries([...parserSourceCounts.entries()].sort(([a], [b]) => a.localeCompare(b)))
       }
     };
+    db.maintainCaches();
     db.optimize();
     if (checkpointEligible) {
       db.clearCheckpoint(checkpointName);
