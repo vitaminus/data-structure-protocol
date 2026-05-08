@@ -615,3 +615,11 @@ Status: done
 - Refactor the benchmark harness into reusable shared code so smoke and soak runs exercise the same reindex path.
 - Make smoke benchmarks fail CI when they regress against the checked-in baseline instead of reporting best-effort artifacts only.
 - Add a separate scheduled and manually triggerable soak benchmark job that captures repeated warm-index and changed-only behavior over time.
+
+### 76. Add crash-safe checkpointing for long full-index runs
+
+Status: done
+
+- Persist resumable full-index checkpoints keyed by the discovered manifest so interrupted runs can continue from the last committed batch.
+- Track checkpoint progress only after successful batch writes so a resumed run never overcounts or skips unwritten files.
+- Clear stale checkpoints automatically when the file manifest changes or the full run completes successfully.

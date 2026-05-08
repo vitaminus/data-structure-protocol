@@ -113,6 +113,7 @@ export type FileHashEntry = {
 
 export type IndexedAstFile = {
   relPath: string;
+  language: string;
   hash: string;
   indexedAt: string;
   mtimeMs: number;
@@ -120,6 +121,13 @@ export type IndexedAstFile = {
   entities: Entity[];
   relations: Relation[];
   unresolved: UnresolvedReference[];
+};
+
+export type StoredCheckpoint = {
+  id: number;
+  name: string;
+  metadata: Record<string, unknown>;
+  createdAt: string;
 };
 
 export type EntitySearchCandidates = {
@@ -250,6 +258,7 @@ export class DSPDatabase {
       CREATE INDEX IF NOT EXISTS idx_relations_to_uid ON relations(to_uid);
       CREATE INDEX IF NOT EXISTS idx_relations_kind ON relations(kind);
       CREATE INDEX IF NOT EXISTS idx_unresolved_references_path ON unresolved_references(path);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoints_name ON checkpoints(name);
     `);
     this.migrate();
   }
@@ -339,6 +348,49 @@ export class DSPDatabase {
       "UPDATE index_runs SET status = ?, ended_at = ?, metadata_json = ? WHERE id = ?"
     )
       .run(status, endedAt, toJson(meta), runId);
+  }
+
+  updateRunProgress(runId: number, filesIndexed: number, filesSkipped: number, meta: unknown): void {
+    this.prepareCached(
+      "update-run-progress",
+      "UPDATE index_runs SET files_indexed = ?, files_skipped = ?, metadata_json = ? WHERE id = ?"
+    )
+      .run(filesIndexed, filesSkipped, toJson(meta), runId);
+  }
+
+  saveCheckpoint(name: string, createdAt: string, metadata: Record<string, unknown>): void {
+    this.prepareCached(
+      "save-checkpoint",
+      `
+      INSERT INTO checkpoints(name, metadata_json, created_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(name) DO UPDATE SET
+        metadata_json = excluded.metadata_json,
+        created_at = excluded.created_at
+      `
+    )
+      .run(name, toJson(metadata), createdAt);
+  }
+
+  getCheckpoint(name: string): StoredCheckpoint | undefined {
+    const row = this.prepareCached(
+      "get-checkpoint",
+      "SELECT id, name, metadata_json, created_at FROM checkpoints WHERE name = ?"
+    )
+      .get(name) as { id: number; name: string; metadata_json: string | null; created_at: string } | undefined;
+    if (!row) {
+      return undefined;
+    }
+    return {
+      id: row.id,
+      name: row.name,
+      metadata: fromJson<Record<string, unknown>>(row.metadata_json ?? "{}") ?? {},
+      createdAt: row.created_at
+    };
+  }
+
+  clearCheckpoint(name: string): void {
+    this.prepareCached("clear-checkpoint", "DELETE FROM checkpoints WHERE name = ?").run(name);
   }
 
   private rowToEntity(row: Record<string, unknown>): Entity {

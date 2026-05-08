@@ -424,4 +424,41 @@ describe("indexer", () => {
     expect(db.getEntity(buildUid("function", "src/a.ts", "demo"))).toBeDefined();
     expect(db.getFileHash("src/a.ts")).toBe(oldHash);
   });
+
+  it("resumes full indexing from the last completed checkpoint batch", async () => {
+    for (let index = 0; index < 40; index += 1) {
+      fs.writeFileSync(path.join(tempDir, "src", `file-${index}.ts`), `export const value${index} = ${index};\n`, "utf8");
+    }
+
+    const adapter = new MockAdapter();
+    const config = {
+      ...DEFAULT_CONFIG,
+      performance: { ...DEFAULT_CONFIG.performance, parallelism: 4 }
+    };
+    const originalReplaceAstFiles = db.replaceAstFiles.bind(db);
+    let replaceCalls = 0;
+    db.replaceAstFiles = ((files) => {
+      replaceCalls += 1;
+      if (replaceCalls === 2) {
+        throw new Error("simulated batch write failure");
+      }
+      originalReplaceAstFiles(files);
+    }) as typeof db.replaceAstFiles;
+
+    await expect(indexRepository(db, [adapter], { rootDir: tempDir, full: true }, config)).rejects.toThrow(
+      "simulated batch write failure"
+    );
+
+    const checkpoint = db.getCheckpoint(`index:${path.resolve(tempDir)}`);
+    expect(checkpoint?.metadata.manifestHash).toBeTruthy();
+    expect((checkpoint?.metadata.completedFiles as string[] | undefined)?.length).toBe(32);
+
+    db.replaceAstFiles = originalReplaceAstFiles;
+    const summary = await indexRepository(db, [adapter], { rootDir: tempDir, full: true }, config);
+
+    expect(summary.filesIndexed).toBe(41);
+    expect(db.getCheckpoint(`index:${path.resolve(tempDir)}`)).toBeUndefined();
+    expect(db.getEntity(buildUid("file", "src/file-0.ts"))).toBeDefined();
+    expect(db.getEntity(buildUid("file", "src/file-39.ts"))).toBeDefined();
+  });
 });

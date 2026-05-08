@@ -317,6 +317,18 @@ function chunkItems<T>(items: T[], chunkSize: number): T[][] {
   return chunks;
 }
 
+type CheckpointState = {
+  manifestHash: string;
+  completedFiles: string[];
+  filesIndexed: number;
+  filesSkipped: number;
+  languages: string[];
+  entities: number;
+  relations: number;
+  unresolvedReferences: number;
+  lowConfidenceRelations: number;
+};
+
 async function mapWithConcurrency<T, R>(
   items: T[],
   concurrency: number,
@@ -522,8 +534,47 @@ export async function indexRepository(
     }
 
     selectedFiles = selectedFiles.sort();
+    const checkpointName = `index:${scanRoot}`;
     const selectedRelPaths = selectedFiles.map((absPath) => normalizePath(path.relative(scanRoot, absPath)));
-    const knownHashes = db.getFileHashEntries(selectedRelPaths);
+    const checkpointEligible =
+      Boolean(request.full) &&
+      !requestedFiles?.length &&
+      !request.changedOnly &&
+      !request.fromGitDiff &&
+      !changedEntries;
+    const manifestHash = checkpointEligible ? contentHash(JSON.stringify(selectedRelPaths)) : undefined;
+    if (checkpointEligible && manifestHash) {
+      const checkpoint = db.getCheckpoint(checkpointName);
+      const checkpointMeta = checkpoint?.metadata as Partial<CheckpointState> | undefined;
+      if (checkpointMeta?.manifestHash === manifestHash) {
+        const completedFiles = new Set(
+          Array.isArray(checkpointMeta.completedFiles)
+            ? checkpointMeta.completedFiles.filter((value): value is string => typeof value === "string")
+            : []
+        );
+        if (completedFiles.size > 0) {
+          selectedFiles = selectedFiles.filter(
+            (absPath) => !completedFiles.has(normalizePath(path.relative(scanRoot, absPath)))
+          );
+          filesIndexed = Number(checkpointMeta.filesIndexed ?? 0);
+          filesSkipped = Number(checkpointMeta.filesSkipped ?? 0);
+          entityCount = Number(checkpointMeta.entities ?? 0);
+          relationCount = Number(checkpointMeta.relations ?? 0);
+          unresolvedCount = Number(checkpointMeta.unresolvedReferences ?? 0);
+          lowConfidenceCount = Number(checkpointMeta.lowConfidenceRelations ?? 0);
+          for (const language of checkpointMeta.languages ?? []) {
+            if (typeof language === "string") {
+              languageSet.add(language);
+            }
+          }
+        }
+      } else if (checkpoint) {
+        db.clearCheckpoint(checkpointName);
+      }
+    }
+
+    const activeSelectedRelPaths = selectedFiles.map((absPath) => normalizePath(path.relative(scanRoot, absPath)));
+    const knownHashes = db.getFileHashEntries(activeSelectedRelPaths);
 
     const parsedResults = await (async () => {
       try {
@@ -535,7 +586,7 @@ export async function indexRepository(
               absPath,
               scanRoot,
               adapters,
-              knownHashes.get(selectedRelPaths[index]!),
+              knownHashes.get(activeSelectedRelPaths[index]!),
               resolutionCache,
               request.full ?? false,
               parsePool
@@ -570,6 +621,7 @@ export async function indexRepository(
       });
       writableFiles.push({
         relPath: result.relPath,
+        language: result.language,
         hash: result.hash,
         indexedAt: result.nowIso,
         mtimeMs: result.mtimeMs,
@@ -578,23 +630,49 @@ export async function indexRepository(
         relations: result.relations,
         unresolved: result.unresolved
       });
-
-      for (const relation of result.relations) {
-        if (relation.confidence < 0.4) {
-          lowConfidenceCount += 1;
-        }
-      }
-
-      filesIndexed += 1;
-      entityCount += result.entities.length;
-      relationCount += result.relations.length;
-      unresolvedCount += result.unresolved.length;
     }
 
     const writeBatchSize = Math.max(32, config.performance.parallelism * 8);
+    const completedFiles = new Set<string>(
+      checkpointEligible && manifestHash
+        ? (((db.getCheckpoint(checkpointName)?.metadata as Partial<CheckpointState> | undefined)?.completedFiles as
+            | string[]
+            | undefined) ?? [])
+        : []
+    );
     for (const batch of chunkItems(writableFiles, writeBatchSize)) {
       db.transaction(() => {
         db.replaceAstFiles(batch);
+        for (const file of batch) {
+          languageSet.add(file.language);
+          filesIndexed += 1;
+          entityCount += file.entities.length;
+          relationCount += file.relations.length;
+          unresolvedCount += file.unresolved.length;
+          for (const relation of file.relations) {
+            if (relation.confidence < 0.4) {
+              lowConfidenceCount += 1;
+            }
+          }
+        }
+        if (checkpointEligible && manifestHash) {
+          for (const file of batch) {
+            completedFiles.add(file.relPath);
+          }
+          const checkpointState: CheckpointState = {
+            manifestHash,
+            completedFiles: [...completedFiles].sort(),
+            filesIndexed,
+            filesSkipped,
+            languages: [...languageSet].sort(),
+            entities: entityCount,
+            relations: relationCount,
+            unresolvedReferences: unresolvedCount,
+            lowConfidenceRelations: lowConfidenceCount
+          };
+          db.saveCheckpoint(checkpointName, stableNowIso(), checkpointState);
+          db.updateRunProgress(runId, filesIndexed, filesSkipped, checkpointState);
+        }
       });
     }
 
@@ -613,6 +691,9 @@ export async function indexRepository(
       estimatedCoverage
     };
     db.optimize();
+    if (checkpointEligible) {
+      db.clearCheckpoint(checkpointName);
+    }
     db.finishRun(runId, "ok", stableNowIso(), summary);
     return summary;
   } catch (error) {
