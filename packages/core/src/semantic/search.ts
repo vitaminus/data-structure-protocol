@@ -2,6 +2,19 @@ import type { DSPDatabase } from "../storage/db.ts";
 import type { EmbeddingProvider, SearchResult } from "../graph/types.ts";
 import { contentHash } from "../graph/uid.ts";
 
+const HIGH_SIGNAL_RELATION_KINDS = new Set([
+  "imports",
+  "exports",
+  "calls",
+  "extends",
+  "implements",
+  "uses",
+  "tests",
+  "routes_to",
+  "depends_on",
+  "similar_to"
+]);
+
 function cosineSimilarity(a: number[], b: number[]): number {
   if (a.length === 0 || b.length === 0 || a.length !== b.length) {
     return 0;
@@ -37,6 +50,21 @@ function providerCacheKey(provider: EmbeddingProvider): string {
   return provider.cacheKey?.() ?? provider.constructor.name;
 }
 
+function highSignalRelations(db: DSPDatabase, uid: string, direction: "from" | "to") {
+  const relations = direction === "from" ? db.getRelationsFrom(uid) : db.getRelationsTo(uid);
+  return relations.filter((relation) => {
+    if (!HIGH_SIGNAL_RELATION_KINDS.has(relation.kind)) {
+      return false;
+    }
+    if (relation.metadata?.synthetic) {
+      return false;
+    }
+    const otherUid = direction === "from" ? relation.to : relation.from;
+    const other = db.getEntity(otherUid);
+    return other?.kind !== "file" && other?.kind !== "directory";
+  });
+}
+
 export async function semanticSearch(
   db: DSPDatabase,
   query: string,
@@ -61,10 +89,10 @@ export async function semanticSearch(
   const lexicalCandidateUids = db.searchEntityUids(query, candidateLimit);
   const expandedCandidateUids = new Set(lexicalCandidateUids);
   for (const uid of lexicalCandidateUids) {
-    for (const relation of db.getRelationsFrom(uid).slice(0, 10)) {
+    for (const relation of highSignalRelations(db, uid, "from").slice(0, 10)) {
       expandedCandidateUids.add(relation.to);
     }
-    for (const relation of db.getRelationsTo(uid).slice(0, 10)) {
+    for (const relation of highSignalRelations(db, uid, "to").slice(0, 10)) {
       expandedCandidateUids.add(relation.from);
     }
   }
@@ -115,8 +143,8 @@ export async function semanticSearch(
     lexicalScore = Math.min(1, lexicalScore);
 
     const neighborIds = [
-      ...db.getRelationsFrom(entity.uid).slice(0, 5).map((relation) => relation.to),
-      ...db.getRelationsTo(entity.uid).slice(0, 5).map((relation) => relation.from)
+      ...highSignalRelations(db, entity.uid, "from").slice(0, 5).map((relation) => relation.to),
+      ...highSignalRelations(db, entity.uid, "to").slice(0, 5).map((relation) => relation.from)
     ];
     let neighborScore = 0;
     if (tokens.length > 0 && neighborIds.length > 0) {

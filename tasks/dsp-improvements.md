@@ -687,3 +687,11 @@ Status: done
 - Stop updating FTS row-by-row during fast AST inserts and instead refresh the touched UID set in bulk after each write batch.
 - Preserve higher-priority manual entities by rebuilding FTS rows from the final stored entities, not from speculative AST payloads.
 - Keep full FTS rebuilds working during migrations by using the same normalized tokenization logic as the incremental refresh path.
+
+### 85. Filter low-value graph edges out of semantic search expansion
+
+Status: done
+
+- Restrict semantic-search graph expansion and neighbor scoring to high-signal relation kinds instead of every stored edge.
+- Ignore synthetic containment plus file/directory hops during expansion so the candidate set stays focused on semantically meaningful entities.
+- Add a regression test that proves containment-only file nodes do not leak into search results as noisy graph neighbors.

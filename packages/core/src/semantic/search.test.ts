@@ -216,4 +216,62 @@ describe("semantic search", () => {
     expect(results[0]?.score).toBeGreaterThan(0);
     expect(results[0]?.explanation).toContain("lexical=");
   });
+
+  it("ignores low-signal file containment relations during graph expansion", async () => {
+    const now = stableNowIso();
+    const tokenUid = buildUid("function", "src/session.ts", "createToken");
+    const loginUid = buildUid("function", "src/auth.ts", "login");
+    const tokenFileUid = buildUid("file", "src/session.ts");
+
+    for (const entity of [
+      {
+        uid: tokenFileUid,
+        kind: "file" as const,
+        name: "session.ts",
+        path: "src/session.ts"
+      },
+      {
+        uid: tokenUid,
+        kind: "function" as const,
+        name: "createToken",
+        path: "src/session.ts",
+        description: "issues access token"
+      },
+      {
+        uid: loginUid,
+        kind: "function" as const,
+        name: "login",
+        path: "src/auth.ts"
+      }
+    ]) {
+      db.upsertEntity({
+        confidence: 1,
+        provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+        createdAt: now,
+        updatedAt: now,
+        ...entity
+      });
+    }
+
+    db.upsertRelation({
+      from: tokenFileUid,
+      to: tokenUid,
+      kind: "contains",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      metadata: { synthetic: true }
+    });
+    db.upsertRelation({
+      from: loginUid,
+      to: tokenUid,
+      kind: "calls",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+
+    const results = await semanticSearch(db, "token", { topK: 5 });
+
+    expect(results.some((result) => result.uid === loginUid)).toBe(true);
+    expect(results.some((result) => result.uid === tokenFileUid)).toBe(false);
+  });
 });
