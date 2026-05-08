@@ -73,7 +73,21 @@ ensure_pnpm() {
   fi
 }
 
+ensure_supported_node() {
+  if ! command -v node >/dev/null 2>&1; then
+    echo "error: Node.js is required. Install Node.js 20.x or 22.x, then rerun." >&2
+    exit 1
+  fi
+  local major
+  major="$(node -p 'process.versions.node.split(".")[0]')"
+  if [[ "$major" != "20" && "$major" != "22" ]]; then
+    echo "error: unsupported Node.js $(node -p 'process.versions.node'). Use Node.js 20.x or 22.x." >&2
+    exit 1
+  fi
+}
+
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
+  ensure_supported_node
   ensure_pnpm
   echo "==> Installing dependencies"
   pnpm install

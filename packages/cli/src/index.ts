@@ -107,33 +107,18 @@ function directedTree(
 }
 
 function graphStats(services: DSPServices): unknown {
-  const entities = services.db.getEntities(300000);
-  const relations = services.db.getRelations(600000);
-  const byKind = Object.fromEntries(
-    [...new Set(entities.map((entity) => entity.kind))]
-      .sort()
-      .map((kind) => [kind, entities.filter((entity) => entity.kind === kind).length])
-  );
-  const byLanguage = Object.fromEntries(
-    [...new Set(entities.map((entity) => entity.language).filter(Boolean) as string[])]
-      .sort()
-      .map((language) => [language, entities.filter((entity) => entity.language === language).length])
-  );
   return {
-    entities: entities.length,
-    relations: relations.length,
-    unresolvedReferences: services.db.getUnresolvedReferences().length,
-    byKind,
-    byLanguage,
+    entities: services.db.entityCount(),
+    relations: services.db.relationCount(),
+    unresolvedReferences: services.db.unresolvedReferenceCount(),
+    byKind: services.db.entityCountsByKind(),
+    byLanguage: services.db.entityCountsByLanguage(),
     cache: services.db.cacheStats()
   };
 }
 
 function findSourceEntities(services: DSPServices, sourcePath: string): Entity[] {
-  const normalized = sourcePath.replaceAll("\\", "/").replace(/^\.\//, "");
-  return services.db
-    .getEntities(300000)
-    .filter((entity) => entity.path === normalized || entity.path?.endsWith(`/${normalized}`));
+  return services.db.findEntitiesByPath(sourcePath);
 }
 
 function shortestPath(services: DSPServices, fromUid: string, toUid: string): string[] | undefined {
@@ -537,7 +522,7 @@ program
     }
     const services = openDSP(resolvedRoot, adapters());
     try {
-      const toc = services.db.getEntities(300000).map((entity) => entity.uid);
+      const toc = services.db.listEntityUids();
       printOutput({ protocol: false, toc }, options.json);
     } finally {
       services.db.close();

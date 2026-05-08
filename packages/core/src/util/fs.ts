@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { execFileSync } from "node:child_process";
 import { DEFAULT_EXCLUDES } from "../config/types.ts";
 
 const require = createRequire(import.meta.url);
@@ -41,18 +42,53 @@ function readGitIgnore(rootDir: string): string[] {
     .filter((line) => line.length > 0 && !line.startsWith("#"));
 }
 
-function walk(dir: string): string[] {
-  const out: string[] = [];
-  const entries = fs.readdirSync(dir, { withFileTypes: true });
-  for (const entry of entries) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      out.push(...walk(full));
-      continue;
-    }
-    out.push(full);
+function discoverFilesFromGit(
+  rootDir: string,
+  rules: import("ignore").Ignore,
+  maxFileSizeKb: number
+): string[] | undefined {
+  const repoRoot = findRepoRoot(rootDir);
+  if (!fs.existsSync(path.join(repoRoot, ".git"))) {
+    return undefined;
   }
-  return out;
+
+  try {
+    const output = execFileSync(
+      "git",
+      ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+      {
+        cwd: repoRoot,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"]
+      }
+    );
+    const rootPrefix = path.relative(repoRoot, rootDir).split(path.sep).join("/");
+    const files = output
+      .split("\0")
+      .filter(Boolean)
+      .flatMap((repoRelPath) => {
+        const normalizedRepoRelPath = repoRelPath.split(path.sep).join("/");
+        if (
+          rootPrefix &&
+          normalizedRepoRelPath !== rootPrefix &&
+          !normalizedRepoRelPath.startsWith(`${rootPrefix}/`)
+        ) {
+          return [];
+        }
+        const rel = rootPrefix
+          ? normalizedRepoRelPath.slice(rootPrefix.length).replace(/^\//, "")
+          : normalizedRepoRelPath;
+        if (!rel || rules.ignores(rel)) {
+          return [];
+        }
+        const absPath = path.join(repoRoot, normalizedRepoRelPath);
+        const stat = fs.statSync(absPath);
+        return stat.size <= maxFileSizeKb * 1024 ? [path.resolve(absPath)] : [];
+      });
+    return files.sort();
+  } catch {
+    return undefined;
+  }
 }
 
 export function discoverFiles(rootDir: string, options: DiscoverOptions = {}): string[] {
@@ -61,20 +97,43 @@ export function discoverFiles(rootDir: string, options: DiscoverOptions = {}): s
   const gitIgnores = readGitIgnore(rootDir);
   rules.add([...excludes, ...gitIgnores]);
   const maxFileSizeKb = options.maxFileSizeKb ?? 512;
-  const files = walk(rootDir);
-  return files
-    .filter((absPath) => {
-      const rel = path.relative(rootDir, absPath).split(path.sep).join("/");
-      if (rel.startsWith(".git/")) {
-        return false;
+  const gitFiles = discoverFilesFromGit(rootDir, rules, maxFileSizeKb);
+  if (gitFiles) {
+    return gitFiles;
+  }
+  const files: string[] = [];
+  const pending = [path.resolve(rootDir)];
+
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    const entries = fs.readdirSync(current, { withFileTypes: true });
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      const rel = path.relative(rootDir, full).split(path.sep).join("/");
+      if (rel === ".git" || rel.startsWith(".git/")) {
+        continue;
+      }
+      if (entry.isDirectory()) {
+        if (entry.isSymbolicLink()) {
+          continue;
+        }
+        if (rules.ignores(rel) || rules.ignores(`${rel}/`)) {
+          continue;
+        }
+        pending.push(full);
+        continue;
       }
       if (rules.ignores(rel)) {
-        return false;
+        continue;
       }
-      const stat = fs.statSync(absPath);
-      return stat.size <= maxFileSizeKb * 1024;
-    })
-    .sort();
+      const stat = fs.statSync(full);
+      if (stat.size <= maxFileSizeKb * 1024) {
+        files.push(full);
+      }
+    }
+  }
+
+  return files.sort();
 }
 
 export function readTextFile(filePath: string): string {

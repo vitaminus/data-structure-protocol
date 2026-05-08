@@ -170,11 +170,10 @@ export async function runEmbeddingsUpdate(
 ): Promise<{ updated: number; skipped: number; provider: string }> {
   const provider = services.embeddingProvider ?? new MockEmbeddingProvider();
   const providerKey = provider.cacheKey?.() ?? provider.constructor.name;
-  const entities = services.db.getEntities(200000);
   let updated = 0;
   let skipped = 0;
   const now = new Date().toISOString();
-  for (const entity of entities) {
+  for (const entity of services.db.iterateEntitiesOrdered()) {
     const semanticText = [
       entity.name,
       entity.signature ?? "",

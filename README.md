@@ -4,6 +4,8 @@ DSP is a local context compiler for AI coding agents.
 
 It builds a deterministic structural-semantic graph of a repository, keeps it incrementally updated, and serves bounded context packs for coding tasks.
 
+Supported local runtimes: Node.js 20.x or 22.x.
+
 ## Why not just grep?
 
 - `grep`/`rg` is lexical only.
@@ -36,6 +38,7 @@ Installers can also write only one agent integration (`--agent cursor|claude|cod
 
 ```bash
 pnpm install
+pnpm doctor
 pnpm build
 pnpm test
 

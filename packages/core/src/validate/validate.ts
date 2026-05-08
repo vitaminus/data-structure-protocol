@@ -28,12 +28,11 @@ function withSeverity(issue: Omit<ValidationIssue, "severity">): ValidationIssue
 
 export function validateGraph(db: DSPDatabase, rootDir: string): ValidationResult {
   const issues: ValidationIssue[] = [];
-  const fileEntities = db.getFileEntities(300000);
   const danglingRelations = db.getDanglingRelations(600000);
   const lowConfidenceRelations = db.getLowConfidenceCriticalRelations(600000);
   const unresolved = db.getUnresolvedReferences();
 
-  for (const entity of fileEntities) {
+  for (const entity of db.iterateFileEntitiesOrdered()) {
     if (!entity.path) {
       continue;
     }
@@ -97,7 +96,7 @@ export function validateGraph(db: DSPDatabase, rootDir: string): ValidationResul
     );
   }
 
-  const annotationConflicts = db.getEntities(300000).filter((entity) => {
+  const annotationConflicts = [...db.iterateEntitiesOrdered()].filter((entity) => {
     const sources = new Set(entity.provenance.map((provenance) => provenance.source));
     return sources.has("human") && sources.has("ast") && entity.confidence < 0.5;
   });

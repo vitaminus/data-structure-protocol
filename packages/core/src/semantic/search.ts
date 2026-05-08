@@ -70,14 +70,17 @@ export async function semanticSearch(
   }
 
   if (queryVector && providerKey) {
-    const storedEmbeddings = db.getEmbeddingsByProvider(providerKey);
+    const storedEmbeddings = db.getEmbeddingsByProvider(providerKey, candidateLimit);
     for (const embedding of storedEmbeddings) {
       expandedCandidateUids.add(embedding.uid);
     }
 
-    if (storedEmbeddings.length < db.entityCount()) {
-      for (const entity of db.getEntities(200000)) {
+    if (lexicalCandidateUids.length === 0) {
+      for (const entity of db.iterateEntitiesOrdered()) {
         expandedCandidateUids.add(entity.uid);
+        if (expandedCandidateUids.size >= candidateLimit) {
+          break;
+        }
       }
     }
   }
