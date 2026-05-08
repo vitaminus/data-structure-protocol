@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { LanguageAdapter, ParseResult } from "../graph/types.ts";
 import { DEFAULT_CONFIG } from "../config/types.ts";
 import { DSPDatabase } from "../storage/db.ts";
-import { indexRepository } from "./indexer.ts";
+import { effectiveParallelismForIndex, indexRepository } from "./indexer.ts";
 import { buildUid, stableNowIso } from "../graph/uid.ts";
 
 class MockAdapter implements LanguageAdapter {
@@ -143,6 +143,19 @@ describe("indexer", () => {
     const summary = await indexRepository(db, [new GemfileAdapter()], { rootDir: tempDir }, DEFAULT_CONFIG);
     expect(summary.languages).toContain("ruby");
     expect(db.getEntity(buildUid("file", "Gemfile"))).toBeDefined();
+  });
+
+  it("caps adaptive parallelism by the number of files in the run", () => {
+    expect(
+      effectiveParallelismForIndex(
+        {
+          ...DEFAULT_CONFIG.performance,
+          parallelism: 8,
+          adaptiveParallelism: true
+        },
+        2
+      )
+    ).toBe(2);
   });
 
   it("skips unchanged files on second run", async () => {

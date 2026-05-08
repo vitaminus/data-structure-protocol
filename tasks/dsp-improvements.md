@@ -695,3 +695,11 @@ Status: done
 - Restrict semantic-search graph expansion and neighbor scoring to high-signal relation kinds instead of every stored edge.
 - Ignore synthetic containment plus file/directory hops during expansion so the candidate set stays focused on semantically meaningful entities.
 - Add a regression test that proves containment-only file nodes do not leak into search results as noisy graph neighbors.
+
+### 86. Add adaptive index parallelism
+
+Status: done
+
+- Add an adaptive parallelism mode that caps concurrency by both CPU availability and the current run size.
+- Reuse the effective parallelism value for parse workers, async parse fanout, and write-batch sizing so the whole index path stays coordinated.
+- Cover the helper with a regression test that proves tiny runs do not oversubscribe workers.

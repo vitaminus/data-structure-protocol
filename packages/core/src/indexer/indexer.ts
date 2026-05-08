@@ -1,4 +1,5 @@
 import path from "node:path";
+import os from "node:os";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import type {
   Entity,
@@ -326,8 +327,21 @@ function persistedRelationsForFile(fileUid: string, relations: Relation[]): Rela
   return relations.filter((relation) => !(relation.kind === "contains" && relation.from === fileUid));
 }
 
-function parseWorkerPoolFor(adapters: LanguageAdapter[], config: DSPConfig["performance"]): ParseWorkerPool | undefined {
-  const parallelism = config.parallelism;
+export function effectiveParallelismForIndex(config: DSPConfig["performance"], fileCount: number): number {
+  const configured = Math.max(1, config.parallelism);
+  if (!config.adaptiveParallelism) {
+    return configured;
+  }
+  const cpuCount = typeof os.availableParallelism === "function" ? os.availableParallelism() : os.cpus().length;
+  const cpuBound = config.mode === "large-repo" ? Math.max(2, Math.floor(cpuCount * 0.75)) : Math.max(2, cpuCount - 1);
+  return Math.max(1, Math.min(configured, fileCount, cpuBound));
+}
+
+function parseWorkerPoolFor(
+  adapters: LanguageAdapter[],
+  config: DSPConfig["performance"],
+  parallelism: number
+): ParseWorkerPool | undefined {
   if (parallelism <= 1 || !adapters.some((adapter) => adapter.worker)) {
     return undefined;
   }
@@ -518,7 +532,7 @@ export async function indexRepository(
   const parserSourceCounts = new Map<string, number>();
   const resolutionCache = new Map<string, string | undefined>();
   const directoryEntityUids = new Set<string>();
-  const parsePool = parseWorkerPoolFor(adapters, config.performance);
+  let parsePool: ParseWorkerPool | undefined;
 
   try {
     const requestedFiles = request.files?.map((file) => path.resolve(scanRoot, file));
@@ -634,13 +648,15 @@ export async function indexRepository(
 
     const activeSelectedRelPaths = selectedFiles.map((absPath) => normalizePath(path.relative(scanRoot, absPath)));
     const pathIndex = buildPathResolutionIndex(new Set([...db.listFilesInHashTable(), ...activeSelectedRelPaths]));
+    const effectiveParallelism = effectiveParallelismForIndex(config.performance, selectedFiles.length);
     const knownHashes = db.getFileHashEntries(activeSelectedRelPaths);
+    parsePool = parseWorkerPoolFor(adapters, config.performance, effectiveParallelism);
 
     const parsedResults = await (async () => {
       try {
         return await mapWithConcurrency(
           selectedFiles,
-          config.performance.parallelism,
+          effectiveParallelism,
           (absPath, index) =>
             parseOne(
               absPath,
@@ -701,7 +717,7 @@ export async function indexRepository(
       }
     }
 
-    const writeBatchSize = Math.max(32, config.performance.parallelism * 8);
+    const writeBatchSize = Math.max(32, effectiveParallelism * 8);
     const completedFiles = new Set<string>(
       checkpointEligible && manifestHash
         ? (((db.getCheckpoint(checkpointName)?.metadata as Partial<CheckpointState> | undefined)?.completedFiles as
