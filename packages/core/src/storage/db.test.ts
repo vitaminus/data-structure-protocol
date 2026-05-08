@@ -238,6 +238,63 @@ describe("DSPDatabase", () => {
     );
   });
 
+  it("finds non-container orphans with a direct SQL query", () => {
+    const now = stableNowIso();
+    const fileUid = buildUid("file", "src/auth.ts");
+    const orphanUid = buildUid("function", "src/auth.ts", "orphan");
+    const linkedUid = buildUid("function", "src/auth.ts", "linked");
+    const callerUid = buildUid("function", "src/auth.ts", "caller");
+
+    for (const entity of [
+      {
+        uid: fileUid,
+        kind: "file" as const,
+        name: "auth.ts"
+      },
+      {
+        uid: orphanUid,
+        kind: "function" as const,
+        name: "orphan"
+      },
+      {
+        uid: linkedUid,
+        kind: "function" as const,
+        name: "linked"
+      },
+      {
+        uid: callerUid,
+        kind: "function" as const,
+        name: "caller"
+      }
+    ]) {
+      db.upsertEntity({
+        ...entity,
+        path: "src/auth.ts",
+        confidence: 1,
+        provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+        createdAt: now,
+        updatedAt: now
+      });
+    }
+
+    db.upsertRelation({
+      from: fileUid,
+      to: orphanUid,
+      kind: "contains",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+    db.upsertRelation({
+      from: callerUid,
+      to: linkedUid,
+      kind: "calls",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+
+    expect(db.getOrphanEntities().map((entity) => entity.uid)).toEqual([callerUid, orphanUid].sort());
+  });
+
   it("reports database integrity and orphaned records", () => {
     const sqlite = new Database(db.dbPath);
     sqlite

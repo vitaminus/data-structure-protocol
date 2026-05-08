@@ -147,8 +147,21 @@ function detectCycles(services: DSPServices): string[][] {
   const visiting = new Set<string>();
   const visited = new Set<string>();
   const stack: string[] = [];
-  const entities = services.db.getEntities(300000);
   const seenCycles = new Set<string>();
+  const nodes = new Set<string>();
+  const adjacency = new Map<string, string[]>();
+
+  for (const entity of services.db.iterateEntitiesOrdered()) {
+    nodes.add(entity.uid);
+  }
+  for (const relation of services.db.iterateRelationsOrdered()) {
+    if (!TRAVERSAL_KINDS.has(relation.kind)) {
+      continue;
+    }
+    const bucket = adjacency.get(relation.from) ?? [];
+    bucket.push(relation.to);
+    adjacency.set(relation.from, bucket);
+  }
 
   const dfs = (uid: string): void => {
     if (visiting.has(uid)) {
@@ -166,31 +179,22 @@ function detectCycles(services: DSPServices): string[][] {
     }
     visiting.add(uid);
     stack.push(uid);
-    for (const relation of services.db.getRelationsFrom(uid).filter((rel) => TRAVERSAL_KINDS.has(rel.kind))) {
-      dfs(relation.to);
+    for (const toUid of adjacency.get(uid) ?? []) {
+      dfs(toUid);
     }
     stack.pop();
     visiting.delete(uid);
     visited.add(uid);
   };
 
-  for (const entity of entities) {
-    dfs(entity.uid);
+  for (const uid of nodes) {
+    dfs(uid);
   }
   return cycles;
 }
 
 function orphans(services: DSPServices): Entity[] {
-  const entities = services.db.getEntities(300000);
-  return entities.filter((entity) => {
-    if (["repository", "directory", "file"].includes(entity.kind)) {
-      return false;
-    }
-    return services.db
-      .getRelationsTo(entity.uid)
-      .filter((relation) => relation.kind !== "contains")
-      .length === 0;
-  });
+  return services.db.getOrphanEntities(300000);
 }
 
 function manualUid(prefix: "obj" | "func", requested?: string): string {

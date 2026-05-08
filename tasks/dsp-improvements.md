@@ -743,3 +743,11 @@ Status: done
 - Split validation into a fast file-state pass and optional deep graph-consistency checks so routine runs avoid the heaviest traversal work.
 - Reuse cached `mtime` and size metadata to skip rereading unchanged files, while still hashing changed files before reporting stale-index drift.
 - Expose `validate --changed-only` and `validate --deep`, and reuse the focused mode in precommit-style CLI flows.
+
+### 92. Stream heavy exports and trim CLI graph scans
+
+Status: done
+
+- Rewrite JSONL and DSP text exports to write rows incrementally instead of materializing the entire graph into arrays first.
+- Rework protocol export bookkeeping around iterator-driven maps so entity and relation passes stay linear without snapshot copies.
+- Replace CLI orphan detection with a direct SQL query and switch cycle detection to a single adjacency build from ordered iterators.

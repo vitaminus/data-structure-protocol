@@ -919,6 +919,25 @@ export class DSPDatabase {
     }
   }
 
+  getOrphanEntities(limit = 300000): Entity[] {
+    const rows = this.prepareReadCached(
+      "get-orphan-entities-limit",
+      `
+      SELECT entities.*
+      FROM entities
+      LEFT JOIN relations
+        ON relations.to_uid = entities.uid
+       AND relations.kind != 'contains'
+      WHERE entities.kind NOT IN ('repository', 'directory', 'file')
+        AND relations.to_uid IS NULL
+      ORDER BY entities.uid
+      LIMIT ?
+      `
+    )
+      .all(limit) as Record<string, unknown>[];
+    return rows.map((row) => this.rowToEntity(row));
+  }
+
   getDanglingRelations(limit = 600000): Relation[] {
     const rows = this.readDb
       .prepare(
@@ -1632,21 +1651,23 @@ export class DSPDatabase {
 
   exportJsonl(targetDir: string): void {
     fs.mkdirSync(targetDir, { recursive: true });
-    const writeJsonLines = (fileName: string, rows: unknown[]) => {
-      fs.writeFileSync(
-        path.join(targetDir, fileName),
-        rows.map((row) => JSON.stringify(row)).join("\n") + (rows.length > 0 ? "\n" : ""),
-        "utf8"
-      );
+    const writeJsonLines = (fileName: string, rows: Iterable<unknown>): number => {
+      const handle = fs.openSync(path.join(targetDir, fileName), "w");
+      let count = 0;
+      try {
+        for (const row of rows) {
+          fs.writeSync(handle, `${JSON.stringify(row)}\n`, undefined, "utf8");
+          count += 1;
+        }
+      } finally {
+        fs.closeSync(handle);
+      }
+      return count;
     };
 
-    const entities = [...this.iterateEntitiesOrdered()];
-    const relations = [...this.iterateRelationsOrdered()];
-    const unresolvedReferences = [...this.iterateUnresolvedReferencesOrdered()];
-
-    writeJsonLines("entities.jsonl", entities);
-    writeJsonLines("relations.jsonl", relations);
-    writeJsonLines("unresolved.jsonl", unresolvedReferences);
+    const entityCount = writeJsonLines("entities.jsonl", this.iterateEntitiesOrdered());
+    const relationCount = writeJsonLines("relations.jsonl", this.iterateRelationsOrdered());
+    const unresolvedCount = writeJsonLines("unresolved.jsonl", this.iterateUnresolvedReferencesOrdered());
     fs.writeFileSync(
       path.join(targetDir, "manifest.json"),
       `${JSON.stringify(
@@ -1660,9 +1681,9 @@ export class DSPDatabase {
             unresolvedReferences: "unresolved.jsonl"
           },
           counts: {
-            entities: entities.length,
-            relations: relations.length,
-            unresolvedReferences: unresolvedReferences.length
+            entities: entityCount,
+            relations: relationCount,
+            unresolvedReferences: unresolvedCount
           }
         },
         null,
@@ -1700,20 +1721,26 @@ export class DSPDatabase {
     fs.rmSync(protocolDir, { recursive: true, force: true });
     fs.mkdirSync(protocolDir, { recursive: true });
 
-    const entities = [...this.iterateEntitiesOrdered()];
-    const relations = [...this.iterateRelationsOrdered()];
-    const uidMap = Object.fromEntries(entities.map((entity) => [entity.uid, protocolUidForEntity(entity)]));
-    const entityByUid = new Map(entities.map((entity) => [entity.uid, entity]));
+    const entityOrder: string[] = [];
+    const uidMap: Record<string, string> = {};
+    const entityByUid = new Map<string, Entity>();
     const outgoingByUid = new Map<string, Relation[]>();
 
-    for (const relation of relations) {
+    for (const entity of this.iterateEntitiesOrdered()) {
+      entityOrder.push(entity.uid);
+      uidMap[entity.uid] = protocolUidForEntity(entity);
+      entityByUid.set(entity.uid, entity);
+    }
+
+    for (const relation of this.iterateRelationsOrdered()) {
       const bucket = outgoingByUid.get(relation.from) ?? [];
       bucket.push(relation);
       outgoingByUid.set(relation.from, bucket);
     }
 
-    for (const entity of entities) {
-      const protocolUid = uidMap[entity.uid]!;
+    for (const entityUid of entityOrder) {
+      const entity = entityByUid.get(entityUid)!;
+      const protocolUid = uidMap[entityUid]!;
       const entityDir = path.join(protocolDir, protocolUid);
       fs.mkdirSync(path.join(entityDir, "exports"), { recursive: true });
       writeProtocolDescription(path.join(entityDir, "description"), entity, protocolUid);
@@ -1732,7 +1759,7 @@ export class DSPDatabase {
       fs.writeFileSync(path.join(entityDir, "shared"), `${[...new Set(sharedLines)].join("\n")}${sharedLines.length ? "\n" : ""}`, "utf8");
     }
 
-    for (const relation of relations) {
+    for (const relation of this.iterateRelationsOrdered()) {
       const importedUid = uidMap[relation.to];
       const importerUid = uidMap[relation.from];
       if (!importedUid || !importerUid || relation.kind === "contains") {
@@ -1744,7 +1771,7 @@ export class DSPDatabase {
       fs.writeFileSync(exportPath, `${why}\nkind: ${relation.kind}\nconfidence: ${relation.confidence.toFixed(2)}\n`, "utf8");
     }
 
-    fs.writeFileSync(path.join(protocolDir, "TOC"), `${entities.map((entity) => uidMap[entity.uid]).join("\n")}\n`, "utf8");
+    fs.writeFileSync(path.join(protocolDir, "TOC"), `${entityOrder.map((uid) => uidMap[uid]).join("\n")}\n`, "utf8");
     fs.writeFileSync(path.join(protocolDir, "uid-map.json"), `${JSON.stringify(uidMap, null, 2)}\n`, "utf8");
     fs.writeFileSync(
       path.join(protocolDir, "README.md"),
@@ -1756,44 +1783,59 @@ export class DSPDatabase {
   exportDsp(targetDir: string): void {
     const dspDir = path.join(targetDir, ".dsp", "export");
     fs.mkdirSync(dspDir, { recursive: true });
-    const entities = [...this.iterateEntitiesOrdered()];
-    const relations = [...this.iterateRelationsOrdered()];
-    const unresolved = [...this.iterateUnresolvedReferencesOrdered()];
-    const entitiesText = entities
-      .sort((a, b) => a.uid.localeCompare(b.uid))
-      .map((entity) => {
-        return [
-          `${entity.uid} [${entity.kind}]`,
-          `name=${entity.name}`,
-          `path=${entity.path ?? ""}`,
-          `language=${entity.language ?? ""}`,
-          `confidence=${entity.confidence.toFixed(2)}`
-        ].join(" | ");
-      })
-      .join("\n");
-    const relationsText = relations
-      .sort((a, b) =>
-        `${a.from}:${a.kind}:${a.to}`.localeCompare(`${b.from}:${b.kind}:${b.to}`)
-      )
-      .map((rel) => {
-        return `${rel.from} --${rel.kind}--> ${rel.to} | confidence=${rel.confidence.toFixed(2)} | reason=${rel.reason ?? ""}`;
-      })
-      .join("\n");
-    const unresolvedText = unresolved
-      .sort((a, b) => `${a.path}:${a.symbol}`.localeCompare(`${b.path}:${b.symbol}`))
-      .map((ref) => `${ref.path} :: ${ref.kind} :: ${ref.symbol} :: confidence=${ref.confidence.toFixed(2)}`)
-      .join("\n");
-    fs.writeFileSync(path.join(dspDir, "entities.txt"), `${entitiesText}\n`, "utf8");
-    fs.writeFileSync(path.join(dspDir, "relations.txt"), `${relationsText}\n`, "utf8");
-    fs.writeFileSync(path.join(dspDir, "unresolved.txt"), `${unresolvedText}\n`, "utf8");
+    const entityHandle = fs.openSync(path.join(dspDir, "entities.txt"), "w");
+    const relationHandle = fs.openSync(path.join(dspDir, "relations.txt"), "w");
+    const unresolvedHandle = fs.openSync(path.join(dspDir, "unresolved.txt"), "w");
+    let entityCount = 0;
+    let relationCount = 0;
+    let unresolvedCount = 0;
+    try {
+      for (const entity of this.iterateEntitiesOrdered()) {
+        fs.writeSync(
+          entityHandle,
+          [
+            `${entity.uid} [${entity.kind}]`,
+            `name=${entity.name}`,
+            `path=${entity.path ?? ""}`,
+            `language=${entity.language ?? ""}`,
+            `confidence=${entity.confidence.toFixed(2)}`
+          ].join(" | ") + "\n",
+          undefined,
+          "utf8"
+        );
+        entityCount += 1;
+      }
+      for (const relation of this.iterateRelationsOrdered()) {
+        fs.writeSync(
+          relationHandle,
+          `${relation.from} --${relation.kind}--> ${relation.to} | confidence=${relation.confidence.toFixed(2)} | reason=${relation.reason ?? ""}\n`,
+          undefined,
+          "utf8"
+        );
+        relationCount += 1;
+      }
+      for (const ref of this.iterateUnresolvedReferencesOrdered()) {
+        fs.writeSync(
+          unresolvedHandle,
+          `${ref.path} :: ${ref.kind} :: ${ref.symbol} :: confidence=${ref.confidence.toFixed(2)}\n`,
+          undefined,
+          "utf8"
+        );
+        unresolvedCount += 1;
+      }
+    } finally {
+      fs.closeSync(entityHandle);
+      fs.closeSync(relationHandle);
+      fs.closeSync(unresolvedHandle);
+    }
     fs.writeFileSync(
       path.join(dspDir, "summary.json"),
       `${JSON.stringify(
         {
           generatedAt: new Date().toISOString(),
-          entities: entities.length,
-          relations: relations.length,
-          unresolved: unresolved.length
+          entities: entityCount,
+          relations: relationCount,
+          unresolved: unresolvedCount
         },
         null,
         2
