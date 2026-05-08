@@ -1096,6 +1096,34 @@ export class DSPDatabase {
       );
   }
 
+  private refreshEntityFtsByUid(uids: string[]): void {
+    const uniqueUids = [...new Set(uids)];
+    if (uniqueUids.length === 0) {
+      return;
+    }
+    for (const chunk of chunks(uniqueUids)) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      this.db.prepare(`DELETE FROM entity_fts WHERE uid IN (${placeholders})`).run(...chunk);
+    }
+    for (const entity of this.getEntitiesByUid(uniqueUids)) {
+      this.prepareCached(
+        "insert-entity-fts",
+        `
+        INSERT INTO entity_fts(uid, name, path, description, docstring, tags)
+        VALUES (?, ?, ?, ?, ?, ?)
+        `
+      )
+        .run(
+          entity.uid,
+          [entity.name, searchableText(entity.name), entity.signature ?? ""].join(" "),
+          [entity.path ?? "", searchableText(entity.path)].join(" "),
+          [entity.description ?? "", searchableText(entity.description)].join(" "),
+          [entity.docstring ?? "", searchableText(entity.docstring)].join(" "),
+          [...(entity.tags ?? []), searchableText((entity.tags ?? []).join(" "))].join(" ")
+        );
+    }
+  }
+
   rebuildEntityFts(): void {
     this.prepareCached("clear-entity-fts", "DELETE FROM entity_fts").run();
     const rows = this.prepareCached("iterate-entities", "SELECT * FROM entities ORDER BY uid").all() as Record<
@@ -1104,7 +1132,21 @@ export class DSPDatabase {
     >[];
     for (const row of rows) {
       const entity = this.rowToEntity(row);
-      this.upsertEntityFts(entity);
+      this.prepareCached(
+        "insert-entity-fts",
+        `
+        INSERT INTO entity_fts(uid, name, path, description, docstring, tags)
+        VALUES (?, ?, ?, ?, ?, ?)
+        `
+      )
+        .run(
+          entity.uid,
+          [entity.name, searchableText(entity.name), entity.signature ?? ""].join(" "),
+          [entity.path ?? "", searchableText(entity.path)].join(" "),
+          [entity.description ?? "", searchableText(entity.description)].join(" "),
+          [entity.docstring ?? "", searchableText(entity.docstring)].join(" "),
+          [...(entity.tags ?? []), searchableText((entity.tags ?? []).join(" "))].join(" ")
+        );
     }
   }
 
@@ -1450,7 +1492,6 @@ export class DSPDatabase {
         entity.createdAt,
         entity.updatedAt
       );
-    this.upsertEntityFts(entity);
   }
 
   private insertRelationFast(relation: Relation): void {
@@ -1524,9 +1565,11 @@ export class DSPDatabase {
       return;
     }
     this.clearAstDataForPaths(files.map((file) => file.relPath));
+    const entityUidsToRefresh: string[] = [];
     for (const file of files) {
       for (const entity of file.entities) {
         this.insertEntityFast(entity);
+        entityUidsToRefresh.push(entity.uid);
       }
       for (const relation of file.relations) {
         this.insertRelationFast(relation);
@@ -1539,6 +1582,7 @@ export class DSPDatabase {
         sizeBytes: file.sizeBytes
       });
     }
+    this.refreshEntityFtsByUid(entityUidsToRefresh);
   }
 
   clearAstDataForPath(filePath: string): void {
@@ -1546,7 +1590,7 @@ export class DSPDatabase {
   }
 
   listFilesInHashTable(): string[] {
-    const rows = this.db.prepare("SELECT path FROM file_hashes ORDER BY path").all() as { path: string }[];
+    const rows = this.readDb.prepare("SELECT path FROM file_hashes ORDER BY path").all() as { path: string }[];
     return rows.map((r) => r.path);
   }
 

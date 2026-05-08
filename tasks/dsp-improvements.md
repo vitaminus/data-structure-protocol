@@ -679,3 +679,11 @@ Status: done
 - Persist a discovery manifest keyed by the current working-tree fingerprint so repeated full scans can reuse the previous file list.
 - Fall back to a lightweight non-git fingerprint when no repository metadata is available.
 - Cover the cache with a unit test that forbids nested directory rescans on a clean manifest cache hit.
+
+### 84. Reduce FTS write amplification during AST refreshes
+
+Status: done
+
+- Stop updating FTS row-by-row during fast AST inserts and instead refresh the touched UID set in bulk after each write batch.
+- Preserve higher-priority manual entities by rebuilding FTS rows from the final stored entities, not from speculative AST payloads.
+- Keep full FTS rebuilds working during migrations by using the same normalized tokenization logic as the incremental refresh path.
