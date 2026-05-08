@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { LanguageAdapter, ParseResult } from "../graph/types.ts";
 import { DEFAULT_CONFIG } from "../config/types.ts";
 import { DSPDatabase } from "../storage/db.ts";
-import { effectiveParallelismForIndex, indexRepository } from "./indexer.ts";
+import { chunkEntriesByByteBudget, effectiveParallelismForIndex, indexRepository } from "./indexer.ts";
 import { buildUid, stableNowIso } from "../graph/uid.ts";
 
 class MockAdapter implements LanguageAdapter {
@@ -156,6 +156,26 @@ describe("indexer", () => {
         2
       )
     ).toBe(2);
+  });
+
+  it("chunks parse work by a byte budget", () => {
+    const chunks = chunkEntriesByByteBudget(
+      [
+        { name: "a", size: 5 },
+        { name: "b", size: 5 },
+        { name: "c", size: 5 }
+      ],
+      10,
+      (entry) => entry.size
+    );
+
+    expect(chunks).toEqual([
+      [
+        { name: "a", size: 5 },
+        { name: "b", size: 5 }
+      ],
+      [{ name: "c", size: 5 }]
+    ]);
   });
 
   it("skips unchanged files on second run", async () => {

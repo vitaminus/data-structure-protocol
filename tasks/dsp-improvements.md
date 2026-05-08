@@ -711,3 +711,11 @@ Status: done
 - Track content-stable rename reconciliations and exclude them from later parse selection during the same git-diff run.
 - Skip neighbor-expansion work for already reconciled pure renames so large move/refactor operations stop paying the normal changed-file tax.
 - Update the rename regression test to assert that pure renames now complete without burning skip slots on files we never need to parse.
+
+### 88. Enforce a memory budget for index runs
+
+Status: done
+
+- Add an index memory budget setting and chunk parse work into byte-bounded windows instead of holding every parsed result in memory at once.
+- Reuse the same checkpointing and write-batch logic inside each memory window so reliability stays intact while RSS stays flatter.
+- Cover the new chunking helper with a regression test that proves byte budgets split work deterministically.

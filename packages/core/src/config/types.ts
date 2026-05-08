@@ -7,6 +7,7 @@ export type DSPPerformanceConfig = {
   workerTimeoutMs: number;
   workerMaxInputKb: number;
   workerMaxJobsPerWorker: number;
+  indexMemoryBudgetMb: number;
   exclude: string[];
 };
 
@@ -42,6 +43,7 @@ export const DEFAULT_CONFIG: DSPConfig = {
     workerTimeoutMs: 15000,
     workerMaxInputKb: 2048,
     workerMaxJobsPerWorker: 200,
+    indexMemoryBudgetMb: 128,
     exclude: DEFAULT_EXCLUDES
   },
   embeddings: {

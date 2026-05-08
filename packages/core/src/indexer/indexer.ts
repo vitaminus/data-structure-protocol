@@ -361,6 +361,34 @@ function chunkItems<T>(items: T[], chunkSize: number): T[][] {
   return chunks;
 }
 
+export function chunkEntriesByByteBudget<T>(
+  items: T[],
+  byteBudget: number,
+  byteSizeOf: (item: T) => number
+): T[][] {
+  const chunks: T[][] = [];
+  const effectiveBudget = Math.max(1, byteBudget);
+  let currentChunk: T[] = [];
+  let currentBytes = 0;
+
+  for (const item of items) {
+    const itemBytes = Math.max(1, byteSizeOf(item));
+    if (currentChunk.length > 0 && currentBytes + itemBytes > effectiveBudget) {
+      chunks.push(currentChunk);
+      currentChunk = [];
+      currentBytes = 0;
+    }
+    currentChunk.push(item);
+    currentBytes += itemBytes;
+  }
+
+  if (currentChunk.length > 0) {
+    chunks.push(currentChunk);
+  }
+
+  return chunks;
+}
+
 type CheckpointState = {
   manifestHash: string;
   completedFiles: string[];
@@ -654,78 +682,16 @@ export async function indexRepository(
       }
     }
 
-    const activeSelectedRelPaths = selectedFiles.map((absPath) => normalizePath(path.relative(scanRoot, absPath)));
+    const selectedEntries = selectedFiles.map((absPath) => ({
+      absPath,
+      relPath: normalizePath(path.relative(scanRoot, absPath)),
+      sizeBytes: statSync(absPath).size
+    }));
+    const activeSelectedRelPaths = selectedEntries.map((entry) => entry.relPath);
     const pathIndex = buildPathResolutionIndex(new Set([...db.listFilesInHashTable(), ...activeSelectedRelPaths]));
     const effectiveParallelism = effectiveParallelismForIndex(config.performance, selectedFiles.length);
     const knownHashes = db.getFileHashEntries(activeSelectedRelPaths);
     parsePool = parseWorkerPoolFor(adapters, config.performance, effectiveParallelism);
-
-    const parsedResults = await (async () => {
-      try {
-        return await mapWithConcurrency(
-          selectedFiles,
-          effectiveParallelism,
-          (absPath, index) =>
-            parseOne(
-              absPath,
-              scanRoot,
-              db,
-              adapters,
-              knownHashes.get(activeSelectedRelPaths[index]!),
-              resolutionCache,
-              pathIndex,
-              request.full ?? false,
-              parsePool
-            )
-        );
-      } finally {
-        await parsePool?.close();
-      }
-    })();
-
-    const writableFiles: IndexedAstFile[] = [];
-
-    for (const result of parsedResults) {
-      if (result.kind === "unsupported") {
-        filesSkipped += 1;
-        continue;
-      }
-      languageSet.add(result.language);
-      if (result.kind === "skipped") {
-        filesSkipped += 1;
-        continue;
-      }
-      const entitiesToWrite = result.entities.filter((entity) => {
-        if (entity.kind !== "directory") {
-          return true;
-        }
-        if (directoryEntityUids.has(entity.uid)) {
-          return false;
-        }
-        directoryEntityUids.add(entity.uid);
-        return true;
-      });
-      writableFiles.push({
-        relPath: result.relPath,
-        language: result.language,
-        hash: result.hash,
-        indexedAt: result.nowIso,
-        mtimeMs: result.mtimeMs,
-        sizeBytes: result.sizeBytes,
-        entities: entitiesToWrite,
-        relations: result.relations,
-        unresolved: result.unresolved
-      });
-      if (result.usedFallback) {
-        parserFallbackFiles += 1;
-        fallbackByLanguage.set(result.language, (fallbackByLanguage.get(result.language) ?? 0) + 1);
-      }
-      for (const source of result.parserSources) {
-        parserSourceCounts.set(source, (parserSourceCounts.get(source) ?? 0) + 1);
-      }
-    }
-
-    const writeBatchSize = Math.max(32, effectiveParallelism * 8);
     const completedFiles = new Set<string>(
       checkpointEligible && manifestHash
         ? (((db.getCheckpoint(checkpointName)?.metadata as Partial<CheckpointState> | undefined)?.completedFiles as
@@ -733,40 +699,112 @@ export async function indexRepository(
             | undefined) ?? [])
         : []
     );
-    for (const batch of chunkItems(writableFiles, writeBatchSize)) {
-      db.transaction(() => {
-        db.replaceAstFiles(batch);
-        for (const file of batch) {
-          languageSet.add(file.language);
-          filesIndexed += 1;
-          entityCount += file.entities.length;
-          relationCount += file.relations.length;
-          unresolvedCount += file.unresolved.length;
-          for (const relation of file.relations) {
-            if (relation.confidence < 0.4) {
-              lowConfidenceCount += 1;
+
+    try {
+      const parseWindows = chunkEntriesByByteBudget(
+        selectedEntries,
+        config.performance.indexMemoryBudgetMb * 1024 * 1024,
+        (entry) => entry.sizeBytes
+      );
+      for (const windowEntries of parseWindows) {
+        const parsedResults = await mapWithConcurrency(
+          windowEntries,
+          effectiveParallelism,
+          (entry) =>
+            parseOne(
+              entry.absPath,
+              scanRoot,
+              db,
+              adapters,
+              knownHashes.get(entry.relPath),
+              resolutionCache,
+              pathIndex,
+              request.full ?? false,
+              parsePool
+            )
+        );
+
+        const writableFiles: IndexedAstFile[] = [];
+        for (const result of parsedResults) {
+          if (result.kind === "unsupported") {
+            filesSkipped += 1;
+            continue;
+          }
+          languageSet.add(result.language);
+          if (result.kind === "skipped") {
+            filesSkipped += 1;
+            continue;
+          }
+          const entitiesToWrite = result.entities.filter((entity) => {
+            if (entity.kind !== "directory") {
+              return true;
             }
+            if (directoryEntityUids.has(entity.uid)) {
+              return false;
+            }
+            directoryEntityUids.add(entity.uid);
+            return true;
+          });
+          writableFiles.push({
+            relPath: result.relPath,
+            language: result.language,
+            hash: result.hash,
+            indexedAt: result.nowIso,
+            mtimeMs: result.mtimeMs,
+            sizeBytes: result.sizeBytes,
+            entities: entitiesToWrite,
+            relations: result.relations,
+            unresolved: result.unresolved
+          });
+          if (result.usedFallback) {
+            parserFallbackFiles += 1;
+            fallbackByLanguage.set(result.language, (fallbackByLanguage.get(result.language) ?? 0) + 1);
+          }
+          for (const source of result.parserSources) {
+            parserSourceCounts.set(source, (parserSourceCounts.get(source) ?? 0) + 1);
           }
         }
-        if (checkpointEligible && manifestHash) {
-          for (const file of batch) {
-            completedFiles.add(file.relPath);
-          }
-          const checkpointState: CheckpointState = {
-            manifestHash,
-            completedFiles: [...completedFiles].sort(),
-            filesIndexed,
-            filesSkipped,
-            languages: [...languageSet].sort(),
-            entities: entityCount,
-            relations: relationCount,
-            unresolvedReferences: unresolvedCount,
-            lowConfidenceRelations: lowConfidenceCount
-          };
-          db.saveCheckpoint(checkpointName, stableNowIso(), checkpointState);
-          db.updateRunProgress(runId, filesIndexed, filesSkipped, checkpointState);
+
+        const writeBatchSize = Math.max(32, effectiveParallelism * 8);
+        for (const batch of chunkItems(writableFiles, writeBatchSize)) {
+          db.transaction(() => {
+            db.replaceAstFiles(batch);
+            for (const file of batch) {
+              languageSet.add(file.language);
+              filesIndexed += 1;
+              entityCount += file.entities.length;
+              relationCount += file.relations.length;
+              unresolvedCount += file.unresolved.length;
+              for (const relation of file.relations) {
+                if (relation.confidence < 0.4) {
+                  lowConfidenceCount += 1;
+                }
+              }
+            }
+            if (checkpointEligible && manifestHash) {
+              for (const file of batch) {
+                completedFiles.add(file.relPath);
+              }
+              const checkpointState: CheckpointState = {
+                manifestHash,
+                completedFiles: [...completedFiles].sort(),
+                filesIndexed,
+                filesSkipped,
+                languages: [...languageSet].sort(),
+                entities: entityCount,
+                relations: relationCount,
+                unresolvedReferences: unresolvedCount,
+                lowConfidenceRelations: lowConfidenceCount
+              };
+              db.saveCheckpoint(checkpointName, stableNowIso(), checkpointState);
+              db.updateRunProgress(runId, filesIndexed, filesSkipped, checkpointState);
+            }
+          });
         }
-      });
+      }
+    } finally {
+      await parsePool?.close();
+      parsePool = undefined;
     }
 
     const allFiles = filesIndexed + filesSkipped;
