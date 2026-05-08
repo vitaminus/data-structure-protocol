@@ -607,3 +607,11 @@ Status: done
 - Filter file-to-symbol `contains` edges out of persisted index writes while preserving class/module containment edges.
 - Synthesize file containment relations on read/export paths from entity ownership instead of storing every one in SQLite.
 - Drop redundant file-to-directory containment noise while keeping higher-level APIs and tests able to observe file containment.
+
+### 75. Turn reindex benchmarks into enforced CI and soak coverage
+
+Status: done
+
+- Refactor the benchmark harness into reusable shared code so smoke and soak runs exercise the same reindex path.
+- Make smoke benchmarks fail CI when they regress against the checked-in baseline instead of reporting best-effort artifacts only.
+- Add a separate scheduled and manually triggerable soak benchmark job that captures repeated warm-index and changed-only behavior over time.
