@@ -13,7 +13,7 @@ import { buildUid } from "../graph/uid.ts";
 import { mergeProvenance, topSourcePriority } from "../graph/provenance.ts";
 import { ensureDir } from "../util/fs.ts";
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 5;
 const SQLITE_LIST_CHUNK_SIZE = 400;
 const SQLITE_CACHE_SIZE_KB = 32 * 1024;
 const SQLITE_MMAP_SIZE_BYTES = 256 * 1024 * 1024;
@@ -176,6 +176,11 @@ export type StoredCheckpoint = {
 };
 
 export type DatabaseDoctorReport = {
+  schema: {
+    currentVersion: number;
+    expectedVersion: number;
+    upToDate: boolean;
+  };
   integrity: {
     ok: boolean;
     rows: string[];
@@ -345,14 +350,38 @@ export class DSPDatabase {
         PRIMARY KEY(language, file_path, content_hash)
       );
 
+      CREATE TABLE IF NOT EXISTS file_dependencies (
+        from_path TEXT NOT NULL,
+        to_path TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        PRIMARY KEY(from_path, to_path, kind)
+      );
+
+      CREATE TABLE IF NOT EXISTS symbol_dependencies (
+        from_uid TEXT NOT NULL,
+        to_uid TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        PRIMARY KEY(from_uid, to_uid, kind)
+      );
+
       CREATE VIRTUAL TABLE IF NOT EXISTS entity_fts
       USING fts5(uid UNINDEXED, name, path, description, docstring, tags);
 
       CREATE INDEX IF NOT EXISTS idx_entities_path ON entities(path);
       CREATE INDEX IF NOT EXISTS idx_entities_kind_path ON entities(kind, path);
+      CREATE INDEX IF NOT EXISTS idx_entities_language_kind_path ON entities(language, kind, path);
+      CREATE INDEX IF NOT EXISTS idx_entities_path_kind ON entities(path, kind);
       CREATE INDEX IF NOT EXISTS idx_relations_from_uid ON relations(from_uid);
       CREATE INDEX IF NOT EXISTS idx_relations_to_uid ON relations(to_uid);
       CREATE INDEX IF NOT EXISTS idx_relations_kind ON relations(kind);
+      CREATE INDEX IF NOT EXISTS idx_relations_kind_from_uid ON relations(kind, from_uid);
+      CREATE INDEX IF NOT EXISTS idx_relations_kind_to_uid ON relations(kind, to_uid);
+      CREATE INDEX IF NOT EXISTS idx_file_dependencies_to_path ON file_dependencies(to_path);
+      CREATE INDEX IF NOT EXISTS idx_file_dependencies_from_path ON file_dependencies(from_path);
+      CREATE INDEX IF NOT EXISTS idx_symbol_dependencies_to_uid ON symbol_dependencies(to_uid);
+      CREATE INDEX IF NOT EXISTS idx_symbol_dependencies_from_uid ON symbol_dependencies(from_uid);
       CREATE INDEX IF NOT EXISTS idx_unresolved_references_path ON unresolved_references(path);
       CREATE INDEX IF NOT EXISTS idx_embedding_buckets_uid ON embedding_buckets(uid);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoints_name ON checkpoints(name);
@@ -425,9 +454,47 @@ export class DSPDatabase {
       this.ensureFileHashColumn("mtime_ms", "INTEGER");
       this.ensureFileHashColumn("size_bytes", "INTEGER");
     }
+    if (current < 4) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS file_dependencies (
+          from_path TEXT NOT NULL,
+          to_path TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          confidence REAL NOT NULL,
+          PRIMARY KEY(from_path, to_path, kind)
+        );
+        CREATE TABLE IF NOT EXISTS symbol_dependencies (
+          from_uid TEXT NOT NULL,
+          to_uid TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          confidence REAL NOT NULL,
+          PRIMARY KEY(from_uid, to_uid, kind)
+        );
+        CREATE INDEX IF NOT EXISTS idx_file_dependencies_to_path ON file_dependencies(to_path);
+        CREATE INDEX IF NOT EXISTS idx_file_dependencies_from_path ON file_dependencies(from_path);
+        CREATE INDEX IF NOT EXISTS idx_symbol_dependencies_to_uid ON symbol_dependencies(to_uid);
+        CREATE INDEX IF NOT EXISTS idx_symbol_dependencies_from_uid ON symbol_dependencies(from_uid);
+      `);
+    }
+    if (current < 5) {
+      this.db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_entities_language_kind_path ON entities(language, kind, path);
+        CREATE INDEX IF NOT EXISTS idx_entities_path_kind ON entities(path, kind);
+        CREATE INDEX IF NOT EXISTS idx_relations_kind_from_uid ON relations(kind, from_uid);
+        CREATE INDEX IF NOT EXISTS idx_relations_kind_to_uid ON relations(kind, to_uid);
+      `);
+    }
     if (current < SCHEMA_VERSION) {
       this.setSchemaVersion(SCHEMA_VERSION);
     }
+  }
+
+  currentSchemaVersion(): number {
+    return this.schemaVersion();
+  }
+
+  expectedSchemaVersion(): number {
+    return SCHEMA_VERSION;
   }
 
   private ensureFileHashColumn(column: string, definition: string): void {
@@ -642,6 +709,11 @@ export class DSPDatabase {
       this.readDb.prepare("PRAGMA freelist_count").get() as { freelist_count?: number; count?: number } | undefined
     )?.freelist_count ?? 0;
     return {
+      schema: {
+        currentVersion,
+        expectedVersion,
+        upToDate: currentVersion === expectedVersion
+      },
       integrity,
       orphanedFileHashes: orphanedFileHashes.map((row) => row.path),
       orphanedEmbeddings: orphanedEmbeddings.map((row) => row.uid),

@@ -230,9 +230,17 @@ describe("DSPDatabase", () => {
       expect.arrayContaining([
         "idx_entities_path",
         "idx_entities_kind_path",
+        "idx_entities_language_kind_path",
+        "idx_entities_path_kind",
         "idx_relations_from_uid",
         "idx_relations_to_uid",
         "idx_relations_kind",
+        "idx_relations_kind_from_uid",
+        "idx_relations_kind_to_uid",
+        "idx_file_dependencies_to_path",
+        "idx_file_dependencies_from_path",
+        "idx_symbol_dependencies_to_uid",
+        "idx_symbol_dependencies_from_uid",
         "idx_unresolved_references_path"
       ])
     );
@@ -319,6 +327,11 @@ describe("DSPDatabase", () => {
 
     const report = db.doctor();
 
+    expect(report.schema).toEqual({
+      currentVersion: db.expectedSchemaVersion(),
+      expectedVersion: db.expectedSchemaVersion(),
+      upToDate: true
+    });
     expect(report.integrity.ok).toBe(true);
     expect(report.orphanedEmbeddings).toContain("missing:entity");
     expect(report.orphanedFileHashes).toContain("src/missing.ts");

@@ -77,7 +77,7 @@ Status: in progress
 
 ### 102. Tighten SQLite schema for hot paths and migration safety
 
-Status: in progress
+Status: done
 
 - Add or verify the remaining hot-path indexes, update schema versioning, and make `doctor` verify the active schema plus migration compatibility.
 - Evaluate targeted storage changes such as `WITHOUT ROWID`, typed hot metadata columns, batched upserts, and reduced JSON stringify/parse churn without breaking existing DBs.
