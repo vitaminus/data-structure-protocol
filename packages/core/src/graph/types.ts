@@ -220,6 +220,7 @@ export type FileIndexRequest = {
   full?: boolean;
   changedOnly?: boolean;
   fromGitDiff?: boolean;
+  baseRef?: string;
   noEmbeddings?: boolean;
 };
 

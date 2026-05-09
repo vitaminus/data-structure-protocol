@@ -567,7 +567,7 @@ export async function indexRepository(
     const requestedFiles = request.files?.map((file) => path.resolve(scanRoot, file));
     const changedEntries =
       request.fromGitDiff || request.changedOnly
-        ? changedFileEntriesFromGit(repoRoot).filter((entry) => {
+        ? changedFileEntriesFromGit(repoRoot, request.baseRef).filter((entry) => {
             const paths = [entry.path, entry.oldPath].filter(Boolean) as string[];
             return paths.some((file) => file === scanRoot || file.startsWith(`${scanRoot}${path.sep}`));
           })
@@ -892,10 +892,10 @@ export async function bootstrapRepository(
   };
 }
 
-export function changedFiles(db: DSPDatabase, rootDir: string): string[] {
+export function changedFiles(db: DSPDatabase, rootDir: string, baseRef?: string): string[] {
   const scanRoot = path.resolve(rootDir);
   const repoRoot = findRepoRoot(scanRoot);
-  const gitChanged = changedFilesFromGit(repoRoot).filter((file) => {
+  const gitChanged = changedFilesFromGit(repoRoot, baseRef).filter((file) => {
     if (file === scanRoot) {
       return true;
     }

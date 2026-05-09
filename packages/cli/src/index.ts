@@ -273,6 +273,7 @@ program
   .option("--full", "full reindex", false)
   .option("--changed-only", "index only changed files", false)
   .option("--from-git-diff", "index files from git diff", false)
+  .option("--base-ref <ref>", "git base ref or merge-base:<ref> for changed-only diff selection")
   .option("--no-embeddings", "disable embeddings for this run")
   .option("--json", "machine-readable output", false)
   .action(async (rootDir: string, options) => {
@@ -286,8 +287,9 @@ program
           full: options.full,
           changedOnly: options.changedOnly,
           fromGitDiff: options.fromGitDiff,
+          baseRef: options.baseRef,
           noEmbeddings: options.embeddings === false
-        }
+        } as any
       );
       printOutput(summary, options.json);
     } finally {
@@ -339,6 +341,7 @@ program
   .argument("[rootDir]", "root directory", ".")
   .option("--from-git-diff", "update from git diff", false)
   .option("--changed-only", "only changed files", false)
+  .option("--base-ref <ref>", "git base ref or merge-base:<ref> for changed-only diff selection")
   .option("--json", "machine-readable output", false)
   .action(async (rootDir: string, options) => {
     const services = openDSP(path.resolve(rootDir), adapters());
@@ -346,8 +349,9 @@ program
       const summary = await runIndex(services, {
         rootDir: services.rootDir,
         fromGitDiff: options.fromGitDiff,
-        changedOnly: options.changedOnly
-      });
+        changedOnly: options.changedOnly,
+        baseRef: options.baseRef
+      } as any);
       printOutput(summary, options.json);
     } finally {
       services.db.close();
@@ -357,11 +361,14 @@ program
 program
   .command("changed")
   .argument("[rootDir]", "root directory", ".")
+  .option("--base-ref <ref>", "git base ref or merge-base:<ref> for changed-file listing")
   .option("--json", "machine-readable output", false)
-  .action((rootDir: string, options: { json: boolean }) => {
+  .action((rootDir: string, options: { baseRef?: string; json: boolean }) => {
     const services = openDSP(path.resolve(rootDir), adapters());
     try {
-      const result = runChanged(services);
+      const result = (runChanged as (services: DSPServices, options: { baseRef?: string }) => string[])(services, {
+        baseRef: options.baseRef
+      });
       printOutput(result, options.json);
     } finally {
       services.db.close();

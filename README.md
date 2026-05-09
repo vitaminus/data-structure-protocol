@@ -57,7 +57,7 @@ pnpm dsp export --format protocol
 - Multi-language indexing (TS/JS, Python, Rust, Ruby)
 - SQLite canonical graph storage
 - JSON import/export + deterministic `.dsp/` export
-- Incremental `update` and git-aware changed-file indexing
+- Incremental `update` and git-aware changed-file indexing, including `--base-ref` and `merge-base:<ref>` PR-mode diffs
 - Impact analysis and stale-index validation
 - MCP tools for agent integration (`dsp.get_context_pack`, search, impact, validate)
 

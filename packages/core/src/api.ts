@@ -93,8 +93,8 @@ export async function runBootstrap(
   return bootstrapRepository(services.db, services.adapters, services.rootDir, services.config, options);
 }
 
-export function runChanged(services: DSPServices): string[] {
-  return changedFiles(services.db, services.rootDir);
+export function runChanged(services: DSPServices, options: { baseRef?: string } = {}): string[] {
+  return changedFiles(services.db, services.rootDir, options.baseRef);
 }
 
 export async function runSearch(
