@@ -1,0 +1,36 @@
+{
+  "max": {
+    "tiny-synthetic-ts": {
+      "coldBootstrapMs": 600,
+      "warmIndexMs": 250,
+      "changedOnlyMs": 150,
+      "searchP95Ms": 120,
+      "searchCandidatesP50": 500,
+      "contextPackP95Ms": 180,
+      "validateMs": 120,
+      "rssMb": 512,
+      "dbSizeMb": 20
+    },
+    "medium-synthetic-ts": {
+      "coldBootstrapMs": 2500,
+      "warmIndexMs": 900,
+      "changedOnlyMs": 400,
+      "searchP95Ms": 250,
+      "searchCandidatesP50": 500,
+      "contextPackP95Ms": 350,
+      "validateMs": 300,
+      "rssMb": 768,
+      "dbSizeMb": 48
+    }
+  },
+  "min": {
+    "tiny-synthetic-ts": {
+      "retrievalRecallAt5": 1,
+      "retrievalRecallAt10": 1
+    },
+    "medium-synthetic-ts": {
+      "retrievalRecallAt5": 1,
+      "retrievalRecallAt10": 1
+    }
+  }
+}

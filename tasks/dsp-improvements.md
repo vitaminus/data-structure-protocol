@@ -93,7 +93,7 @@ Status: in progress
 
 ### 104. Expand benchmark fixtures and CI performance gates
 
-Status: in progress
+Status: done
 
 - Add realistic fixtures for a small TS app, Next.js-like app, Rails-like app, Rust workspace, FastAPI-like app, and a mixed monorepo scale target.
 - Extend benchmark results with changed-only timings, search/context-pack p50/p95, impact p95, validate time, RSS, DB size, parser fallback counters, worker restarts/timeouts, query count, and recall metrics.

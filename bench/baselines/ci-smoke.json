@@ -14,7 +14,8 @@
   },
   "min": {
     "tiny-synthetic-ts": {
-      "retrievalRecallAt5": 1
+      "retrievalRecallAt5": 1,
+      "retrievalRecallAt10": 1
     }
   }
 }
