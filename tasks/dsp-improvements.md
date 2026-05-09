@@ -85,7 +85,7 @@ Status: done
 
 ### 103. Improve semantic/vector search scalability and recall measurement
 
-Status: in progress
+Status: done
 
 - Replace the current embedding bucket strategy with a stronger ANN path or a materially better bounded-LSH alternative that works locally.
 - Make embedding cache identity include provider key/content hash and keep lexical fallback behavior intact when embeddings are disabled or missing.

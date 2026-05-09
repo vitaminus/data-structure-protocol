@@ -12,6 +12,7 @@ import type {
 import { buildUid } from "../graph/uid.ts";
 import { mergeProvenance, topSourcePriority } from "../graph/provenance.ts";
 import { ensureDir } from "../util/fs.ts";
+import { safeJsonParse } from "./json.ts";
 
 const SCHEMA_VERSION = 5;
 const SQLITE_LIST_CHUNK_SIZE = 400;
@@ -22,7 +23,11 @@ const SQLITE_BUSY_RETRIES = 4;
 const PARSE_CACHE_MAX_ROWS = 20000;
 const PARSE_CACHE_MAX_AGE_DAYS = 30;
 const SQLITE_VACUUM_FREELIST_THRESHOLD = 2000;
-const EMBEDDING_BUCKET_BITS = 8;
+const STALE_INDEX_RUN_AFTER_MS = 60 * 60 * 1000;
+const STALE_CHECKPOINT_AFTER_MS = 24 * 60 * 60 * 1000;
+const EMBEDDING_BUCKET_BITS = 12;
+const EMBEDDING_BUCKET_FAMILIES = 4;
+const EMBEDDING_BUCKET_MAX_HAMMING_DISTANCE = 1;
 
 function toJson(value: unknown): string {
   return JSON.stringify(value ?? null);
@@ -32,21 +37,77 @@ function fromJson<T>(value: string | null): T {
   return value ? (JSON.parse(value) as T) : (null as T);
 }
 
-function embeddingBucketKey(vector: number[]): string {
-  const bits: string[] = [];
-  for (let index = 0; index < EMBEDDING_BUCKET_BITS; index += 1) {
-    bits.push((vector[index] ?? 0) >= 0 ? "1" : "0");
-  }
-  return bits.join("");
+function safeJsonObject(value: string | null): { ok: boolean; value: Record<string, unknown> } {
+  return safeJsonParse<Record<string, unknown>>(value, {});
 }
 
-function embeddingBucketNeighbors(bucketKey: string): string[] {
+function normalizeVector(vector: number[]): number[] {
+  let norm = 0;
+  for (const value of vector) {
+    norm += value * value;
+  }
+  if (norm <= 0) {
+    return vector.map(() => 0);
+  }
+  const scale = Math.sqrt(norm);
+  return vector.map((value) => value / scale);
+}
+
+function projectionWeight(family: number, bit: number, dimension: number): number {
+  let state = (family + 1) * 0x9e3779b1 ^ (bit + 1) * 0x85ebca6b ^ (dimension + 1) * 0xc2b2ae35;
+  state ^= state >>> 16;
+  state = Math.imul(state, 0x7feb352d);
+  state ^= state >>> 15;
+  state = Math.imul(state, 0x846ca68b);
+  state ^= state >>> 16;
+  return (state & 1) === 0 ? -1 : 1;
+}
+
+function embeddingBucketKeyForFamily(vector: number[], family: number): string {
+  const normalized = normalizeVector(vector);
+  const bits: string[] = [];
+  for (let bit = 0; bit < EMBEDDING_BUCKET_BITS; bit += 1) {
+    let dot = 0;
+    for (let dimension = 0; dimension < normalized.length; dimension += 1) {
+      dot += (normalized[dimension] ?? 0) * projectionWeight(family, bit, dimension);
+    }
+    bits.push(dot >= 0 ? "1" : "0");
+  }
+  return `f${family}:${bits.join("")}`;
+}
+
+function embeddingBucketKeys(vector: number[]): string[] {
+  const keys: string[] = [];
+  for (let family = 0; family < EMBEDDING_BUCKET_FAMILIES; family += 1) {
+    keys.push(embeddingBucketKeyForFamily(vector, family));
+  }
+  return keys;
+}
+
+function embeddingBucketNeighbors(bucketKey: string, maxHammingDistance = EMBEDDING_BUCKET_MAX_HAMMING_DISTANCE): string[] {
+  const separator = bucketKey.indexOf(":");
+  if (separator === -1) {
+    return [bucketKey];
+  }
+  const familyPrefix = bucketKey.slice(0, separator + 1);
+  const bits = bucketKey.slice(separator + 1);
   const neighbors = [bucketKey];
-  for (let index = 0; index < bucketKey.length; index += 1) {
-    const flipped = bucketKey.slice(0, index) + (bucketKey[index] === "1" ? "0" : "1") + bucketKey.slice(index + 1);
-    neighbors.push(flipped);
+  if (maxHammingDistance <= 0) {
+    return neighbors;
+  }
+  for (let index = 0; index < bits.length; index += 1) {
+    const flipped = bits.slice(0, index) + (bits[index] === "1" ? "0" : "1") + bits.slice(index + 1);
+    neighbors.push(`${familyPrefix}${flipped}`);
   }
   return neighbors;
+}
+
+function embeddingBucketQueryKeys(vector: number[]): string[] {
+  const keys: string[] = [];
+  for (const bucketKey of embeddingBucketKeys(vector)) {
+    keys.push(...embeddingBucketNeighbors(bucketKey));
+  }
+  return [...new Set(keys)];
 }
 
 function protocolUidForEntity(entity: Entity): string {
@@ -2019,7 +2080,8 @@ export class DSPDatabase {
   }
 
   setEmbedding(uid: string, hash: string, vector: number[], provider: string, updatedAt: string): void {
-    const bucketKey = embeddingBucketKey(vector);
+    const normalizedVector = normalizeVector(vector);
+    const bucketKeys = embeddingBucketKeys(normalizedVector);
     this.transaction(() => {
       this.db
         .prepare(
@@ -2033,12 +2095,14 @@ export class DSPDatabase {
           updated_at = excluded.updated_at
         `
         )
-        .run(uid, hash, toJson(vector), provider, updatedAt);
+        .run(uid, hash, toJson(normalizedVector), provider, updatedAt);
       this.prepareCached("clear-embedding-buckets-for-uid", "DELETE FROM embedding_buckets WHERE uid = ?").run(uid);
-      this.prepareCached(
-        "insert-embedding-bucket",
-        "INSERT OR REPLACE INTO embedding_buckets(provider, bucket_key, uid) VALUES (?, ?, ?)"
-      ).run(provider, bucketKey, uid);
+      for (const bucketKey of bucketKeys) {
+        this.prepareCached(
+          "insert-embedding-bucket",
+          "INSERT OR REPLACE INTO embedding_buckets(provider, bucket_key, uid) VALUES (?, ?, ?)"
+        ).run(provider, bucketKey, uid);
+      }
     });
   }
 
@@ -2131,7 +2195,7 @@ export class DSPDatabase {
     const scanLimit = options.scanLimit ?? Math.max(topK * 20, 2000);
     const bucketCandidates = this.getEmbeddingsByBucket(
       provider,
-      embeddingBucketNeighbors(embeddingBucketKey(queryVector)),
+      embeddingBucketQueryKeys(queryVector),
       scanLimit
     );
     const scanSource = bucketCandidates.length >= Math.min(topK, 10)

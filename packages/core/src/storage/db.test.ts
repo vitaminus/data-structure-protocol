@@ -372,6 +372,20 @@ describe("DSPDatabase", () => {
     expect(results.map((row) => row.uid)).toEqual(["entity:alpha", "entity:beta"]);
   });
 
+  it("stores multiple LSH bucket entries per embedding", () => {
+    const now = stableNowIso();
+    db.setEmbedding("entity:alpha", "hash-a", [1, 0.5, -0.25, 0.75, -0.5, 0.1, 0.2, -0.3], "mock", now);
+
+    const sqlite = new Database(db.dbPath, { readonly: true });
+    const rows = sqlite
+      .prepare("SELECT bucket_key FROM embedding_buckets WHERE provider = ? AND uid = ? ORDER BY bucket_key")
+      .all("mock", "entity:alpha") as { bucket_key: string }[];
+    sqlite.close();
+
+    expect(rows).toHaveLength(4);
+    expect(rows.every((row) => /^f\d:/.test(row.bucket_key))).toBe(true);
+  });
+
   it("indexes entities into SQLite FTS for lexical candidate lookup", () => {
     const now = stableNowIso();
     const uid = buildUid("function", "src/users.ts", "createUser");
