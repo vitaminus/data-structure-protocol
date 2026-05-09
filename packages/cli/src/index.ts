@@ -420,10 +420,13 @@ program
   .argument("<uidOrPath>", "entity uid or path")
   .argument("[rootDir]", "root directory", ".")
   .option("--depth <number>", "graph depth", "2")
+  .option("--max-depth <number>", "maximum traversal depth override")
+  .option("--max-nodes <number>", "maximum graph nodes to return")
   .option("--max-entities <number>", "maximum graph entities to return")
   .option("--max-relations <number>", "maximum graph relations to return")
   .option("--max-files <number>", "maximum graph files to include")
   .option("--max-estimated-tokens <number>", "maximum estimated graph tokens")
+  .option("--timeout-ms <number>", "maximum traversal time in milliseconds")
   .option("--json", "machine-readable output", false)
   .action(
     (
@@ -431,10 +434,13 @@ program
       rootDir: string,
       options: {
         depth: string;
+        maxDepth?: string;
+        maxNodes?: string;
         maxEntities?: string;
         maxRelations?: string;
         maxFiles?: string;
         maxEstimatedTokens?: string;
+        timeoutMs?: string;
         json: boolean;
       }
     ) => {
@@ -446,11 +452,14 @@ program
           return;
         }
         const graph = getNeighbors(services.db, entity.uid, Number(options.depth), {
+          maxDepth: options.maxDepth ? Number(options.maxDepth) : undefined,
+          maxNodes: options.maxNodes ? Number(options.maxNodes) : undefined,
           maxEntities: options.maxEntities ? Number(options.maxEntities) : undefined,
           maxRelations: options.maxRelations ? Number(options.maxRelations) : undefined,
           maxFiles: options.maxFiles ? Number(options.maxFiles) : undefined,
-          maxEstimatedTokens: options.maxEstimatedTokens ? Number(options.maxEstimatedTokens) : undefined
-        });
+          maxEstimatedTokens: options.maxEstimatedTokens ? Number(options.maxEstimatedTokens) : undefined,
+          timeoutMs: options.timeoutMs ? Number(options.timeoutMs) : undefined
+        } as any);
         printOutput({ root: entity.uid, ...graph }, options.json);
       } finally {
         services.db.close();
@@ -888,16 +897,35 @@ program
   .command("impact")
   .argument("<uidOrPath>", "target uid or path")
   .argument("[rootDir]", "root directory", ".")
+  .option("--max-depth <number>", "maximum reverse-dependency depth")
+  .option("--max-nodes <number>", "maximum impacted nodes to traverse")
+  .option("--max-relations <number>", "maximum dependency relations to inspect")
+  .option("--timeout-ms <number>", "maximum impact-analysis time in milliseconds")
   .option("--json", "machine-readable output", false)
-  .action((uidOrPath: string, rootDir: string, options: { json: boolean }) => {
-    const services = openDSP(path.resolve(rootDir), adapters());
-    try {
-      const result = runImpact(services, uidOrPath);
-      printOutput(result, options.json);
-    } finally {
-      services.db.close();
+  .action(
+    (
+      uidOrPath: string,
+      rootDir: string,
+      options: { maxDepth?: string; maxNodes?: string; maxRelations?: string; timeoutMs?: string; json: boolean }
+    ) => {
+      const services = openDSP(path.resolve(rootDir), adapters());
+      try {
+        const result = (runImpact as (services: DSPServices, target: string, options: Record<string, number | undefined>) => unknown)(
+          services,
+          uidOrPath,
+          {
+            maxDepth: options.maxDepth ? Number(options.maxDepth) : undefined,
+            maxNodes: options.maxNodes ? Number(options.maxNodes) : undefined,
+            maxRelations: options.maxRelations ? Number(options.maxRelations) : undefined,
+            timeoutMs: options.timeoutMs ? Number(options.timeoutMs) : undefined
+          }
+        );
+        printOutput(result, options.json);
+      } finally {
+        services.db.close();
+      }
     }
-  });
+  );
 
 program
   .command("validate")

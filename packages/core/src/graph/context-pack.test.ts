@@ -191,6 +191,36 @@ describe("context pack", () => {
     expect(result.code?.[0]?.content).toContain("createToken");
   });
 
+  it("records unreadable code payload files in risk notes", async () => {
+    fs.mkdirSync(path.join(tempDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, "src", "auth.ts"), Buffer.from([0x61, 0x00, 0x62]));
+
+    const now = stableNowIso();
+    const authUid = buildUid("function", "src/auth.ts", "login");
+    db.upsertEntity({
+      uid: authUid,
+      kind: "function",
+      name: "login",
+      path: "src/auth.ts",
+      description: "Handles authentication logic",
+      startLine: 1,
+      endLine: 1,
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+
+    const result = await buildContextPack(db, {
+      task: "authentication login",
+      includeCode: "full-files",
+      strategy: "debug"
+    });
+
+    expect(result.code ?? []).toEqual([]);
+    expect(result.riskNotes.some((note) => note.includes("src/auth.ts (binary)"))).toBe(true);
+  });
+
   it("filters test-only graph dependencies when tests are excluded", async () => {
     const now = stableNowIso();
     const authUid = buildUid("function", "src/auth.ts", "login");
@@ -474,6 +504,41 @@ describe("context pack", () => {
 
     expect(result.relevantEntities.map((entity) => entity.uid)).toContain(importantUid);
     expect(result.truncated).toBe(true);
+    expect(result.truncationReason).toBe("maxRelations");
     expect(result.riskNotes.some((note) => note.includes("Graph dependencies truncated"))).toBe(true);
+  });
+
+  it("surfaces traversal timeout truncation in context packs", async () => {
+    const now = stableNowIso();
+    const authUid = buildUid("function", "src/auth.ts", "login");
+    const serviceUid = buildUid("function", "src/session.ts", "createSession");
+
+    db.upsertEntity({
+      uid: serviceUid,
+      kind: "function",
+      name: "createSession",
+      path: "src/session.ts",
+      description: "Session service used by authentication login",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+      createdAt: now,
+      updatedAt: now
+    });
+    db.upsertRelation({
+      from: authUid,
+      to: serviceUid,
+      kind: "calls",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+
+    const result = await buildContextPack(db, {
+      task: "authentication login",
+      maxDepth: 1,
+      timeoutMs: 0
+    });
+
+    expect(result.truncated).toBe(true);
+    expect(result.truncationReason).toBe("timeout");
   });
 });

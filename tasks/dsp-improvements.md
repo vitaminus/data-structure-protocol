@@ -21,7 +21,7 @@ Status: in progress
 
 ### 95. Add hard truncation limits to traversal, impact, and context-pack
 
-Status: in progress
+Status: done
 
 - Introduce shared traversal limits for `maxDepth`, `maxNodes`, `maxRelations`, and `timeoutMs` across graph traversal, impact analysis, and context-pack expansion.
 - Extend `ImpactResult`, CLI output, and MCP output with explicit `truncated` state and `truncationReason` so large or cyclic graphs fail predictably instead of hanging.

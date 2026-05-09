@@ -105,6 +105,9 @@ describe("mcp tool dispatcher", () => {
               "depth": {
                 "type": "number",
               },
+              "maxDepth": {
+                "type": "number",
+              },
               "maxEntities": {
                 "type": "number",
               },
@@ -114,7 +117,13 @@ describe("mcp tool dispatcher", () => {
               "maxFiles": {
                 "type": "number",
               },
+              "maxNodes": {
+                "type": "number",
+              },
               "maxRelations": {
+                "type": "number",
+              },
+              "timeoutMs": {
                 "type": "number",
               },
               "uid": {
@@ -131,8 +140,20 @@ describe("mcp tool dispatcher", () => {
         {
           "inputSchema": {
             "properties": {
+              "maxDepth": {
+                "type": "number",
+              },
+              "maxNodes": {
+                "type": "number",
+              },
+              "maxRelations": {
+                "type": "number",
+              },
               "target": {
                 "type": "string",
+              },
+              "timeoutMs": {
+                "type": "number",
               },
             },
             "required": [
@@ -189,6 +210,12 @@ describe("mcp tool dispatcher", () => {
               "maxFiles": {
                 "type": "number",
               },
+              "maxNodes": {
+                "type": "number",
+              },
+              "maxRelations": {
+                "type": "number",
+              },
               "maxTokens": {
                 "type": "number",
               },
@@ -197,6 +224,9 @@ describe("mcp tool dispatcher", () => {
               },
               "task": {
                 "type": "string",
+              },
+              "timeoutMs": {
+                "type": "number",
               },
             },
             "required": [

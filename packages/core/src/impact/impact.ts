@@ -1,5 +1,6 @@
+import { performance } from "node:perf_hooks";
 import type { DSPDatabase } from "../storage/db.ts";
-import type { ImpactResult, RelationKind } from "../graph/types.ts";
+import type { ImpactResult, RelationKind, TraversalLimits, TraversalTruncationReason } from "../graph/types.ts";
 import { buildUid, normalizePath } from "../graph/uid.ts";
 
 const IMPACT_KINDS: Set<RelationKind> = new Set([
@@ -19,35 +20,120 @@ export function resolveTargetUid(target: string): string {
   return buildUid("file", normalizePath(target));
 }
 
-export function analyzeImpact(db: DSPDatabase, target: string): ImpactResult {
-  const targetUid = resolveTargetUid(target);
-  const directRelations = db
-    .getRelationsTo(targetUid)
-    .filter((relation) => IMPACT_KINDS.has(relation.kind));
-  const direct = [...new Set(directRelations.map((relation) => relation.from))];
+function normalizedImpactLimits(options: TraversalLimits): Required<TraversalLimits> {
+  const maxDepth = Math.floor(options.maxDepth ?? Number.POSITIVE_INFINITY);
+  const maxNodes = Math.floor(options.maxNodes ?? Number.POSITIVE_INFINITY);
+  const maxRelations = Math.floor(options.maxRelations ?? Number.POSITIVE_INFINITY);
+  const timeoutMs = Math.floor(options.timeoutMs ?? Number.POSITIVE_INFINITY);
+  return {
+    maxDepth: Number.isFinite(maxDepth) ? Math.max(0, maxDepth) : Number.POSITIVE_INFINITY,
+    maxNodes: Number.isFinite(maxNodes) ? Math.max(1, maxNodes) : Number.POSITIVE_INFINITY,
+    maxRelations: Number.isFinite(maxRelations) ? Math.max(0, maxRelations) : Number.POSITIVE_INFINITY,
+    timeoutMs: Number.isFinite(timeoutMs) ? Math.max(0, timeoutMs) : Number.POSITIVE_INFINITY
+  };
+}
 
-  const visited = new Set<string>([targetUid, ...direct]);
-  const queue = [...direct];
+export function analyzeImpact(db: DSPDatabase, target: string, options: TraversalLimits = {}): ImpactResult {
+  const targetUid = resolveTargetUid(target);
+  const limits = normalizedImpactLimits(options);
+  const startedAt = performance.now();
+  const cache = db.createGraphReadCache();
+  let truncationReason: TraversalTruncationReason | undefined;
+  let traversedRelations = 0;
+
+  const markTruncated = (reason: TraversalTruncationReason): void => {
+    if (!truncationReason) {
+      truncationReason = reason;
+    }
+  };
+
+  const timedOut = (): boolean => performance.now() - startedAt >= limits.timeoutMs;
+  const directRelations = db
+    .getRelationsToCached(targetUid, cache)
+    .filter((relation) => IMPACT_KINDS.has(relation.kind));
+  const direct: string[] = [];
+  const directSeen = new Set<string>();
+  const visited = new Set<string>([targetUid]);
+
+  for (const relation of directRelations) {
+    if (timedOut()) {
+      markTruncated("timeout");
+      break;
+    }
+    if (traversedRelations >= limits.maxRelations) {
+      markTruncated("maxRelations");
+      break;
+    }
+    if (limits.maxDepth < 1) {
+      markTruncated("maxDepth");
+      break;
+    }
+    if (directSeen.has(relation.from)) {
+      traversedRelations += 1;
+      continue;
+    }
+    if (visited.size + 1 > limits.maxNodes) {
+      markTruncated("maxNodes");
+      break;
+    }
+    traversedRelations += 1;
+    directSeen.add(relation.from);
+    direct.push(relation.from);
+    visited.add(relation.from);
+  }
+
+  const queue = direct.map((uid) => ({ uid, depth: 1 }));
   const transitive: string[] = [];
   while (queue.length > 0) {
+    if (timedOut()) {
+      markTruncated("timeout");
+      break;
+    }
     const current = queue.shift()!;
+    if (current.depth >= limits.maxDepth) {
+      const parentsAtDepthLimit = db
+        .getRelationsToCached(current.uid, cache)
+        .filter((relation) => IMPACT_KINDS.has(relation.kind) && !visited.has(relation.from));
+      if (parentsAtDepthLimit.length > 0) {
+        markTruncated("maxDepth");
+        break;
+      }
+      continue;
+    }
     const parents = db
-      .getRelationsTo(current)
+      .getRelationsToCached(current.uid, cache)
       .filter((relation) => IMPACT_KINDS.has(relation.kind))
       .map((relation) => relation.from);
     for (const parent of parents) {
+      if (timedOut()) {
+        markTruncated("timeout");
+        break;
+      }
+      if (traversedRelations >= limits.maxRelations) {
+        markTruncated("maxRelations");
+        break;
+      }
+      traversedRelations += 1;
       if (!visited.has(parent)) {
+        if (visited.size + 1 > limits.maxNodes) {
+          markTruncated("maxNodes");
+          break;
+        }
         visited.add(parent);
         transitive.push(parent);
-        queue.push(parent);
+        queue.push({ uid: parent, depth: current.depth + 1 });
       }
+    }
+    if (truncationReason) {
+      break;
     }
   }
 
   const allDependents = [...direct, ...transitive];
-  const tests = allDependents.filter((uid) => db.getEntity(uid)?.kind === "test");
-  const targetEntity = db.getEntity(targetUid);
-  const exportRelations = db.getRelationsTo(targetUid).filter((relation) => relation.kind === "exports");
+  const entitiesByUid = new Map(db.getEntitiesByUidCached([targetUid, ...allDependents], cache).map((entity) => [entity.uid, entity]));
+  const tests = allDependents.filter((uid) => entitiesByUid.get(uid)?.kind === "test");
+  const targetEntity = entitiesByUid.get(targetUid);
+  const exportRelations = db.getRelationsToCached(targetUid, cache).filter((relation) => relation.kind === "exports");
   const publicApiAffected = Boolean(targetEntity?.metadata?.public) || exportRelations.length > 0;
 
   let riskScore: ImpactResult["riskScore"] = "LOW";
@@ -61,7 +147,7 @@ export function analyzeImpact(db: DSPDatabase, target: string): ImpactResult {
   if (allDependents.length > 6) {
     reasons.push("wide dependency surface");
   }
-  if (allDependents.some((uid) => db.getEntity(uid)?.kind === "route")) {
+  if (allDependents.some((uid) => entitiesByUid.get(uid)?.kind === "route")) {
     reasons.push("used by route");
   }
   if (reasons.length >= 3) {
@@ -76,7 +162,7 @@ export function analyzeImpact(db: DSPDatabase, target: string): ImpactResult {
       ? 0.4
       : Math.max(0.1, confidenceValues.reduce((acc, value) => acc + value, 0) / confidenceValues.length);
 
-  const suggestedFiles = [...new Set(allDependents.map((uid) => db.getEntity(uid)?.path).filter(Boolean))] as string[];
+  const suggestedFiles = [...new Set(allDependents.map((uid) => entitiesByUid.get(uid)?.path).filter(Boolean))] as string[];
 
   return {
     target: targetUid,
@@ -87,6 +173,8 @@ export function analyzeImpact(db: DSPDatabase, target: string): ImpactResult {
     riskScore,
     suggestedFiles,
     confidence,
-    reasons
+    reasons,
+    truncated: Boolean(truncationReason),
+    ...(truncationReason ? { truncationReason } : {})
   };
 }

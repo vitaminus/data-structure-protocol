@@ -78,5 +78,32 @@ describe("impact analysis", () => {
     expect(result.directDependents.length).toBeGreaterThanOrEqual(2);
     expect(result.transitiveDependents.length).toBeGreaterThanOrEqual(1);
     expect(result.testsAffected.length).toBeGreaterThanOrEqual(1);
+    expect(result.truncated).toBe(false);
+  });
+
+  it("reports truncation when maxDepth prevents transitive expansion", () => {
+    const result = analyzeImpact(db, buildUid("function", "src/billing/calc.ts", "calculate"), { maxDepth: 1 });
+    expect(result.directDependents.length).toBeGreaterThanOrEqual(2);
+    expect(result.transitiveDependents).toEqual([]);
+    expect(result.truncated).toBe(true);
+    expect(result.truncationReason).toBe("maxDepth");
+  });
+
+  it("reports truncation when maxNodes is exhausted", () => {
+    const result = analyzeImpact(db, buildUid("function", "src/billing/calc.ts", "calculate"), { maxNodes: 2 });
+    expect(result.truncated).toBe(true);
+    expect(result.truncationReason).toBe("maxNodes");
+  });
+
+  it("reports truncation when maxRelations is exhausted", () => {
+    const result = analyzeImpact(db, buildUid("function", "src/billing/calc.ts", "calculate"), { maxRelations: 1 });
+    expect(result.truncated).toBe(true);
+    expect(result.truncationReason).toBe("maxRelations");
+  });
+
+  it("reports truncation when timeout is exhausted", () => {
+    const result = analyzeImpact(db, buildUid("function", "src/billing/calc.ts", "calculate"), { timeoutMs: 0 });
+    expect(result.truncated).toBe(true);
+    expect(result.truncationReason).toBe("timeout");
   });
 });

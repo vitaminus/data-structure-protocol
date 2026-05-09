@@ -1,6 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { ContextPackRequest, ContextPackResponse, EmbeddingProvider, Entity, Relation } from "./types.ts";
+import type {
+  ContextPackRequest,
+  ContextPackResponse,
+  EmbeddingProvider,
+  Entity,
+  Relation,
+  TraversalTruncationReason
+} from "./types.ts";
 import { DSPDatabase } from "../storage/db.ts";
 import { semanticSearch } from "../semantic/search.ts";
 import { relationPriority, streamNeighbors } from "./query.ts";
@@ -164,26 +171,30 @@ async function relationDepthFilter(
   db: DSPDatabase,
   seedUids: Set<string>,
   maxDepth: number,
-  options: { maxEntities: number; maxRelations: number }
-): Promise<{ entities: Set<string>; relations: Relation[] }> {
+  options: { maxEntities: number; maxRelations: number; timeoutMs?: number }
+): Promise<{ entities: Set<string>; relations: Relation[]; truncated: boolean; truncationReason?: TraversalTruncationReason }> {
   const accepted: Relation[] = [];
   const acceptedKeys = new Set<string>();
   const visited = new Set<string>(seedUids);
+  let truncationReason: TraversalTruncationReason | undefined;
 
   for (const seedUid of seedUids) {
     if (accepted.length >= options.maxRelations || visited.size >= options.maxEntities) {
+      truncationReason ??= accepted.length >= options.maxRelations ? "maxRelations" : "maxNodes";
       break;
     }
     for await (const event of streamNeighbors(db, seedUid, maxDepth, {
       maxEntities: options.maxEntities,
-      maxRelations: options.maxRelations - accepted.length
+      maxRelations: options.maxRelations - accepted.length,
+      timeoutMs: options.timeoutMs
     })) {
       if (event.type === "entity") {
         visited.add(event.entity.uid);
-        if (visited.size >= options.maxEntities) {
-          break;
-        }
         continue;
+      }
+      if (event.type === "truncation") {
+        truncationReason ??= event.reason;
+        break;
       }
       const relation = event.relation;
       const relationKey = `${relation.from}\0${relation.kind}\0${relation.to}`;
@@ -198,12 +209,17 @@ async function relationDepthFilter(
       accepted.push(relation);
       visited.add(relation.from);
       visited.add(relation.to);
-      if (accepted.length >= options.maxRelations || visited.size >= options.maxEntities) {
-        break;
-      }
+    }
+    if (truncationReason) {
+      break;
     }
   }
-  return { entities: visited, relations: accepted };
+  return {
+    entities: visited,
+    relations: accepted,
+    truncated: Boolean(truncationReason),
+    ...(truncationReason ? { truncationReason } : {})
+  };
 }
 
 function contextPackServices(input: DSPDatabase | ContextPackServices): ContextPackServices {
@@ -360,14 +376,23 @@ function enforceContextBudget(context: ContextPackResponse): ContextPackResponse
   ];
 
   for (const stage of stages) {
-    current = alignContextLists({ ...stage(current), truncated: true });
+    current = alignContextLists({
+      ...stage(current),
+      truncated: true,
+      truncationReason: current.truncationReason ?? "maxTokens"
+    });
     estimatedTokens = estimateContextTokens(current);
     if (estimatedTokens <= current.maxTokens) {
       return { ...current, estimatedTokens };
     }
   }
 
-  return { ...current, estimatedTokens: Math.min(estimatedTokens, current.maxTokens), truncated: true };
+  return {
+    ...current,
+    estimatedTokens: Math.min(estimatedTokens, current.maxTokens),
+    truncated: true,
+    truncationReason: current.truncationReason ?? "maxTokens"
+  };
 }
 
 async function rerankContextEntities(
@@ -455,16 +480,17 @@ export async function buildContextPack(
   const selectedEntities = rankedEntities.slice(0, maxFiles * 3);
   const selectedUids = new Set(selectedEntities.map((entity) => entity.uid));
   const maxTraversalEntities = Math.min(
-    Math.max(maxFiles * 8, selectedUids.size),
+    request.maxNodes ?? Math.max(maxFiles * 8, selectedUids.size),
     Math.max(48, Math.floor(maxTokens / 40))
   );
   const maxTraversalRelations = Math.min(
-    Math.max(maxFiles * 40, 300),
+    request.maxRelations ?? Math.max(maxFiles * 40, 300),
     Math.max(120, Math.floor(maxTokens / 12))
   );
   const graphSlice = await relationDepthFilter(db, selectedUids, maxDepth, {
     maxEntities: maxTraversalEntities,
-    maxRelations: maxTraversalRelations
+    maxRelations: maxTraversalRelations,
+    timeoutMs: request.timeoutMs
   });
   const contextEntities = [...selectedEntities];
   const contextEntityUids = new Set(contextEntities.map((entity) => entity.uid));
@@ -478,7 +504,9 @@ export async function buildContextPack(
       (includeTests || !relationHasTestEndpoint(relation, entitiesByUid))
   );
   const dependencies = graphDependencies.slice(0, 300);
-  const dependenciesTruncated = graphDependencies.length > dependencies.length;
+  const dependenciesTruncated = graphSlice.truncated || graphDependencies.length > dependencies.length;
+  const traversalTruncationReason =
+    graphDependencies.length > dependencies.length ? "maxRelations" : graphSlice.truncationReason;
   for (const uid of graphSlice.entities) {
     const entity = entitiesByUid.get(uid);
     if (!includeTests && entity?.kind === "test") {
@@ -529,7 +557,8 @@ export async function buildContextPack(
     suggestedEditOrder,
     estimatedTokens: 0,
     maxTokens,
-    truncated: dependenciesTruncated
+    truncated: dependenciesTruncated,
+    ...(traversalTruncationReason ? { truncationReason: traversalTruncationReason } : {})
   };
   return enforceContextBudget(context);
 }

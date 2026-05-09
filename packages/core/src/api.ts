@@ -11,6 +11,7 @@ import type {
   LanguageAdapter,
   RepairResult,
   SearchResult,
+  TraversalLimits,
   ValidationOptions,
   ValidationResult
 } from "./graph/types.ts";
@@ -111,8 +112,8 @@ export async function runSearch(
   });
 }
 
-export function runImpact(services: DSPServices, target: string): ImpactResult {
-  return analyzeImpact(services.db, target);
+export function runImpact(services: DSPServices, target: string, options: TraversalLimits = {}): ImpactResult {
+  return analyzeImpact(services.db, target, options);
 }
 
 export function runValidate(

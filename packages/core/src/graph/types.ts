@@ -117,6 +117,15 @@ export type SearchResult = {
   neighbors: string[];
 };
 
+export type TraversalTruncationReason = "maxDepth" | "maxNodes" | "maxRelations" | "timeout";
+
+export type TraversalLimits = {
+  maxDepth?: number;
+  maxNodes?: number;
+  maxRelations?: number;
+  timeoutMs?: number;
+};
+
 export type ImpactResult = {
   target: string;
   directDependents: string[];
@@ -127,6 +136,8 @@ export type ImpactResult = {
   suggestedFiles: string[];
   confidence: number;
   reasons: string[];
+  truncated: boolean;
+  truncationReason?: TraversalTruncationReason;
 };
 
 export type ValidationSeverity = "error" | "warning" | "info";
@@ -186,6 +197,9 @@ export type ContextPackRequest = {
   maxTokens?: number;
   maxFiles?: number;
   maxDepth?: number;
+  maxNodes?: number;
+  maxRelations?: number;
+  timeoutMs?: number;
   includeCode?: "none" | "snippets-only" | "full-files";
   includeTests?: boolean;
   strategy?: "minimal" | "balanced" | "deep" | "debug";
@@ -209,6 +223,7 @@ export type ContextPackResponse = {
   estimatedTokens: number;
   maxTokens: number;
   truncated: boolean;
+  truncationReason?: TraversalTruncationReason | "maxTokens";
 };
 
 export type IndexMode = "index" | "update" | "bootstrap";

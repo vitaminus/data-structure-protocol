@@ -186,6 +186,164 @@ describe("graph query", () => {
     });
 
     expect(getNeighbors(db, root, 1, { maxFiles: 1 }).entities.map((entity) => entity.uid)).toEqual([root]);
-    expect(getNeighbors(db, root, 1, { maxEstimatedTokens: 1 })).toEqual({ entities: [], relations: [] });
+    expect(getNeighbors(db, root, 1, { maxEstimatedTokens: 1 })).toMatchObject({
+      entities: [],
+      relations: [],
+      truncated: false
+    });
+  });
+
+  it("reports maxRelations truncation when relation budgets are exceeded", () => {
+    const now = stableNowIso();
+    const root = buildUid("function", "src/root.ts", "root");
+    const first = buildUid("function", "src/first.ts", "first");
+    const second = buildUid("function", "src/second.ts", "second");
+
+    for (const [uid, name] of [
+      [root, "root"],
+      [first, "first"],
+      [second, "second"]
+    ] as const) {
+      db.upsertEntity({
+        uid,
+        kind: "function",
+        name,
+        path: uid.slice("function:".length).split("#")[0],
+        confidence: 1,
+        provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+        createdAt: now,
+        updatedAt: now
+      });
+    }
+    for (const to of [first, second]) {
+      db.upsertRelation({
+        from: root,
+        to,
+        kind: "calls",
+        confidence: 1,
+        provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+      });
+    }
+
+    const result = getNeighbors(db, root, 1, { maxRelations: 1 });
+    expect(result.truncated).toBe(true);
+    expect(result.truncationReason).toBe("maxRelations");
+  });
+
+  it("reports maxNodes truncation when node budgets are exceeded", () => {
+    const now = stableNowIso();
+    const root = buildUid("function", "src/root.ts", "root");
+    const first = buildUid("function", "src/first.ts", "first");
+    const second = buildUid("function", "src/second.ts", "second");
+
+    for (const [uid, name] of [
+      [root, "root"],
+      [first, "first"],
+      [second, "second"]
+    ] as const) {
+      db.upsertEntity({
+        uid,
+        kind: "function",
+        name,
+        path: uid.slice("function:".length).split("#")[0],
+        confidence: 1,
+        provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+        createdAt: now,
+        updatedAt: now
+      });
+    }
+    db.upsertRelation({
+      from: root,
+      to: first,
+      kind: "calls",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+    db.upsertRelation({
+      from: first,
+      to: second,
+      kind: "calls",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+
+    const result = getNeighbors(db, root, 2, { maxNodes: 2 });
+    expect(result.truncated).toBe(true);
+    expect(result.truncationReason).toBe("maxNodes");
+  });
+
+  it("reports maxDepth truncation when deeper neighbors remain", () => {
+    const now = stableNowIso();
+    const root = buildUid("function", "src/root.ts", "root");
+    const first = buildUid("function", "src/first.ts", "first");
+    const second = buildUid("function", "src/second.ts", "second");
+
+    for (const [uid, name] of [
+      [root, "root"],
+      [first, "first"],
+      [second, "second"]
+    ] as const) {
+      db.upsertEntity({
+        uid,
+        kind: "function",
+        name,
+        path: uid.slice("function:".length).split("#")[0],
+        confidence: 1,
+        provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+        createdAt: now,
+        updatedAt: now
+      });
+    }
+    db.upsertRelation({
+      from: root,
+      to: first,
+      kind: "calls",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+    db.upsertRelation({
+      from: first,
+      to: second,
+      kind: "calls",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+
+    const result = getNeighbors(db, root, 1);
+    expect(result.truncated).toBe(true);
+    expect(result.truncationReason).toBe("maxDepth");
+  });
+
+  it("reports timeout truncation when traversal time is exhausted", () => {
+    const now = stableNowIso();
+    const root = buildUid("function", "src/root.ts", "root");
+    const child = buildUid("function", "src/child.ts", "child");
+
+    for (const [uid, name] of [
+      [root, "root"],
+      [child, "child"]
+    ] as const) {
+      db.upsertEntity({
+        uid,
+        kind: "function",
+        name,
+        path: uid.slice("function:".length).split("#")[0],
+        confidence: 1,
+        provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+        createdAt: now,
+        updatedAt: now
+      });
+    }
+    db.upsertRelation({
+      from: root,
+      to: child,
+      kind: "calls",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+
+    const result = getNeighbors(db, root, 1, { timeoutMs: 0 });
+    expect(result.truncated).toBe(true);
+    expect(result.truncationReason).toBe("timeout");
   });
 });
