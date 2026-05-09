@@ -45,7 +45,7 @@ Status: done
 
 ### 98. Refactor search, context-pack, impact, and CLI graph paths onto batched reads
 
-Status: in progress
+Status: done
 
 - Move `semanticSearch`, `buildContextPack`, `streamNeighbors`, `analyzeImpact`, and graph-heavy CLI commands onto the new batched database APIs.
 - Preserve deterministic ordering plus provenance/confidence data while removing repeated `getEntity`, `getRelationsFrom`, and `getRelationsTo` loops.
@@ -69,7 +69,7 @@ Status: done
 
 ### 101. Add reverse dependency indexes for more precise incremental updates
 
-Status: in progress
+Status: done
 
 - Add persistent `file_dependencies` and `symbol_dependencies` tables with safe migrations and bounded write/update paths.
 - Compare old/new public API snapshots for changed files so private-only edits do not fan out, while public API changes trigger bounded reverse-dependent reindexing.

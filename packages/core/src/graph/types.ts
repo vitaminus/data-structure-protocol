@@ -146,6 +146,8 @@ export type ValidationIssue = {
   kind:
     | "missing_file"
     | "stale_hash"
+    | "binary_file"
+    | "invalid_utf8"
     | "dangling_relation"
     | "unresolved_reference"
     | "low_confidence_critical"
@@ -176,13 +178,31 @@ export type ValidationOptions = {
   deep?: boolean;
 };
 
+export type RepairActionKind =
+  | ValidationIssue["kind"]
+  | "orphaned_file_hash"
+  | "orphaned_embedding"
+  | "stale_parse_cache"
+  | "stale_checkpoint"
+  | "abandoned_run";
+
 export type RepairAction = {
-  kind: ValidationIssue["kind"];
+  kind: RepairActionKind;
   status: "planned" | "applied" | "skipped";
   message: string;
   path?: string;
   uid?: string;
   relation?: { from: string; to: string; kind: RelationKind };
+};
+
+export type RepairOptions = {
+  dryRun?: boolean;
+  apply?: boolean;
+  cleanOrphanedFileHashes?: boolean;
+  cleanOrphanedEmbeddings?: boolean;
+  cleanStaleParseCache?: boolean;
+  clearStaleCheckpoints?: boolean;
+  failAbandonedRuns?: boolean;
 };
 
 export type RepairResult = {
@@ -228,6 +248,47 @@ export type ContextPackResponse = {
 
 export type IndexMode = "index" | "update" | "bootstrap";
 
+export type IndexSlowFile = {
+  path: string;
+  ms: number;
+  sizeBytes: number;
+  language: string;
+};
+
+export type IndexSkipReason = "unsupported" | "unchanged" | "tooLarge" | "binary" | "invalidUtf8";
+
+export type IndexSkippedFile = {
+  path: string;
+  reason: IndexSkipReason;
+  sizeBytes: number;
+  language?: string;
+};
+
+export type IndexTelemetry = {
+  discoveryMs: number;
+  readMs: number;
+  hashMs: number;
+  parseMs: number;
+  dbWriteMs: number;
+  tsResolutionMs?: number;
+  tsResolutionCacheHits?: number;
+  tsResolutionCacheMisses?: number;
+  incrementalDependentFiles?: number;
+  incrementalExpansionTruncated?: boolean;
+  incrementalExpansionReason?: "maxDepth" | "maxFiles";
+  cacheHitFiles: number;
+  cacheHitParses: number;
+  workerRestarts: number;
+  workerTimeouts: number;
+  parserFallbackFiles: number;
+  fallbackByLanguage: Record<string, number>;
+  parserSourceCounts: Record<string, number>;
+  skippedByReason: Partial<Record<IndexSkipReason, number>>;
+  skippedFiles: IndexSkippedFile[];
+  slowestFiles: IndexSlowFile[];
+  dbQueryCount?: number;
+};
+
 export type FileIndexRequest = {
   rootDir: string;
   files?: string[];
@@ -250,9 +311,5 @@ export type IndexSummary = {
   unresolvedReferences: number;
   lowConfidenceRelations: number;
   estimatedCoverage: number;
-  telemetry?: {
-    parserFallbackFiles: number;
-    fallbackByLanguage: Record<string, number>;
-    parserSourceCounts: Record<string, number>;
-  };
+  telemetry?: IndexTelemetry;
 };

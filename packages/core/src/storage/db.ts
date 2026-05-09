@@ -276,6 +276,17 @@ export type CachedParseResult = {
   entities: Entity[];
   relations: Relation[];
   unresolvedReferences: UnresolvedReference[];
+  telemetry?: {
+    moduleResolutionMs?: number;
+    moduleResolutionCacheHits?: number;
+    moduleResolutionCacheMisses?: number;
+  };
+};
+
+export type ParseCacheEntryKey = {
+  language: string;
+  filePath: string;
+  contentHash: string;
 };
 
 export type EntitySearchCandidates = {
@@ -1100,6 +1111,20 @@ export class DSPDatabase {
     return rows.map((row) => this.rowToEntity(row));
   }
 
+  getEntitiesForPath(filePath: string): Entity[] {
+    const rows = this.prepareReadCached(
+      "get-entities-for-path",
+      `
+      SELECT *
+      FROM entities
+      WHERE path = ? AND source_priority < 100
+      ORDER BY uid
+      `
+    )
+      .all(filePath) as Record<string, unknown>[];
+    return rows.map((row) => this.rowToEntity(row));
+  }
+
   getEntitiesByUid(uids: string[]): Entity[] {
     if (uids.length === 0) {
       return [];
@@ -1790,28 +1815,35 @@ export class DSPDatabase {
     }
     this.removeFileHash(oldPath);
 
-    for (const entity of oldEntities) {
+    const rewrittenEntities = oldEntities.map((entity) => ({
+      ...entity,
+      uid: uidMap.get(entity.uid)!,
+      path: newPath,
+      metadata: {
+        ...(entity.metadata ?? {}),
+        previousPath: oldPath,
+        renameReconciledAt: indexedAt
+      },
+      updatedAt: indexedAt
+    }));
+    const rewrittenRelations = relations.map((relation) => ({
+      ...relation,
+      from: uidMap.get(relation.from) ?? relation.from,
+      to: uidMap.get(relation.to) ?? relation.to,
+      metadata: {
+        ...(relation.metadata ?? {}),
+        renameReconciledAt: indexedAt
+      }
+    }));
+
+    for (const entity of rewrittenEntities) {
       this.upsertEntity({
-        ...entity,
-        uid: uidMap.get(entity.uid)!,
-        path: newPath,
-        metadata: {
-          ...(entity.metadata ?? {}),
-          previousPath: oldPath,
-          renameReconciledAt: indexedAt
-        },
-        updatedAt: indexedAt
+        ...entity
       });
     }
-    for (const relation of relations) {
+    for (const relation of rewrittenRelations) {
       this.upsertRelation({
-        ...relation,
-        from: uidMap.get(relation.from) ?? relation.from,
-        to: uidMap.get(relation.to) ?? relation.to,
-        metadata: {
-          ...(relation.metadata ?? {}),
-          renameReconciledAt: indexedAt
-        }
+        ...relation
       });
     }
     for (const ref of unresolvedRows) {
@@ -1827,6 +1859,7 @@ export class DSPDatabase {
         indexedAt
       );
     }
+    this.replaceDependencySnapshotForAstFile(newPath, rewrittenEntities, rewrittenRelations);
     for (const row of embeddingRows) {
       this.db
         .prepare(
@@ -1992,6 +2025,98 @@ export class DSPDatabase {
       );
   }
 
+  private clearDependencySnapshotsForPaths(filePaths: string[]): void {
+    const uniquePaths = [...new Set(filePaths)];
+    if (uniquePaths.length === 0) {
+      return;
+    }
+    for (const chunk of chunks(uniquePaths)) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      this.db.prepare(`DELETE FROM file_dependencies WHERE from_path IN (${placeholders})`).run(...chunk);
+    }
+  }
+
+  private clearDependencySnapshotsForUids(uids: string[]): void {
+    const uniqueUids = [...new Set(uids)];
+    if (uniqueUids.length === 0) {
+      return;
+    }
+    for (const chunk of chunks(uniqueUids)) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      this.db.prepare(`DELETE FROM symbol_dependencies WHERE from_uid IN (${placeholders})`).run(...chunk);
+    }
+  }
+
+  private replaceDependencySnapshotForAstFile(filePath: string, entities: Entity[], relations: Relation[]): void {
+    this.clearDependencySnapshotsForPaths([filePath]);
+    this.clearDependencySnapshotsForUids(entities.map((entity) => entity.uid));
+
+    const entityByUid = new Map(entities.map((entity) => [entity.uid, entity]));
+    const fileDependencies = new Map<string, FileDependency>();
+    const symbolDependencies = new Map<string, SymbolDependency>();
+
+    for (const relation of relations) {
+      if (!DEPENDENCY_RELATION_KINDS.has(relation.kind)) {
+        continue;
+      }
+
+      const fromPath = dependencyFilePathForUid(relation.from, entityByUid);
+      const toPath = dependencyFilePathForUid(relation.to, entityByUid);
+      if (fromPath && toPath && fromPath !== toPath) {
+        const key = `${fromPath}\0${toPath}\0${relation.kind}`;
+        const existing = fileDependencies.get(key);
+        if (!existing || relation.confidence > existing.confidence) {
+          fileDependencies.set(key, {
+            fromPath,
+            toPath,
+            kind: relation.kind,
+            confidence: relation.confidence
+          });
+        }
+      }
+
+      if (!isSymbolDependencyUid(relation.from) || !isSymbolDependencyUid(relation.to) || relation.from === relation.to) {
+        continue;
+      }
+      const key = `${relation.from}\0${relation.to}\0${relation.kind}`;
+      const existing = symbolDependencies.get(key);
+      if (!existing || relation.confidence > existing.confidence) {
+        symbolDependencies.set(key, {
+          fromUid: relation.from,
+          toUid: relation.to,
+          kind: relation.kind,
+          confidence: relation.confidence
+        });
+      }
+    }
+
+    for (const dependency of fileDependencies.values()) {
+      this.prepareCached(
+        "upsert-file-dependency",
+        `
+        INSERT INTO file_dependencies(from_path, to_path, kind, confidence)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(from_path, to_path, kind) DO UPDATE SET
+          confidence = excluded.confidence
+        `
+      )
+        .run(dependency.fromPath, dependency.toPath, dependency.kind, dependency.confidence);
+    }
+
+    for (const dependency of symbolDependencies.values()) {
+      this.prepareCached(
+        "upsert-symbol-dependency",
+        `
+        INSERT INTO symbol_dependencies(from_uid, to_uid, kind, confidence)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(from_uid, to_uid, kind) DO UPDATE SET
+          confidence = excluded.confidence
+        `
+      )
+        .run(dependency.fromUid, dependency.toUid, dependency.kind, dependency.confidence);
+    }
+  }
+
   clearAstDataForPaths(filePaths: string[]): void {
     const uniquePaths = [...new Set(filePaths)];
     if (uniquePaths.length === 0) {
@@ -2020,8 +2145,10 @@ export class DSPDatabase {
         this.db.prepare(`DELETE FROM entity_fts WHERE uid IN (${placeholders})`).run(...chunk);
         this.db.prepare(`DELETE FROM entities WHERE uid IN (${placeholders})`).run(...chunk);
       }
+      this.clearDependencySnapshotsForUids(uids);
     }
 
+    this.clearDependencySnapshotsForPaths(uniquePaths);
     for (const chunk of chunks(uniquePaths)) {
       const placeholders = chunk.map(() => "?").join(", ");
       this.db.prepare(`DELETE FROM unresolved_references WHERE path IN (${placeholders})`).run(...chunk);
@@ -2049,6 +2176,7 @@ export class DSPDatabase {
         mtimeMs: file.mtimeMs,
         sizeBytes: file.sizeBytes
       });
+      this.replaceDependencySnapshotForAstFile(file.relPath, file.entities, file.relations);
     }
     this.refreshEntityFtsByUid(entityUidsToRefresh);
   }

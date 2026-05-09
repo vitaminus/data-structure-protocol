@@ -31,6 +31,11 @@ type WorkerReply =
       };
     };
 
+export type ParseWorkerPoolStats = {
+  restarts: number;
+  timeouts: number;
+};
+
 const WORKER_SOURCE = `
   import { parentPort } from "node:worker_threads";
 
@@ -93,6 +98,10 @@ export class ParseWorkerPool {
   private readonly queue: ParseJob[] = [];
   private nextJobId = 1;
   private closing = false;
+  private stats: ParseWorkerPoolStats = {
+    restarts: 0,
+    timeouts: 0
+  };
 
   constructor(
     size: number,
@@ -115,6 +124,10 @@ export class ParseWorkerPool {
 
   get enabled(): boolean {
     return this.size > 0;
+  }
+
+  getStats(): ParseWorkerPoolStats {
+    return { ...this.stats };
   }
 
   run(spec: LanguageAdapterWorkerSpec, filePath: string, content: string): Promise<ParseResult> {
@@ -208,6 +221,7 @@ export class ParseWorkerPool {
     }
     const slotIndex = this.slots.indexOf(slot);
     if (slotIndex !== -1) {
+      this.stats.restarts += 1;
       this.slots.splice(slotIndex, 1, this.createSlot());
     }
     this.dispatch();
@@ -241,6 +255,7 @@ export class ParseWorkerPool {
       slot.currentJobId = job.id;
       this.pendingJobs.set(job.id, job);
       slot.currentTimeout = setTimeout(() => {
+        this.stats.timeouts += 1;
         this.failSlot(slot, new Error(`Parse worker timed out after ${this.timeoutMs}ms for ${job.filePath}`));
         slot.worker.terminate().catch(() => undefined);
       }, this.timeoutMs);

@@ -1,20 +1,29 @@
 import path from "node:path";
 import os from "node:os";
 import { existsSync, readFileSync, statSync } from "node:fs";
+import { performance } from "node:perf_hooks";
 import type {
   Entity,
   FileIndexRequest,
+  IndexSkippedFile,
+  IndexSkipReason,
+  IndexSlowFile,
   IndexSummary,
   LanguageAdapter,
+  ParseResult,
   Relation,
   UnresolvedReference
 } from "../graph/types.ts";
 import { buildUid, contentHash, normalizePath, stableNowIso } from "../graph/uid.ts";
-import { discoverFiles, findRepoRoot } from "../util/fs.ts";
+import { discoverFilesDetailed, findRepoRoot } from "../util/fs.ts";
 import { changedFileEntriesFromGit, changedFilesFromGit } from "../util/git.ts";
+import { classifyTextBuffer } from "../util/text.ts";
 import { ParseWorkerPool } from "./parse-pool.ts";
 import type { DSPDatabase, FileHashEntry, IndexedAstFile } from "../storage/db.ts";
 import type { DSPConfig } from "../config/types.ts";
+
+const INCREMENTAL_DEPENDENT_MAX_DEPTH = 3;
+const INCREMENTAL_DEPENDENT_MAX_FILES = 256;
 
 function languageFromFile(filePath: string): string | undefined {
   const ext = path.extname(filePath).toLowerCase();
@@ -294,11 +303,15 @@ type ParseOneResult =
   | {
       kind: "unsupported";
       relPath: string;
+      telemetry: ParseOneTelemetry;
     }
   | {
       kind: "skipped";
       relPath: string;
       language: string;
+      reason: IndexSkipReason;
+      sizeBytes: number;
+      telemetry: ParseOneTelemetry;
     }
   | {
       kind: "parsed";
@@ -313,7 +326,36 @@ type ParseOneResult =
       unresolved: UnresolvedReference[];
       parserSources: string[];
       usedFallback: boolean;
+      publicApiSnapshot: PublicApiSnapshot;
+      telemetry: ParseOneTelemetry;
     };
+
+type ParseOneTelemetry = {
+  readMs: number;
+  hashMs: number;
+  parseMs: number;
+  dbWriteMs: number;
+  tsResolutionMs: number;
+  tsResolutionCacheHits: number;
+  tsResolutionCacheMisses: number;
+  workerRestarts: number;
+  workerTimeouts: number;
+  cacheHitFile: boolean;
+  cacheHitParse: boolean;
+  totalMs: number;
+};
+
+type ParsedResultTelemetry = {
+  moduleResolutionMs?: number;
+  moduleResolutionCacheHits?: number;
+  moduleResolutionCacheMisses?: number;
+  workerRestarts?: number;
+  workerTimeouts?: number;
+};
+
+type ParseResultWithTelemetry = ParseResult & {
+  telemetry?: ParsedResultTelemetry;
+};
 
 function sameCachedFileState(
   cached: FileHashEntry | undefined,
@@ -401,6 +443,210 @@ type CheckpointState = {
   lowConfidenceRelations: number;
 };
 
+export function normalizeCheckpointState(
+  metadata: unknown,
+  manifestHash: string,
+  allowedFiles: Iterable<string>
+): CheckpointState | undefined {
+  if (!metadata || typeof metadata !== "object") {
+    return undefined;
+  }
+  const candidate = metadata as Partial<CheckpointState>;
+  if (candidate.manifestHash !== manifestHash) {
+    return undefined;
+  }
+  const allowed = new Set(allowedFiles);
+  const completedFiles = Array.isArray(candidate.completedFiles)
+    ? [...new Set(candidate.completedFiles.filter((value): value is string => typeof value === "string"))]
+        .filter((value) => allowed.has(value))
+        .sort()
+    : [];
+  if (completedFiles.length === 0) {
+    return undefined;
+  }
+  const asSafeCount = (value: unknown, max = Number.MAX_SAFE_INTEGER): number => {
+    const numeric = typeof value === "number" ? value : Number(value ?? 0);
+    if (!Number.isFinite(numeric) || numeric < 0) {
+      return 0;
+    }
+    return Math.min(max, Math.trunc(numeric));
+  };
+  const filesIndexed = Math.max(completedFiles.length, asSafeCount(candidate.filesIndexed, allowed.size));
+  return {
+    manifestHash,
+    completedFiles,
+    filesIndexed,
+    filesSkipped: asSafeCount(candidate.filesSkipped),
+    languages: Array.isArray(candidate.languages)
+      ? [...new Set(candidate.languages.filter((value): value is string => typeof value === "string"))].sort()
+      : [],
+    entities: asSafeCount(candidate.entities),
+    relations: asSafeCount(candidate.relations),
+    unresolvedReferences: asSafeCount(candidate.unresolvedReferences),
+    lowConfidenceRelations: asSafeCount(candidate.lowConfidenceRelations)
+  };
+}
+
+function durationMs(start: number): number {
+  return performance.now() - start;
+}
+
+function stableMetadataValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((entry) => stableMetadataValue(entry));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([key]) => !["previousPath", "renameReconciledAt", "stableUidSource", "structuralUid", "testedPath"].includes(key))
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entry]) => [key, stableMetadataValue(entry)])
+    );
+  }
+  return value;
+}
+
+type PublicApiSnapshot = {
+  fingerprint: string;
+  publicUids: string[];
+};
+
+function snapshotPublicApi(
+  adapter: LanguageAdapter,
+  entities: Entity[]
+): PublicApiSnapshot {
+  const publicEntities = adapter
+    .extractPublicAPI(entities)
+    .map((entity) => ({
+      uid: entity.uid,
+      kind: entity.kind,
+      name: entity.name,
+      language: entity.language,
+      signature: entity.signature,
+      metadata: stableMetadataValue(entity.metadata ?? {})
+    }))
+    .sort((left, right) => left.uid.localeCompare(right.uid));
+  return {
+    fingerprint: JSON.stringify(publicEntities),
+    publicUids: publicEntities.map((entity) => entity.uid)
+  };
+}
+
+type IncrementalSeed = {
+  relPath: string;
+  snapshotPath: string;
+  oldPublicUids: string[];
+};
+
+type IncrementalExpansionResult = {
+  files: string[];
+  truncated: boolean;
+  reason?: "maxDepth" | "maxFiles";
+};
+
+function expandReverseDependents(
+  db: DSPDatabase,
+  seeds: IncrementalSeed[],
+  alreadySelected: Set<string>
+): IncrementalExpansionResult {
+  const selected = new Set(alreadySelected);
+  const dependents = new Set<string>();
+  let frontierPaths = [...new Set(seeds.map((seed) => seed.snapshotPath))].sort();
+  let frontierSymbolUids = [...new Set(seeds.flatMap((seed) => seed.oldPublicUids))].sort();
+  let truncated = false;
+  let reason: "maxDepth" | "maxFiles" | undefined;
+
+  for (let depth = 0; depth < INCREMENTAL_DEPENDENT_MAX_DEPTH; depth += 1) {
+    const nextPaths = new Set<string>();
+    const candidates = new Set<string>(db.getReverseFileDependents(frontierPaths, null));
+    if (frontierSymbolUids.length > 0) {
+      const symbolDependents = db.getReverseSymbolDependents(frontierSymbolUids, null);
+      const symbolEntities = db.getEntitiesByUid(symbolDependents);
+      for (const entity of symbolEntities) {
+        if (entity.path) {
+          candidates.add(entity.path);
+        }
+      }
+    }
+
+    for (const candidate of [...candidates].sort()) {
+      if (selected.has(candidate) || dependents.has(candidate)) {
+        continue;
+      }
+      if (dependents.size >= INCREMENTAL_DEPENDENT_MAX_FILES) {
+        truncated = true;
+        reason = "maxFiles";
+        return { files: [...dependents].sort(), truncated, reason };
+      }
+      dependents.add(candidate);
+      nextPaths.add(candidate);
+    }
+
+    if (nextPaths.size === 0) {
+      return { files: [...dependents].sort(), truncated, reason };
+    }
+
+    frontierPaths = [...nextPaths].sort();
+    frontierSymbolUids = [];
+  }
+
+  if (frontierPaths.length > 0) {
+    truncated = true;
+    reason = "maxDepth";
+  }
+
+  return { files: [...dependents].sort(), truncated, reason };
+}
+
+function telemetryZero(): ParseOneTelemetry {
+  return {
+    readMs: 0,
+    hashMs: 0,
+    parseMs: 0,
+    dbWriteMs: 0,
+    tsResolutionMs: 0,
+    tsResolutionCacheHits: 0,
+    tsResolutionCacheMisses: 0,
+    workerRestarts: 0,
+    workerTimeouts: 0,
+    cacheHitFile: false,
+    cacheHitParse: false,
+    totalMs: 0
+  };
+}
+
+function recordSlowFile(
+  slowestFiles: IndexSlowFile[],
+  entry: IndexSlowFile,
+  limit = 10
+): void {
+  slowestFiles.push(entry);
+  slowestFiles.sort((a, b) => {
+    if (b.ms !== a.ms) {
+      return b.ms - a.ms;
+    }
+    return a.path.localeCompare(b.path);
+  });
+  if (slowestFiles.length > limit) {
+    slowestFiles.length = limit;
+  }
+}
+
+function incrementSkipReason(counts: Partial<Record<IndexSkipReason, number>>, reason: IndexSkipReason): void {
+  counts[reason] = (counts[reason] ?? 0) + 1;
+}
+
+function recordSkippedFile(skippedFiles: IndexSkippedFile[], entry: IndexSkippedFile, limit = 20): void {
+  if (skippedFiles.some((existing) => existing.path === entry.path && existing.reason === entry.reason)) {
+    return;
+  }
+  skippedFiles.push(entry);
+  skippedFiles.sort((left, right) => left.path.localeCompare(right.path));
+  if (skippedFiles.length > limit) {
+    skippedFiles.length = limit;
+  }
+}
+
 async function mapWithConcurrency<T, R>(
   items: T[],
   concurrency: number,
@@ -432,38 +678,75 @@ async function parseOne(
   resolutionCache: Map<string, string | undefined>,
   pathIndex: Map<string, string>,
   full: boolean,
+  maxFileSizeBytes: number,
   workerPool?: ParseWorkerPool
 ): Promise<ParseOneResult> {
+  const telemetry = telemetryZero();
+  const startedAt = performance.now();
   const relPath = normalizePath(path.relative(scanRoot, absPath));
   const language = languageFromFile(relPath);
   if (!language) {
-    return { kind: "unsupported", relPath };
+    telemetry.totalMs = durationMs(startedAt);
+    return { kind: "unsupported", relPath, telemetry };
   }
   const adapter = adapters.find((candidate) => candidate.canHandle(relPath));
   if (!adapter) {
-    return { kind: "unsupported", relPath };
+    telemetry.totalMs = durationMs(startedAt);
+    return { kind: "unsupported", relPath, telemetry };
   }
 
   const stat = statSync(absPath);
   const mtimeMs = Math.trunc(stat.mtimeMs);
   const sizeBytes = stat.size;
+  if (sizeBytes > maxFileSizeBytes) {
+    telemetry.totalMs = durationMs(startedAt);
+    return { kind: "skipped", relPath, language: adapter.language, reason: "tooLarge", sizeBytes, telemetry };
+  }
   if (!full && sameCachedFileState(cachedHash, mtimeMs, sizeBytes)) {
-    return { kind: "skipped", relPath, language: adapter.language };
+    telemetry.cacheHitFile = true;
+    telemetry.totalMs = durationMs(startedAt);
+    return { kind: "skipped", relPath, language: adapter.language, reason: "unchanged", sizeBytes, telemetry };
   }
 
-  const content = readFileSync(absPath, "utf8");
+  const readStartedAt = performance.now();
+  const rawContent = readFileSync(absPath);
+  telemetry.readMs += durationMs(readStartedAt);
+  const classified = classifyTextBuffer(rawContent);
+  if (classified.kind !== "text") {
+    telemetry.totalMs = durationMs(startedAt);
+    return {
+      kind: "skipped",
+      relPath,
+      language: adapter.language,
+      reason: classified.kind,
+      sizeBytes,
+      telemetry
+    };
+  }
+  const content = classified.content;
+  const hashStartedAt = performance.now();
   const hash = contentHash(content);
+  telemetry.hashMs += durationMs(hashStartedAt);
   if (!full && cachedHash?.hash === hash) {
-    return { kind: "skipped", relPath, language: adapter.language };
+    telemetry.cacheHitFile = true;
+    telemetry.totalMs = durationMs(startedAt);
+    return { kind: "skipped", relPath, language: adapter.language, reason: "unchanged", sizeBytes, telemetry };
   }
 
   const cachedParse = db.getCachedParseResult(adapter.language, relPath, hash);
-  const parsed =
+  telemetry.cacheHitParse = Boolean(cachedParse);
+  const parseStartedAt = performance.now();
+  const parsed = (
     cachedParse ??
     (workerPool && adapter.worker
       ? await workerPool.run(adapter.worker, relPath, content)
-      : await adapter.parseFile(relPath, content));
+      : await adapter.parseFile(relPath, content))
+  ) as ParseResultWithTelemetry;
   if (!cachedParse) {
+    telemetry.parseMs += durationMs(parseStartedAt);
+  }
+  if (!cachedParse) {
+    const cacheWriteStartedAt = performance.now();
     db.setCachedParseResult(
       adapter.language,
       relPath,
@@ -471,10 +754,17 @@ async function parseOne(
       {
         entities: parsed.entities,
         relations: parsed.relations,
-        unresolvedReferences: parsed.unresolvedReferences ?? []
+        unresolvedReferences: parsed.unresolvedReferences ?? [],
+        telemetry: parsed.telemetry
       },
       stableNowIso()
     );
+    telemetry.dbWriteMs += durationMs(cacheWriteStartedAt);
+    telemetry.tsResolutionMs += parsed.telemetry?.moduleResolutionMs ?? 0;
+    telemetry.tsResolutionCacheHits += parsed.telemetry?.moduleResolutionCacheHits ?? 0;
+    telemetry.tsResolutionCacheMisses += parsed.telemetry?.moduleResolutionCacheMisses ?? 0;
+    telemetry.workerRestarts += parsed.telemetry?.workerRestarts ?? 0;
+    telemetry.workerTimeouts += parsed.telemetry?.workerTimeouts ?? 0;
   }
   const parsedEntities = adapter.extractEntities(parsed);
   const parsedRelations = adapter.extractRelations(parsed, parsedEntities);
@@ -485,6 +775,7 @@ async function parseOne(
   const testNode = testEntityForFile(relPath, nowIso);
   const directories = dirEntitiesForFile(relPath, nowIso);
   const extractedEntities = extracted.entities;
+  const publicApiSnapshot = snapshotPublicApi(adapter, extractedEntities);
   const extractedRelations = canonicalizeFileRelations(
     persistedRelationsForFile(fileNode.uid, extracted.relations),
     scanRoot,
@@ -534,7 +825,12 @@ async function parseOne(
     relations: allRelations,
     unresolved,
     parserSources,
-    usedFallback: parserSources.some((source) => source !== "ast" && source !== "test" && source !== "human")
+    usedFallback: parserSources.some((source) => source !== "ast" && source !== "test" && source !== "human"),
+    publicApiSnapshot,
+    telemetry: {
+      ...telemetry,
+      totalMs: durationMs(startedAt)
+    }
   };
 }
 
@@ -556,14 +852,34 @@ export async function indexRepository(
   let unresolvedCount = 0;
   let lowConfidenceCount = 0;
   let parserFallbackFiles = 0;
+  let discoveryMs = 0;
+  let readMs = 0;
+  let hashMs = 0;
+  let parseMs = 0;
+  let dbWriteMs = 0;
+  let tsResolutionMs = 0;
+  let tsResolutionCacheHits = 0;
+  let tsResolutionCacheMisses = 0;
+  let incrementalDependentFiles = 0;
+  let incrementalExpansionTruncated = false;
+  let incrementalExpansionReason: "maxDepth" | "maxFiles" | undefined;
+  let cacheHitFiles = 0;
+  let cacheHitParses = 0;
+  const skippedByReason: Partial<Record<IndexSkipReason, number>> = {};
+  const skippedFiles: IndexSkippedFile[] = [];
   const fallbackByLanguage = new Map<string, number>();
   const parserSourceCounts = new Map<string, number>();
+  const slowestFiles: IndexSlowFile[] = [];
   const resolutionCache = new Map<string, string | undefined>();
   const directoryEntityUids = new Set<string>();
   const renameReconciledPaths = new Set<string>();
   let parsePool: ParseWorkerPool | undefined;
+  let workerRestarts = 0;
+  let workerTimeouts = 0;
+  let dbQueryCount: number | undefined;
 
   try {
+    const discoveryStartedAt = performance.now();
     const requestedFiles = request.files?.map((file) => path.resolve(scanRoot, file));
     const changedEntries =
       request.fromGitDiff || request.changedOnly
@@ -575,8 +891,29 @@ export async function indexRepository(
     const changedFromGit = changedEntries?.map((entry) => entry.path);
     const requiresFullDiscovery =
       !requestedFiles?.length && (!changedFromGit || changedFromGit.length === 0) && !request.changedOnly;
+    const changedEntryByRelPath = new Map<string, { snapshotPath: string; adapter: LanguageAdapter; oldPublicApi: PublicApiSnapshot }>();
 
     if (changedEntries) {
+      for (const entry of changedEntries) {
+        if (!existsSync(entry.path)) {
+          continue;
+        }
+        const relPath = normalizePath(path.relative(scanRoot, entry.path));
+        const snapshotPath = normalizePath(path.relative(scanRoot, entry.oldPath ?? entry.path));
+        const adapter = adapters.find((candidate) => candidate.canHandle(relPath));
+        if (!adapter) {
+          continue;
+        }
+        changedEntryByRelPath.set(relPath, {
+          snapshotPath,
+          adapter,
+          oldPublicApi: snapshotPublicApi(adapter, db.getEntitiesForPath(snapshotPath))
+        });
+      }
+    }
+
+    if (changedEntries) {
+      const staleWriteStartedAt = performance.now();
       db.transaction(() => {
         for (const entry of changedEntries) {
           let renameReconciled = false;
@@ -610,39 +947,38 @@ export async function indexRepository(
           }
         }
       });
+      dbWriteMs += durationMs(staleWriteStartedAt);
     }
 
-    let selectedFiles = requiresFullDiscovery
-      ? discoverFiles(scanRoot, {
+    const discovered = requiresFullDiscovery
+      ? discoverFilesDetailed(scanRoot, {
           excludes: config.performance.exclude,
           maxFileSizeKb: config.performance.maxFileSizeKb
         })
+      : undefined;
+
+    let selectedFiles = requiresFullDiscovery
+      ? discovered!.files
       : (requestedFiles ?? changedFromGit ?? []).filter((absPath) => existsSync(absPath));
+
+    if (discovered) {
+      filesSkipped += discovered.skipped.length;
+      for (const skipped of discovered.skipped) {
+        incrementSkipReason(skippedByReason, "tooLarge");
+        recordSkippedFile(skippedFiles, {
+          path: normalizePath(path.relative(scanRoot, skipped.path)),
+          reason: "tooLarge",
+          sizeBytes: skipped.sizeBytes
+        });
+      }
+    }
 
     if (renameReconciledPaths.size > 0) {
       selectedFiles = selectedFiles.filter((absPath) => !renameReconciledPaths.has(normalizePath(absPath)));
     }
 
-    if (changedFromGit && changedFromGit.length > 0) {
-      const changedUids = changedFromGit
-        .filter((absPath) => !renameReconciledPaths.has(normalizePath(absPath)))
-        .map((absPath) => buildUid("file", normalizePath(path.relative(scanRoot, absPath))));
-      const neighborRelPaths = new Set<string>();
-      for (const uid of changedUids) {
-        for (const incoming of db.getRelationsTo(uid)) {
-          const fromEntity = db.getEntity(incoming.from);
-          if (fromEntity?.path) {
-            neighborRelPaths.add(fromEntity.path);
-          }
-        }
-      }
-      for (const relPath of neighborRelPaths) {
-        selectedFiles.push(path.resolve(scanRoot, relPath));
-      }
-      selectedFiles = [...new Set(selectedFiles)];
-    }
-
     selectedFiles = selectedFiles.sort();
+    discoveryMs += durationMs(discoveryStartedAt);
     const checkpointName = `index:${scanRoot}`;
     const selectedRelPaths = selectedFiles.map((absPath) => normalizePath(path.relative(scanRoot, absPath)));
     const checkpointEligible =
@@ -652,30 +988,21 @@ export async function indexRepository(
       !request.fromGitDiff &&
       !changedEntries;
     const manifestHash = checkpointEligible ? contentHash(JSON.stringify(selectedRelPaths)) : undefined;
+    let restoredCheckpointState: CheckpointState | undefined;
     if (checkpointEligible && manifestHash) {
       const checkpoint = db.getCheckpoint(checkpointName);
-      const checkpointMeta = checkpoint?.metadata as Partial<CheckpointState> | undefined;
-      if (checkpointMeta?.manifestHash === manifestHash) {
-        const completedFiles = new Set(
-          Array.isArray(checkpointMeta.completedFiles)
-            ? checkpointMeta.completedFiles.filter((value): value is string => typeof value === "string")
-            : []
-        );
-        if (completedFiles.size > 0) {
-          selectedFiles = selectedFiles.filter(
-            (absPath) => !completedFiles.has(normalizePath(path.relative(scanRoot, absPath)))
-          );
-          filesIndexed = Number(checkpointMeta.filesIndexed ?? 0);
-          filesSkipped = Number(checkpointMeta.filesSkipped ?? 0);
-          entityCount = Number(checkpointMeta.entities ?? 0);
-          relationCount = Number(checkpointMeta.relations ?? 0);
-          unresolvedCount = Number(checkpointMeta.unresolvedReferences ?? 0);
-          lowConfidenceCount = Number(checkpointMeta.lowConfidenceRelations ?? 0);
-          for (const language of checkpointMeta.languages ?? []) {
-            if (typeof language === "string") {
-              languageSet.add(language);
-            }
-          }
+      restoredCheckpointState = normalizeCheckpointState(checkpoint?.metadata, manifestHash, selectedRelPaths);
+      if (restoredCheckpointState) {
+        const completedFiles = new Set(restoredCheckpointState.completedFiles);
+        selectedFiles = selectedFiles.filter((absPath) => !completedFiles.has(normalizePath(path.relative(scanRoot, absPath))));
+        filesIndexed = restoredCheckpointState.filesIndexed;
+        filesSkipped = restoredCheckpointState.filesSkipped;
+        entityCount = restoredCheckpointState.entities;
+        relationCount = restoredCheckpointState.relations;
+        unresolvedCount = restoredCheckpointState.unresolvedReferences;
+        lowConfidenceCount = restoredCheckpointState.lowConfidenceRelations;
+        for (const language of restoredCheckpointState.languages) {
+          languageSet.add(language);
         }
       } else if (checkpoint) {
         db.clearCheckpoint(checkpointName);
@@ -687,128 +1014,224 @@ export async function indexRepository(
       relPath: normalizePath(path.relative(scanRoot, absPath)),
       sizeBytes: statSync(absPath).size
     }));
-    const activeSelectedRelPaths = selectedEntries.map((entry) => entry.relPath);
-    const pathIndex = buildPathResolutionIndex(new Set([...db.listFilesInHashTable(), ...activeSelectedRelPaths]));
     const effectiveParallelism = effectiveParallelismForIndex(config.performance, selectedFiles.length);
-    const knownHashes = db.getFileHashEntries(activeSelectedRelPaths);
     parsePool = parseWorkerPoolFor(adapters, config.performance, effectiveParallelism);
-    const completedFiles = new Set<string>(
-      checkpointEligible && manifestHash
-        ? (((db.getCheckpoint(checkpointName)?.metadata as Partial<CheckpointState> | undefined)?.completedFiles as
-            | string[]
-            | undefined) ?? [])
-        : []
-    );
+    const completedFiles = new Set<string>(restoredCheckpointState?.completedFiles ?? []);
 
     try {
-      const parseWindows = chunkEntriesByByteBudget(
-        selectedEntries,
-        config.performance.indexMemoryBudgetMb * 1024 * 1024,
-        (entry) => entry.sizeBytes
-      );
-      for (const windowEntries of parseWindows) {
-        const parsedResults = await mapWithConcurrency(
-          windowEntries,
-          effectiveParallelism,
-          (entry) =>
-            parseOne(
-              entry.absPath,
-              scanRoot,
-              db,
-              adapters,
-              knownHashes.get(entry.relPath),
-              resolutionCache,
-              pathIndex,
-              request.full ?? false,
-              parsePool
-            )
+      const processSelectedEntries = async (
+        entries: Array<{ absPath: string; relPath: string; sizeBytes: number }>,
+        options: { allowCheckpoint: boolean; forceFull: boolean }
+      ): Promise<Array<{ relPath: string; publicApiSnapshot: PublicApiSnapshot }>> => {
+        if (entries.length === 0) {
+          return [];
+        }
+        const localPathIndex = buildPathResolutionIndex(new Set([...db.listFilesInHashTable(), ...entries.map((entry) => entry.relPath)]));
+        const localKnownHashes = db.getFileHashEntries(entries.map((entry) => entry.relPath));
+        const parsedPublicApiSnapshots: Array<{ relPath: string; publicApiSnapshot: PublicApiSnapshot }> = [];
+        const parseWindows = chunkEntriesByByteBudget(
+          entries,
+          config.performance.indexMemoryBudgetMb * 1024 * 1024,
+          (entry) => entry.sizeBytes
         );
 
-        const writableFiles: IndexedAstFile[] = [];
-        for (const result of parsedResults) {
-          if (result.kind === "unsupported") {
-            filesSkipped += 1;
-            continue;
-          }
-          languageSet.add(result.language);
-          if (result.kind === "skipped") {
-            filesSkipped += 1;
-            continue;
-          }
-          const entitiesToWrite = result.entities.filter((entity) => {
-            if (entity.kind !== "directory") {
+        for (const windowEntries of parseWindows) {
+          const parsedResults = await mapWithConcurrency(
+            windowEntries,
+            effectiveParallelism,
+            (entry) =>
+              parseOne(
+                entry.absPath,
+                scanRoot,
+                db,
+                adapters,
+                localKnownHashes.get(entry.relPath),
+                resolutionCache,
+                localPathIndex,
+                options.forceFull || Boolean(request.full),
+                config.performance.maxFileSizeKb * 1024,
+                parsePool
+              )
+          );
+
+          const writableFiles: IndexedAstFile[] = [];
+          for (const result of parsedResults) {
+            readMs += result.telemetry.readMs;
+            hashMs += result.telemetry.hashMs;
+            parseMs += result.telemetry.parseMs;
+            dbWriteMs += result.telemetry.dbWriteMs;
+            tsResolutionMs += result.telemetry.tsResolutionMs;
+            tsResolutionCacheHits += result.telemetry.tsResolutionCacheHits;
+            tsResolutionCacheMisses += result.telemetry.tsResolutionCacheMisses;
+            workerRestarts += result.telemetry.workerRestarts;
+            workerTimeouts += result.telemetry.workerTimeouts;
+            if (result.telemetry.cacheHitFile) {
+              cacheHitFiles += 1;
+            }
+            if (result.telemetry.cacheHitParse) {
+              cacheHitParses += 1;
+            }
+            if (result.kind === "unsupported") {
+              filesSkipped += 1;
+              incrementSkipReason(skippedByReason, "unsupported");
+              continue;
+            }
+            languageSet.add(result.language);
+            if (result.kind === "skipped") {
+              filesSkipped += 1;
+              incrementSkipReason(skippedByReason, result.reason);
+              if (result.reason !== "unchanged" && result.reason !== "unsupported") {
+                recordSkippedFile(skippedFiles, {
+                  path: result.relPath,
+                  reason: result.reason,
+                  sizeBytes: result.sizeBytes,
+                  language: result.language
+                });
+              }
+              continue;
+            }
+            parsedPublicApiSnapshots.push({
+              relPath: result.relPath,
+              publicApiSnapshot: result.publicApiSnapshot
+            });
+            const entitiesToWrite = result.entities.filter((entity) => {
+              if (entity.kind !== "directory") {
+                return true;
+              }
+              if (directoryEntityUids.has(entity.uid)) {
+                return false;
+              }
+              directoryEntityUids.add(entity.uid);
               return true;
+            });
+            writableFiles.push({
+              relPath: result.relPath,
+              language: result.language,
+              hash: result.hash,
+              indexedAt: result.nowIso,
+              mtimeMs: result.mtimeMs,
+              sizeBytes: result.sizeBytes,
+              entities: entitiesToWrite,
+              relations: result.relations,
+              unresolved: result.unresolved
+            });
+            recordSlowFile(slowestFiles, {
+              path: result.relPath,
+              ms: result.telemetry.totalMs,
+              sizeBytes: result.sizeBytes,
+              language: result.language
+            });
+            if (result.usedFallback) {
+              parserFallbackFiles += 1;
+              fallbackByLanguage.set(result.language, (fallbackByLanguage.get(result.language) ?? 0) + 1);
             }
-            if (directoryEntityUids.has(entity.uid)) {
-              return false;
+            for (const source of result.parserSources) {
+              parserSourceCounts.set(source, (parserSourceCounts.get(source) ?? 0) + 1);
             }
-            directoryEntityUids.add(entity.uid);
-            return true;
-          });
-          writableFiles.push({
-            relPath: result.relPath,
-            language: result.language,
-            hash: result.hash,
-            indexedAt: result.nowIso,
-            mtimeMs: result.mtimeMs,
-            sizeBytes: result.sizeBytes,
-            entities: entitiesToWrite,
-            relations: result.relations,
-            unresolved: result.unresolved
-          });
-          if (result.usedFallback) {
-            parserFallbackFiles += 1;
-            fallbackByLanguage.set(result.language, (fallbackByLanguage.get(result.language) ?? 0) + 1);
           }
-          for (const source of result.parserSources) {
-            parserSourceCounts.set(source, (parserSourceCounts.get(source) ?? 0) + 1);
+
+          const writeBatchSize = Math.max(32, effectiveParallelism * 8);
+          for (const batch of chunkItems(writableFiles, writeBatchSize)) {
+            const batchWriteStartedAt = performance.now();
+            db.transaction(() => {
+              db.replaceAstFiles(batch);
+              for (const file of batch) {
+                languageSet.add(file.language);
+                filesIndexed += 1;
+                entityCount += file.entities.length;
+                relationCount += file.relations.length;
+                unresolvedCount += file.unresolved.length;
+                for (const relation of file.relations) {
+                  if (relation.confidence < 0.4) {
+                    lowConfidenceCount += 1;
+                  }
+                }
+              }
+              if (options.allowCheckpoint && checkpointEligible && manifestHash) {
+                for (const file of batch) {
+                  completedFiles.add(file.relPath);
+                }
+                const checkpointState: CheckpointState = {
+                  manifestHash,
+                  completedFiles: [...completedFiles].sort(),
+                  filesIndexed,
+                  filesSkipped,
+                  languages: [...languageSet].sort(),
+                  entities: entityCount,
+                  relations: relationCount,
+                  unresolvedReferences: unresolvedCount,
+                  lowConfidenceRelations: lowConfidenceCount
+                };
+                db.saveCheckpoint(checkpointName, stableNowIso(), checkpointState);
+                db.updateRunProgress(runId, filesIndexed, filesSkipped, checkpointState);
+              }
+            });
+            dbWriteMs += durationMs(batchWriteStartedAt);
           }
         }
 
-        const writeBatchSize = Math.max(32, effectiveParallelism * 8);
-        for (const batch of chunkItems(writableFiles, writeBatchSize)) {
-          db.transaction(() => {
-            db.replaceAstFiles(batch);
-            for (const file of batch) {
-              languageSet.add(file.language);
-              filesIndexed += 1;
-              entityCount += file.entities.length;
-              relationCount += file.relations.length;
-              unresolvedCount += file.unresolved.length;
-              for (const relation of file.relations) {
-                if (relation.confidence < 0.4) {
-                  lowConfidenceCount += 1;
-                }
-              }
-            }
-            if (checkpointEligible && manifestHash) {
-              for (const file of batch) {
-                completedFiles.add(file.relPath);
-              }
-              const checkpointState: CheckpointState = {
-                manifestHash,
-                completedFiles: [...completedFiles].sort(),
-                filesIndexed,
-                filesSkipped,
-                languages: [...languageSet].sort(),
-                entities: entityCount,
-                relations: relationCount,
-                unresolvedReferences: unresolvedCount,
-                lowConfidenceRelations: lowConfidenceCount
-              };
-              db.saveCheckpoint(checkpointName, stableNowIso(), checkpointState);
-              db.updateRunProgress(runId, filesIndexed, filesSkipped, checkpointState);
-            }
-          });
+        return parsedPublicApiSnapshots;
+      };
+
+      const directParsedPublicApi = await processSelectedEntries(selectedEntries, {
+        allowCheckpoint: checkpointEligible,
+        forceFull: false
+      });
+
+      if (changedEntries && changedEntries.length > 0) {
+        const changedSeeds: IncrementalSeed[] = [];
+        for (const parsed of directParsedPublicApi) {
+          const oldSnapshot = changedEntryByRelPath.get(parsed.relPath);
+          if (!oldSnapshot) {
+            continue;
+          }
+          if (oldSnapshot.oldPublicApi.fingerprint !== parsed.publicApiSnapshot.fingerprint) {
+            changedSeeds.push({
+              relPath: parsed.relPath,
+              snapshotPath: oldSnapshot.snapshotPath,
+              oldPublicUids: oldSnapshot.oldPublicApi.publicUids
+            });
+          }
+        }
+
+        if (changedSeeds.length > 0) {
+          const directSelection = new Set(selectedEntries.map((entry) => entry.relPath));
+          const expanded = expandReverseDependents(db, changedSeeds, directSelection);
+          incrementalExpansionTruncated = expanded.truncated;
+          incrementalExpansionReason = expanded.reason;
+          const dependentEntries = expanded.files
+            .filter((relPath) => !directSelection.has(relPath))
+            .map((relPath) => path.resolve(scanRoot, relPath))
+            .filter((absPath) => existsSync(absPath))
+            .sort()
+            .map((absPath) => ({
+              absPath,
+              relPath: normalizePath(path.relative(scanRoot, absPath)),
+              sizeBytes: statSync(absPath).size
+            }));
+
+          incrementalDependentFiles = dependentEntries.length;
+          await processSelectedEntries(dependentEntries, { allowCheckpoint: false, forceFull: true });
         }
       }
     } finally {
+      workerRestarts += parsePool?.getStats().restarts ?? 0;
+      workerTimeouts += parsePool?.getStats().timeouts ?? 0;
       await parsePool?.close();
       parsePool = undefined;
     }
 
     const allFiles = filesIndexed + filesSkipped;
     const estimatedCoverage = allFiles === 0 ? 0 : filesIndexed / allFiles;
+    const maintenanceStartedAt = performance.now();
+    db.maintainCaches();
+    db.optimize();
+    dbWriteMs += durationMs(maintenanceStartedAt);
+    if (checkpointEligible) {
+      const checkpointClearStartedAt = performance.now();
+      db.clearCheckpoint(checkpointName);
+      dbWriteMs += durationMs(checkpointClearStartedAt);
+    }
     const summary: IndexSummary = {
       mode: request.fromGitDiff ? "update" : "index",
       filesScanned: allFiles,
@@ -821,16 +1244,30 @@ export async function indexRepository(
       lowConfidenceRelations: lowConfidenceCount,
       estimatedCoverage,
       telemetry: {
+        discoveryMs,
+        readMs,
+        hashMs,
+        parseMs,
+        dbWriteMs,
+        tsResolutionMs,
+        tsResolutionCacheHits,
+        tsResolutionCacheMisses,
+        incrementalDependentFiles,
+        incrementalExpansionTruncated,
+        incrementalExpansionReason,
+        cacheHitFiles,
+        cacheHitParses,
+        workerRestarts,
+        workerTimeouts,
         parserFallbackFiles,
         fallbackByLanguage: Object.fromEntries([...fallbackByLanguage.entries()].sort(([a], [b]) => a.localeCompare(b))),
-        parserSourceCounts: Object.fromEntries([...parserSourceCounts.entries()].sort(([a], [b]) => a.localeCompare(b)))
+        parserSourceCounts: Object.fromEntries([...parserSourceCounts.entries()].sort(([a], [b]) => a.localeCompare(b))),
+        skippedByReason,
+        skippedFiles,
+        slowestFiles,
+        dbQueryCount
       }
     };
-    db.maintainCaches();
-    db.optimize();
-    if (checkpointEligible) {
-      db.clearCheckpoint(checkpointName);
-    }
     db.finishRun(runId, "ok", stableNowIso(), summary);
     return summary;
   } catch (error) {
@@ -859,15 +1296,15 @@ export async function bootstrapRepository(
     config.performance.lazyIndexing = true;
   }
   if (options.dryRun) {
-    const discovered = discoverFiles(rootDir, {
+    const discovered = discoverFilesDetailed(rootDir, {
       excludes: config.performance.exclude,
       maxFileSizeKb: config.performance.maxFileSizeKb
     });
     return {
       mode: "bootstrap",
-      filesScanned: discovered.length,
+      filesScanned: discovered.files.length + discovered.skipped.length,
       filesIndexed: 0,
-      filesSkipped: discovered.length,
+      filesSkipped: discovered.files.length + discovered.skipped.length,
       languages: [],
       entities: 0,
       relations: 0,

@@ -246,6 +246,110 @@ describe("DSPDatabase", () => {
     );
   });
 
+  it("stores reverse dependency snapshots for file and symbol lookups", () => {
+    const now = stableNowIso();
+    const fileA = "src/a.ts";
+    const fileB = "src/b.ts";
+    const fileUidA = buildUid("file", fileA);
+    const fileUidB = buildUid("file", fileB);
+    const fnUidA = buildUid("function", fileA, "exported");
+    const fnUidB = buildUid("function", fileB, "consumer");
+
+    db.replaceAstFiles([
+      {
+        relPath: fileA,
+        language: "typescript",
+        hash: "hash-a",
+        indexedAt: now,
+        mtimeMs: 1,
+        sizeBytes: 10,
+        entities: [
+          {
+            uid: fileUidA,
+            kind: "file",
+            name: "a.ts",
+            path: fileA,
+            language: "typescript",
+            confidence: 1,
+            provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+            createdAt: now,
+            updatedAt: now
+          },
+          {
+            uid: fnUidA,
+            kind: "function",
+            name: "exported",
+            path: fileA,
+            language: "typescript",
+            confidence: 1,
+            provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+            createdAt: now,
+            updatedAt: now
+          }
+        ],
+        relations: [],
+        unresolved: []
+      },
+      {
+        relPath: fileB,
+        language: "typescript",
+        hash: "hash-b",
+        indexedAt: now,
+        mtimeMs: 1,
+        sizeBytes: 10,
+        entities: [
+          {
+            uid: fileUidB,
+            kind: "file",
+            name: "b.ts",
+            path: fileB,
+            language: "typescript",
+            confidence: 1,
+            provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+            createdAt: now,
+            updatedAt: now
+          },
+          {
+            uid: fnUidB,
+            kind: "function",
+            name: "consumer",
+            path: fileB,
+            language: "typescript",
+            confidence: 1,
+            provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+            createdAt: now,
+            updatedAt: now
+          }
+        ],
+        relations: [
+          {
+            from: fileUidB,
+            to: fileUidA,
+            kind: "imports",
+            confidence: 0.9,
+            provenance: [{ source: "ast", timestamp: now, confidence: 0.9 }]
+          },
+          {
+            from: fnUidB,
+            to: fnUidA,
+            kind: "calls",
+            confidence: 0.8,
+            provenance: [{ source: "ast", timestamp: now, confidence: 0.8 }]
+          }
+        ],
+        unresolved: []
+      }
+    ]);
+
+    expect(db.getReverseFileDependents([fileA])).toEqual([fileB]);
+    expect(db.getReverseSymbolDependents([fnUidA])).toEqual([fnUidB]);
+
+    db.clearAstDataForPath(fileA);
+
+    expect(db.getReverseFileDependents([fileA])).toEqual([fileB]);
+    expect(db.getReverseSymbolDependents([fnUidA])).toEqual([fnUidB]);
+  });
+
   it("finds non-container orphans with a direct SQL query", () => {
     const now = stableNowIso();
     const fileUid = buildUid("file", "src/auth.ts");
