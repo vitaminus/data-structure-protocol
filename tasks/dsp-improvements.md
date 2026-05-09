@@ -37,7 +37,7 @@ Status: done
 
 ### 97. Add batched graph read APIs and request-scoped caches
 
-Status: in progress
+Status: done
 
 - Add batch database helpers for entity/relation endpoint reads, including `getEntitiesByUidCached`, `getRelationsForUids`, and `getTouchingRelationsWithEndpoints`.
 - Add request-scoped entity/relation caches and reduce repeated JSON parse work for hot read paths.

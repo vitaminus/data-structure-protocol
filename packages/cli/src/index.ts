@@ -87,18 +87,18 @@ function directedTree(
   direction: "children" | "parents"
 ): unknown {
   const visited = new Set<string>();
+  const cache = services.db.createGraphReadCache();
   const walk = (entity: Entity, remaining: number): unknown => {
     if (remaining <= 0 || visited.has(entity.uid)) {
       return { entity, relations: [], [direction]: [] };
     }
     visited.add(entity.uid);
     const relations = (direction === "children"
-      ? services.db.getRelationsFrom(entity.uid)
-      : services.db.getRelationsTo(entity.uid)
+      ? services.db.getRelationsFromCached(entity.uid, cache)
+      : services.db.getRelationsToCached(entity.uid, cache)
     ).filter((relation) => TRAVERSAL_KINDS.has(relation.kind));
-    const nodes = relations
-      .map((relation) => services.db.getEntity(direction === "children" ? relation.to : relation.from))
-      .filter(Boolean) as Entity[];
+    const nodeUids = relations.map((relation) => (direction === "children" ? relation.to : relation.from));
+    const nodes = services.db.getEntitiesByUidCached(nodeUids, cache);
     return {
       entity,
       relations,
@@ -124,6 +124,7 @@ function findSourceEntities(services: DSPServices, sourcePath: string): Entity[]
 }
 
 function shortestPath(services: DSPServices, fromUid: string, toUid: string): string[] | undefined {
+  const cache = services.db.createGraphReadCache();
   const queue: string[][] = [[fromUid]];
   const visited = new Set<string>([fromUid]);
   while (queue.length > 0) {
@@ -132,7 +133,7 @@ function shortestPath(services: DSPServices, fromUid: string, toUid: string): st
     if (current === toUid) {
       return pathSoFar;
     }
-    for (const relation of services.db.getRelationsFrom(current).filter((rel) => TRAVERSAL_KINDS.has(rel.kind))) {
+    for (const relation of services.db.getRelationsFromCached(current, cache).filter((rel) => TRAVERSAL_KINDS.has(rel.kind))) {
       if (!visited.has(relation.to)) {
         visited.add(relation.to);
         queue.push([...pathSoFar, relation.to]);
