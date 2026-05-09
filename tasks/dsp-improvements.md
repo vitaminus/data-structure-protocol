@@ -61,7 +61,7 @@ Status: done
 
 ### 100. Replace per-file Python and Ruby external parsing with persistent workers
 
-Status: in progress
+Status: done
 
 - Add long-lived Python and Ruby parser workers with a stable request protocol, per-job timeout, bounded lifetime, crash restart, and explicit fallback telemetry.
 - Preserve safe syntax-error handling and existing fallback parsers so one worker failure cannot fail the full index run.
