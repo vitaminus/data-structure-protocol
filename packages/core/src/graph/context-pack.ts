@@ -1,4 +1,3 @@
-import fs from "node:fs";
 import path from "node:path";
 import type {
   ContextPackRequest,
@@ -12,6 +11,7 @@ import { DSPDatabase } from "../storage/db.ts";
 import { semanticSearch } from "../semantic/search.ts";
 import { relationPriority, streamNeighbors } from "./query.ts";
 import { contentHash } from "./uid.ts";
+import { readUtf8FileSafe, readUtf8PrefixSafe } from "../util/text.ts";
 
 type StrategyDefaults = {
   maxFiles: number;
@@ -82,67 +82,49 @@ function lineRangeForEntities(entities: Entity[]): { startLine?: number; endLine
   };
 }
 
-function readUtf8Prefix(
-  filePath: string,
-  maxChars: number
-): { content: string; truncated: boolean } {
-  const maxBytes = Math.max(256, maxChars * 4);
-  const fd = fs.openSync(filePath, "r");
-  try {
-    const buffer = Buffer.allocUnsafe(maxBytes);
-    const bytesRead = fs.readSync(fd, buffer, 0, maxBytes, 0);
-    const content = buffer.subarray(0, bytesRead).toString("utf8").slice(0, maxChars);
-    const stat = fs.fstatSync(fd);
-    return {
-      content,
-      truncated: stat.size > bytesRead || content.length >= maxChars
-    };
-  } finally {
-    fs.closeSync(fd);
-  }
-}
-
 function readCodePayload(
   db: DSPDatabase,
   files: string[],
   entities: Entity[],
   mode: NonNullable<ContextPackRequest["includeCode"]>,
   options: { maxCharsPerFile: number; maxTotalChars: number }
-): NonNullable<ContextPackResponse["code"]> | undefined {
+): { code?: NonNullable<ContextPackResponse["code"]>; skipped: string[] } {
   if (mode === "none") {
-    return undefined;
+    return { skipped: [] };
   }
   const rootDir = rootDirForDb(db);
   let remainingChars = options.maxTotalChars;
-  return files.flatMap<CodePayload>((filePath) => {
+  const skipped: string[] = [];
+  const code = files.flatMap<CodePayload>((filePath) => {
     if (remainingChars <= 0) {
       return [];
     }
     const absPath = path.resolve(rootDir, filePath);
     const fileCharBudget = Math.max(160, Math.min(options.maxCharsPerFile, remainingChars));
     if (mode === "full-files") {
-      try {
-        const prefix = readUtf8Prefix(absPath, fileCharBudget);
-        remainingChars -= prefix.content.length;
-        return [
-          {
-            path: filePath,
-            mode,
-            content: prefix.content,
-            truncated: prefix.truncated
-          }
-        ];
-      } catch {
+      const prefix = readUtf8PrefixSafe(absPath, fileCharBudget);
+      if (prefix.kind !== "text") {
+        skipped.push(`${filePath} (${prefix.kind})`);
         return [];
       }
+      remainingChars -= prefix.content.length;
+      return [
+        {
+          path: filePath,
+          mode,
+          content: prefix.content,
+          truncated: prefix.truncated
+        }
+      ];
     }
 
     let raw: string;
-    try {
-      raw = fs.readFileSync(absPath, "utf8");
-    } catch {
+    const safeContent = readUtf8FileSafe(absPath);
+    if (safeContent.kind !== "text") {
+      skipped.push(`${filePath} (${safeContent.kind})`);
       return [];
     }
+    raw = safeContent.content;
     if (fileCharBudget <= 0) {
       return [];
     }
@@ -165,6 +147,10 @@ function readCodePayload(
       }
     ];
   });
+  return {
+    ...(code.length > 0 ? { code } : {}),
+    skipped
+  };
 }
 
 async function relationDepthFilter(
@@ -530,7 +516,7 @@ export async function buildContextPack(
   const maxCodeTokens = includeCode === "full-files" ? Math.max(400, Math.floor(maxTokens * 0.45)) : Math.max(240, Math.floor(maxTokens * 0.25));
   const maxCodeChars = Math.max(320, maxCodeTokens * 4);
   const maxCharsPerFile = Math.max(160, Math.floor(maxCodeChars / Math.max(1, files.length)));
-  const code = readCodePayload(db, files, rankedContextEntities, includeCode, {
+  const codePayload = readCodePayload(db, files, rankedContextEntities, includeCode, {
     maxCharsPerFile,
     maxTotalChars: maxCodeChars
   });
@@ -540,7 +526,14 @@ export async function buildContextPack(
       : "No direct public API edges in selected context.",
     tests.length > 0 ? `${tests.length} related tests included.` : "No tests in top-ranked context.",
     ...(embeddingsEnabled ? ["Semantic reranking applied to context entities."] : []),
-    ...(dependenciesTruncated ? [`Graph dependencies truncated from ${graphDependencies.length} to ${dependencies.length}.`] : [])
+    ...(codePayload.skipped.length > 0
+      ? [`Skipped code payloads for unreadable files: ${codePayload.skipped.slice(0, 5).join(", ")}.`]
+      : []),
+    ...(dependenciesTruncated
+      ? [
+          `Graph dependencies truncated from ${graphDependencies.length} to ${dependencies.length}${traversalTruncationReason ? ` due to ${traversalTruncationReason}.` : "."}`
+        ]
+      : [])
   ];
 
   const suggestedEditOrder = topoSortByDependencies(files, rankedContextEntities, dependencies).slice(
@@ -552,7 +545,7 @@ export async function buildContextPack(
     files,
     dependencies,
     tests,
-    ...(code ? { code } : {}),
+    ...(codePayload.code ? { code: codePayload.code } : {}),
     riskNotes,
     suggestedEditOrder,
     estimatedTokens: 0,

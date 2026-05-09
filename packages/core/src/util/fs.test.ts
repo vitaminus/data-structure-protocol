@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { discoverFiles } from "./fs.ts";
+import { discoverFiles, discoverFilesDetailed } from "./fs.ts";
 
 describe("discoverFiles", () => {
   let tempDir: string | undefined;
@@ -36,5 +36,23 @@ describe("discoverFiles", () => {
     const second = discoverFiles(tempDir);
     expect(second).toEqual(first);
     expect(fs.readFileSync).toHaveBeenCalledWith(path.join(tempDir, ".dsp", "discovery-manifest.json"), "utf8");
+  });
+
+  it("records oversize files instead of silently dropping them", () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "dsp-fs-large-test-"));
+    fs.mkdirSync(path.join(tempDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, "src", "small.ts"), "export const ok = true;\n", "utf8");
+    fs.writeFileSync(path.join(tempDir, "src", "large.ts"), "x".repeat(2048), "utf8");
+
+    const discovered = discoverFilesDetailed(tempDir, { maxFileSizeKb: 1 });
+
+    expect(discovered.files.map((filePath) => path.basename(filePath))).toEqual(["small.ts"]);
+    expect(discovered.skipped).toEqual([
+      expect.objectContaining({
+        path: path.join(tempDir, "src", "large.ts"),
+        reason: "tooLarge",
+        sizeBytes: 2048
+      })
+    ]);
   });
 });

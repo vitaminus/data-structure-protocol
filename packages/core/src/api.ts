@@ -9,6 +9,7 @@ import type {
   IndexSummary,
   EmbeddingProvider,
   LanguageAdapter,
+  RepairOptions,
   RepairResult,
   SearchResult,
   TraversalLimits,
@@ -125,7 +126,7 @@ export function runValidate(
 
 export async function runRepair(
   services: DSPServices,
-  options: { dryRun?: boolean } = {}
+  options: RepairOptions = {}
 ): Promise<RepairResult> {
   return repairGraph(services.db, services.rootDir, services.adapters, services.config, options);
 }

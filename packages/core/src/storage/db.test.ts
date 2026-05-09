@@ -445,6 +445,35 @@ describe("DSPDatabase", () => {
     expect(report.maintenance.freelistPages).toBeGreaterThanOrEqual(0);
   });
 
+  it("reports stale checkpoints and abandoned index runs", () => {
+    const oldIso = stableNowIso(new Date(Date.now() - 3 * 24 * 60 * 60 * 1000));
+    const recentIso = stableNowIso();
+    const sqlite = new Database(db.dbPath);
+    sqlite
+      .prepare("INSERT INTO index_runs(started_at, mode, status, metadata_json) VALUES (?, ?, 'running', ?)")
+      .run(oldIso, "index", "{}");
+    sqlite
+      .prepare("INSERT INTO index_runs(started_at, mode, status, metadata_json) VALUES (?, ?, 'running', ?)")
+      .run(recentIso, "update", "{}");
+    sqlite
+      .prepare("INSERT INTO checkpoints(name, metadata_json, created_at) VALUES (?, ?, ?)")
+      .run("index:stale", "{}", oldIso);
+    sqlite
+      .prepare("INSERT INTO checkpoints(name, metadata_json, created_at) VALUES (?, ?, ?)")
+      .run("index:fresh", "{}", recentIso);
+    sqlite.close();
+
+    const report = db.doctor();
+
+    expect(report.runningIndexRuns).toBe(2);
+    expect(report.abandonedIndexRuns).toEqual([
+      expect.objectContaining({ mode: "index", startedAt: oldIso })
+    ]);
+    expect(report.staleCheckpoints).toEqual([
+      expect.objectContaining({ name: "index:stale", createdAt: oldIso })
+    ]);
+  });
+
   it("clears parse cache alongside other cache tables", () => {
     const now = stableNowIso();
     db.setEmbedding("uid:test", "hash", [1, 2, 3], "mock", now);

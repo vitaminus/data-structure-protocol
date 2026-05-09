@@ -25,6 +25,7 @@ import {
   type DSPServices,
   type Entity,
   type EntityKind,
+  type IndexSummary,
   type LanguageAdapter,
   type RelationKind,
   type WatchSummary
@@ -49,11 +50,108 @@ function printOutput(output: unknown, asJson: boolean): void {
     process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
     return;
   }
+  if (isIndexSummary(output)) {
+    process.stdout.write(`${formatIndexSummary(output)}\n`);
+    return;
+  }
   if (typeof output === "string") {
     process.stdout.write(`${output}\n`);
     return;
   }
   process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
+}
+
+function isIndexSummary(value: unknown): value is IndexSummary {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const candidate = value as Partial<IndexSummary>;
+  return (
+    typeof candidate.mode === "string" &&
+    typeof candidate.filesScanned === "number" &&
+    typeof candidate.filesIndexed === "number" &&
+    typeof candidate.filesSkipped === "number"
+  );
+}
+
+function formatNumber(value: number | undefined, digits = 1): string {
+  return Number.isFinite(value) ? Number(value).toFixed(digits) : "0.0";
+}
+
+type CliIndexTelemetry = {
+  discoveryMs?: number;
+  readMs?: number;
+  hashMs?: number;
+  parseMs?: number;
+  dbWriteMs?: number;
+  tsResolutionMs?: number;
+  tsResolutionCacheHits?: number;
+  tsResolutionCacheMisses?: number;
+  incrementalDependentFiles?: number;
+  incrementalExpansionTruncated?: boolean;
+  incrementalExpansionReason?: "maxDepth" | "maxFiles";
+  cacheHitFiles?: number;
+  cacheHitParses?: number;
+  workerRestarts?: number;
+  workerTimeouts?: number;
+  parserFallbackFiles: number;
+  skippedByReason?: Partial<Record<"unsupported" | "unchanged" | "tooLarge" | "binary" | "invalidUtf8", number>>;
+  skippedFiles?: Array<{
+    path: string;
+    reason: "unsupported" | "unchanged" | "tooLarge" | "binary" | "invalidUtf8";
+    sizeBytes: number;
+    language?: string;
+  }>;
+  slowestFiles?: Array<{
+    path: string;
+    ms: number;
+    sizeBytes: number;
+    language: string;
+  }>;
+};
+
+function formatIndexSummary(summary: IndexSummary): string {
+  const lines = [
+    `Index ${summary.mode} complete`,
+    `Files: scanned ${summary.filesScanned}, indexed ${summary.filesIndexed}, skipped ${summary.filesSkipped}`,
+    `Graph: entities ${summary.entities}, relations ${summary.relations}, unresolved ${summary.unresolvedReferences}, low-confidence ${summary.lowConfidenceRelations}`,
+    `Coverage: ${formatNumber(summary.estimatedCoverage * 100)}%`
+  ];
+  const telemetry = summary.telemetry as CliIndexTelemetry | undefined;
+  if (!telemetry) {
+    return lines.join("\n");
+  }
+  lines.push(
+    `Telemetry: discovery ${formatNumber(telemetry.discoveryMs)}ms, read ${formatNumber(telemetry.readMs)}ms, hash ${formatNumber(telemetry.hashMs)}ms, parse ${formatNumber(telemetry.parseMs)}ms, db-write ${formatNumber(telemetry.dbWriteMs)}ms`,
+    `TS resolution: ${formatNumber(telemetry.tsResolutionMs)}ms, cache hits ${telemetry.tsResolutionCacheHits ?? 0}, misses ${telemetry.tsResolutionCacheMisses ?? 0}`,
+    `Incremental dependents: ${telemetry.incrementalDependentFiles ?? 0}${telemetry.incrementalExpansionTruncated ? ` (truncated: ${telemetry.incrementalExpansionReason ?? "unknown"})` : ""}`,
+    `Cache hits: files ${telemetry.cacheHitFiles ?? 0}, parses ${telemetry.cacheHitParses ?? 0}`,
+    `Workers: restarts ${telemetry.workerRestarts ?? 0}, timeouts ${telemetry.workerTimeouts ?? 0}`,
+    `Fallbacks: files ${telemetry.parserFallbackFiles}`
+  );
+  if (telemetry.skippedByReason && Object.keys(telemetry.skippedByReason).length > 0) {
+    lines.push(
+      `Skipped reasons: ${Object.entries(telemetry.skippedByReason)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([reason, count]) => `${reason} ${count}`)
+        .join(", ")}`
+    );
+  }
+  const noteworthySkipped = (telemetry.skippedFiles ?? []).filter((file) => file.reason !== "unchanged");
+  if (noteworthySkipped.length > 0) {
+    lines.push("Skipped files:");
+    for (const file of noteworthySkipped.slice(0, 5)) {
+      lines.push(`- ${file.path} ${file.reason} ${file.sizeBytes}B${file.language ? ` ${file.language}` : ""}`);
+    }
+  }
+  const slowestFiles = telemetry.slowestFiles ?? [];
+  if (slowestFiles.length > 0) {
+    lines.push("Slowest files:");
+    for (const file of slowestFiles.slice(0, 5)) {
+      lines.push(`- ${file.path} ${formatNumber(file.ms)}ms ${file.sizeBytes}B ${file.language}`);
+    }
+  }
+  return lines.join("\n");
 }
 
 const TRAVERSAL_KINDS = new Set<RelationKind>([
@@ -968,17 +1066,50 @@ program
 program
   .command("repair")
   .argument("[rootDir]", "root directory", ".")
+  .option("--apply", "apply repairs; without this flag, repair runs in planning mode", false)
   .option("--dry-run", "show planned repairs without writing", false)
+  .option("--clean-orphaned-file-hashes", "remove file-hash rows whose file entity no longer exists", false)
+  .option("--clean-orphaned-embeddings", "remove embedding rows whose entity no longer exists", false)
+  .option("--clean-stale-parse-cache", "remove parse-cache rows with no matching file hash", false)
+  .option("--clear-stale-checkpoints", "remove old leftover checkpoints from interrupted runs", false)
+  .option("--fail-abandoned-runs", "mark long-running index runs as failed", false)
   .option("--json", "machine-readable output", false)
-  .action(async (rootDir: string, options: { dryRun: boolean; json: boolean }) => {
+  .action(
+    async (
+      rootDir: string,
+      options: {
+        apply: boolean;
+        dryRun: boolean;
+        cleanOrphanedFileHashes: boolean;
+        cleanOrphanedEmbeddings: boolean;
+        cleanStaleParseCache: boolean;
+        clearStaleCheckpoints: boolean;
+        failAbandonedRuns: boolean;
+        json: boolean;
+      }
+    ) => {
     const services = openDSP(path.resolve(rootDir), adapters());
     try {
-      const result = await runRepair(services, { dryRun: options.dryRun });
+      const result = await (
+        runRepair as (
+          services: DSPServices,
+          options: Record<string, boolean | undefined>
+        ) => Promise<unknown>
+      )(services, {
+        apply: options.apply,
+        dryRun: options.dryRun,
+        cleanOrphanedFileHashes: options.cleanOrphanedFileHashes,
+        cleanOrphanedEmbeddings: options.cleanOrphanedEmbeddings,
+        cleanStaleParseCache: options.cleanStaleParseCache,
+        clearStaleCheckpoints: options.clearStaleCheckpoints,
+        failAbandonedRuns: options.failAbandonedRuns
+      });
       printOutput(result, options.json);
     } finally {
       services.db.close();
     }
-  });
+    }
+  );
 
 program
   .command("export")

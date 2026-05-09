@@ -101,7 +101,7 @@ Status: done
 
 ### 105. Harden crash recovery, doctor/repair, and large-repo reliability
 
-Status: in progress
+Status: done
 
 - Add failure-mode tests for interrupted index runs, corrupted checkpoints, concurrent read-while-indexing, invalid UTF-8, binary/huge file skipping, stale parse cache, SQLite busy/retry, graph cycles, and truncation visibility.
 - Extend `doctor`/`repair` with machine-readable output, stale-run/checkpoint detection, orphan cleanup, explicit destructive flags, and runtime/dependency capability checks.

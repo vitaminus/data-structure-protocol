@@ -75,4 +75,32 @@ describe("validation", () => {
     expect(shallow.issues.some((issue) => issue.kind === "dangling_relation")).toBe(false);
     expect(deep.issues.some((issue) => issue.kind === "dangling_relation")).toBe(true);
   });
+
+  it("reports binary files as warnings instead of treating them as missing", () => {
+    fs.writeFileSync(path.join(tempDir, "src", "auth.ts"), Buffer.from([0x61, 0x00, 0x62]));
+
+    const result = validateGraph(db, tempDir);
+
+    expect(result.issues).toContainEqual(
+      expect.objectContaining({
+        kind: "binary_file",
+        severity: "warning",
+        path: "src/auth.ts"
+      })
+    );
+  });
+
+  it("reports invalid UTF-8 files as warnings", () => {
+    fs.writeFileSync(path.join(tempDir, "src", "auth.ts"), Buffer.from([0xc3, 0x28]));
+
+    const result = validateGraph(db, tempDir);
+
+    expect(result.issues).toContainEqual(
+      expect.objectContaining({
+        kind: "invalid_utf8",
+        severity: "warning",
+        path: "src/auth.ts"
+      })
+    );
+  });
 });

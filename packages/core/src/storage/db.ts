@@ -262,10 +262,22 @@ export type DatabaseDoctorReport = {
   orphanedEmbeddings: string[];
   danglingUnresolvedPaths: string[];
   runningIndexRuns: number;
+  abandonedIndexRuns: Array<{
+    id: number;
+    mode: string;
+    startedAt: string;
+  }>;
+  corruptedIndexRunMetadata: number[];
   checkpoints: number;
+  staleCheckpoints: Array<{
+    name: string;
+    createdAt: string;
+  }>;
+  corruptedCheckpoints: string[];
   parseCache: {
     entries: number;
     stalePaths: string[];
+    corruptedEntries: string[];
   };
   maintenance: {
     freelistPages: number;
@@ -743,16 +755,283 @@ export class DSPDatabase {
     if (!row) {
       return undefined;
     }
+    const metadata = safeJsonObject(row.metadata_json ?? "{}");
     return {
       id: row.id,
       name: row.name,
-      metadata: fromJson<Record<string, unknown>>(row.metadata_json ?? "{}") ?? {},
+      metadata: metadata.value,
       createdAt: row.created_at
     };
   }
 
   clearCheckpoint(name: string): void {
     this.withBusyRetry(() => this.prepareCached("clear-checkpoint", "DELETE FROM checkpoints WHERE name = ?").run(name));
+  }
+
+  clearCheckpoints(names: string[]): number {
+    if (names.length === 0) {
+      return 0;
+    }
+    let removed = 0;
+    this.withBusyRetry(() => {
+      for (const chunk of chunks([...new Set(names)])) {
+        const placeholders = chunk.map(() => "?").join(", ");
+        removed += this.db.prepare(`DELETE FROM checkpoints WHERE name IN (${placeholders})`).run(...chunk).changes;
+      }
+    });
+    return removed;
+  }
+
+  getStaleCheckpoints(limit = 100, olderThanMs = STALE_CHECKPOINT_AFTER_MS): Array<{ name: string; createdAt: string }> {
+    const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+    const rows = this.readDb
+      .prepare(
+        `
+        SELECT name, created_at
+        FROM checkpoints
+        WHERE created_at < ?
+        ORDER BY created_at, name
+        LIMIT ?
+        `
+      )
+      .all(cutoff, limit) as { name: string; created_at: string }[];
+    return rows.map((row) => ({ name: row.name, createdAt: row.created_at }));
+  }
+
+  getAbandonedIndexRuns(limit = 100, olderThanMs = STALE_INDEX_RUN_AFTER_MS): IndexRunRecord[] {
+    const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+    const rows = this.readDb
+      .prepare(
+        `
+        SELECT id, started_at, ended_at, mode, status, metadata_json
+        FROM index_runs
+        WHERE status = 'running' AND started_at < ?
+        ORDER BY started_at, id
+        LIMIT ?
+        `
+      )
+      .all(cutoff, limit) as {
+      id: number;
+      started_at: string;
+      ended_at: string | null;
+      mode: string;
+      status: string;
+      metadata_json: string | null;
+    }[];
+    return rows.map((row) => {
+      const metadata = safeJsonObject(row.metadata_json ?? "{}");
+      return {
+      id: row.id,
+      startedAt: row.started_at,
+      endedAt: row.ended_at ?? undefined,
+      mode: row.mode,
+      status: row.status,
+      metadata: metadata.value
+      };
+    });
+  }
+
+  getCorruptedCheckpoints(limit = 100): string[] {
+    const rows = this.readDb
+      .prepare("SELECT name, metadata_json FROM checkpoints ORDER BY name LIMIT ?")
+      .all(limit) as { name: string; metadata_json: string | null }[];
+    return rows
+      .filter((row) => !safeJsonObject(row.metadata_json ?? "{}").ok)
+      .map((row) => row.name);
+  }
+
+  getCorruptedIndexRunMetadata(limit = 100): number[] {
+    const rows = this.readDb
+      .prepare("SELECT id, metadata_json FROM index_runs ORDER BY id LIMIT ?")
+      .all(limit) as { id: number; metadata_json: string | null }[];
+    return rows
+      .filter((row) => !safeJsonObject(row.metadata_json ?? "{}").ok)
+      .map((row) => row.id);
+  }
+
+  getCorruptedParseCacheEntries(limit = 100): string[] {
+    return this.getCorruptedParseCacheRows(limit).map(
+      (row) => `${row.language}:${row.filePath}:${row.contentHash}`
+    );
+  }
+
+  getCorruptedParseCacheRows(limit = 100): ParseCacheEntryKey[] {
+    const rows = this.readDb
+      .prepare(
+        "SELECT language, file_path, content_hash, payload_json FROM parse_cache ORDER BY file_path, language, content_hash LIMIT ?"
+      )
+      .all(limit) as { language: string; file_path: string; content_hash: string; payload_json: string }[];
+    return rows
+      .filter((row) => !safeJsonParse<CachedParseResult>(row.payload_json, { entities: [], relations: [], unresolvedReferences: [] }).ok)
+      .map((row) => ({
+        language: row.language,
+        filePath: row.file_path,
+        contentHash: row.content_hash
+      }));
+  }
+
+  markIndexRunsFailed(ids: number[], endedAt: string, reason: string): number {
+    if (ids.length === 0) {
+      return 0;
+    }
+    let updated = 0;
+    this.transaction(() => {
+      for (const run of this.getIndexRunsById(ids)) {
+        updated += this.prepareCached(
+          "mark-index-run-failed",
+          "UPDATE index_runs SET status = 'failed', ended_at = ?, metadata_json = ? WHERE id = ?"
+        ).run(
+          endedAt,
+          toJson({
+            ...run.metadata,
+            repairMarkedFailedAt: endedAt,
+            repairFailureReason: reason
+          }),
+          run.id
+        ).changes;
+      }
+    });
+    return updated;
+  }
+
+  getOrphanedFileHashes(limit = 100): string[] {
+    const rows = this.readDb
+      .prepare(
+        `
+        SELECT file_hashes.path
+        FROM file_hashes
+        LEFT JOIN entities ON entities.uid = ('file:' || file_hashes.path)
+        WHERE entities.uid IS NULL
+        ORDER BY file_hashes.path
+        LIMIT ?
+        `
+      )
+      .all(limit) as { path: string }[];
+    return rows.map((row) => row.path);
+  }
+
+  removeFileHashes(filePaths: string[]): number {
+    if (filePaths.length === 0) {
+      return 0;
+    }
+    let removed = 0;
+    this.withBusyRetry(() => {
+      for (const chunk of chunks([...new Set(filePaths)])) {
+        const placeholders = chunk.map(() => "?").join(", ");
+        removed += this.db.prepare(`DELETE FROM file_hashes WHERE path IN (${placeholders})`).run(...chunk).changes;
+      }
+    });
+    return removed;
+  }
+
+  getOrphanedEmbeddings(limit = 100): string[] {
+    const rows = this.readDb
+      .prepare(
+        `
+        SELECT embeddings.uid
+        FROM embeddings
+        LEFT JOIN entities ON entities.uid = embeddings.uid
+        WHERE entities.uid IS NULL
+        ORDER BY embeddings.uid
+        LIMIT ?
+        `
+      )
+      .all(limit) as { uid: string }[];
+    return rows.map((row) => row.uid);
+  }
+
+  removeEmbeddings(uids: string[]): number {
+    if (uids.length === 0) {
+      return 0;
+    }
+    let removed = 0;
+    this.transaction(() => {
+      for (const chunk of chunks([...new Set(uids)])) {
+        const placeholders = chunk.map(() => "?").join(", ");
+        this.db.prepare(`DELETE FROM embedding_buckets WHERE uid IN (${placeholders})`).run(...chunk);
+        removed += this.db.prepare(`DELETE FROM embeddings WHERE uid IN (${placeholders})`).run(...chunk).changes;
+      }
+    });
+    return removed;
+  }
+
+  getStaleParseCachePaths(limit = 100): string[] {
+    const rows = this.readDb
+      .prepare(
+        `
+        SELECT DISTINCT parse_cache.file_path
+        FROM parse_cache
+        LEFT JOIN file_hashes ON file_hashes.path = parse_cache.file_path
+        WHERE file_hashes.path IS NULL
+        ORDER BY parse_cache.file_path
+        LIMIT ?
+        `
+      )
+      .all(limit) as { file_path: string }[];
+    return rows.map((row) => row.file_path);
+  }
+
+  removeParseCachePaths(filePaths: string[]): number {
+    if (filePaths.length === 0) {
+      return 0;
+    }
+    let removed = 0;
+    this.withBusyRetry(() => {
+      for (const chunk of chunks([...new Set(filePaths)])) {
+        const placeholders = chunk.map(() => "?").join(", ");
+        removed += this.db.prepare(`DELETE FROM parse_cache WHERE file_path IN (${placeholders})`).run(...chunk).changes;
+      }
+    });
+    return removed;
+  }
+
+  removeParseCacheEntries(entries: ParseCacheEntryKey[]): number {
+    if (entries.length === 0) {
+      return 0;
+    }
+    let removed = 0;
+    this.withBusyRetry(() => {
+      for (const entry of entries) {
+        removed += this.db
+          .prepare("DELETE FROM parse_cache WHERE language = ? AND file_path = ? AND content_hash = ?")
+          .run(entry.language, entry.filePath, entry.contentHash).changes;
+      }
+    });
+    return removed;
+  }
+
+  private getIndexRunsById(ids: number[]): IndexRunRecord[] {
+    if (ids.length === 0) {
+      return [];
+    }
+    const records: IndexRunRecord[] = [];
+    for (const chunk of chunks([...new Set(ids)])) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      const rows = this.readDb
+        .prepare(
+          `SELECT id, started_at, ended_at, mode, status, metadata_json FROM index_runs WHERE id IN (${placeholders})`
+        )
+        .all(...chunk) as {
+        id: number;
+        started_at: string;
+        ended_at: string | null;
+        mode: string;
+        status: string;
+        metadata_json: string | null;
+      }[];
+      for (const row of rows) {
+        const metadata = safeJsonObject(row.metadata_json ?? "{}");
+        records.push({
+          id: row.id,
+          startedAt: row.started_at,
+          endedAt: row.ended_at ?? undefined,
+          mode: row.mode,
+          status: row.status,
+          metadata: metadata.value
+        });
+      }
+    }
+    return records.sort((left, right) => left.id - right.id);
   }
 
   integrityCheck(): { ok: boolean; rows: string[] } {
@@ -765,31 +1044,11 @@ export class DSPDatabase {
   }
 
   doctor(limit = 100): DatabaseDoctorReport {
+    const currentVersion = this.currentSchemaVersion();
+    const expectedVersion = this.expectedSchemaVersion();
     const integrity = this.integrityCheck();
-    const orphanedFileHashes = this.readDb
-      .prepare(
-        `
-        SELECT file_hashes.path
-        FROM file_hashes
-        LEFT JOIN entities ON entities.uid = ('file:' || file_hashes.path)
-        WHERE entities.uid IS NULL
-        ORDER BY file_hashes.path
-        LIMIT ?
-        `
-      )
-      .all(limit) as { path: string }[];
-    const orphanedEmbeddings = this.readDb
-      .prepare(
-        `
-        SELECT embeddings.uid
-        FROM embeddings
-        LEFT JOIN entities ON entities.uid = embeddings.uid
-        WHERE entities.uid IS NULL
-        ORDER BY embeddings.uid
-        LIMIT ?
-        `
-      )
-      .all(limit) as { uid: string }[];
+    const orphanedFileHashes = this.getOrphanedFileHashes(limit);
+    const orphanedEmbeddings = this.getOrphanedEmbeddings(limit);
     const danglingUnresolvedPaths = this.readDb
       .prepare(
         `
@@ -813,23 +1072,17 @@ export class DSPDatabase {
         count: number;
       }
     ).count;
+    const abandonedIndexRuns = this.getAbandonedIndexRuns(limit);
+    const corruptedIndexRunMetadata = this.getCorruptedIndexRunMetadata(limit);
+    const staleCheckpoints = this.getStaleCheckpoints(limit);
+    const corruptedCheckpoints = this.getCorruptedCheckpoints(limit);
     const parseCacheEntries = (
       this.readDb.prepare("SELECT COUNT(*) AS count FROM parse_cache").get() as {
         count: number;
       }
     ).count;
-    const staleParseCachePaths = this.readDb
-      .prepare(
-        `
-        SELECT DISTINCT parse_cache.file_path
-        FROM parse_cache
-        LEFT JOIN file_hashes ON file_hashes.path = parse_cache.file_path
-        WHERE file_hashes.path IS NULL
-        ORDER BY parse_cache.file_path
-        LIMIT ?
-        `
-      )
-      .all(limit) as { file_path: string }[];
+    const staleParseCachePaths = this.getStaleParseCachePaths(limit);
+    const corruptedParseCacheEntries = this.getCorruptedParseCacheEntries(limit);
     const freelistPages = (
       this.readDb.prepare("PRAGMA freelist_count").get() as { freelist_count?: number; count?: number } | undefined
     )?.freelist_count ?? 0;
@@ -840,14 +1093,23 @@ export class DSPDatabase {
         upToDate: currentVersion === expectedVersion
       },
       integrity,
-      orphanedFileHashes: orphanedFileHashes.map((row) => row.path),
-      orphanedEmbeddings: orphanedEmbeddings.map((row) => row.uid),
+      orphanedFileHashes,
+      orphanedEmbeddings,
       danglingUnresolvedPaths: danglingUnresolvedPaths.map((row) => row.path),
       runningIndexRuns,
+      abandonedIndexRuns: abandonedIndexRuns.map((run) => ({
+        id: run.id,
+        mode: run.mode,
+        startedAt: run.startedAt
+      })),
+      corruptedIndexRunMetadata,
       checkpoints,
+      staleCheckpoints,
+      corruptedCheckpoints,
       parseCache: {
         entries: parseCacheEntries,
-        stalePaths: staleParseCachePaths.map((row) => row.file_path)
+        stalePaths: staleParseCachePaths,
+        corruptedEntries: corruptedParseCacheEntries
       },
       maintenance: {
         freelistPages
@@ -868,7 +1130,12 @@ export class DSPDatabase {
     if (!row) {
       return undefined;
     }
-    return fromJson<CachedParseResult>(row.payload_json);
+    const parsed = safeJsonParse<CachedParseResult>(row.payload_json, {
+      entities: [],
+      relations: [],
+      unresolvedReferences: []
+    });
+    return parsed.ok ? parsed.value : undefined;
   }
 
   setCachedParseResult(language: string, filePath: string, hash: string, payload: CachedParseResult, updatedAt: string): void {

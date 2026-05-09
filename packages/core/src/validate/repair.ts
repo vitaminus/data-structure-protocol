@@ -2,13 +2,17 @@ import fs from "node:fs";
 import path from "node:path";
 import type { DSPDatabase } from "../storage/db.ts";
 import type { DSPConfig } from "../config/types.ts";
-import type { LanguageAdapter, RepairAction, RepairResult, ValidationIssue } from "../graph/types.ts";
+import {
+  type LanguageAdapter,
+  type RepairAction,
+  type RepairActionKind,
+  type RepairOptions,
+  type RepairResult,
+  type ValidationIssue
+} from "../graph/types.ts";
+import { stableNowIso } from "../graph/uid.ts";
 import { indexRepository } from "../indexer/indexer.ts";
 import { validateGraph } from "./validate.ts";
-
-type RepairOptions = {
-  dryRun?: boolean;
-};
 
 function actionForIssue(issue: ValidationIssue, status: RepairAction["status"], message: string): RepairAction {
   return {
@@ -21,6 +25,20 @@ function actionForIssue(issue: ValidationIssue, status: RepairAction["status"], 
   };
 }
 
+function actionForKind(
+  kind: RepairActionKind,
+  status: RepairAction["status"],
+  message: string,
+  extra: Partial<RepairAction> = {}
+): RepairAction {
+  return {
+    kind,
+    status,
+    message,
+    ...extra
+  };
+}
+
 export async function repairGraph(
   db: DSPDatabase,
   rootDir: string,
@@ -28,7 +46,7 @@ export async function repairGraph(
   config: DSPConfig,
   options: RepairOptions = {}
 ): Promise<RepairResult> {
-  const dryRun = options.dryRun ?? false;
+  const dryRun = options.apply ? false : (options.dryRun ?? true);
   const validationBefore = validateGraph(db, rootDir);
   const actions: RepairAction[] = [];
   const reindexPaths = new Set<string>();
@@ -84,6 +102,121 @@ export async function repairGraph(
       default:
         actions.push(actionForIssue(issue, "skipped", `No automatic repair for ${issue.kind}.`));
         break;
+    }
+  }
+
+  const operationalLimit = 10000;
+  if (options.cleanOrphanedFileHashes) {
+    const orphanedFileHashes = db.getOrphanedFileHashes(operationalLimit);
+    for (const filePath of orphanedFileHashes) {
+      actions.push(
+        actionForKind(
+          "orphaned_file_hash",
+          dryRun ? "planned" : "applied",
+          `Remove orphaned file hash for ${filePath}.`,
+          { path: filePath }
+        )
+      );
+    }
+    if (!dryRun) {
+      db.removeFileHashes(orphanedFileHashes);
+    }
+  }
+
+  if (options.cleanOrphanedEmbeddings) {
+    const orphanedEmbeddings = db.getOrphanedEmbeddings(operationalLimit);
+    for (const uid of orphanedEmbeddings) {
+      actions.push(
+        actionForKind(
+          "orphaned_embedding",
+          dryRun ? "planned" : "applied",
+          `Remove orphaned embedding for ${uid}.`,
+          { uid }
+        )
+      );
+    }
+    if (!dryRun) {
+      db.removeEmbeddings(orphanedEmbeddings);
+    }
+  }
+
+  if (options.cleanStaleParseCache) {
+    const staleParseCachePaths = db.getStaleParseCachePaths(operationalLimit);
+    const corruptedParseCacheEntries = db.getCorruptedParseCacheRows(operationalLimit);
+    for (const filePath of staleParseCachePaths) {
+      actions.push(
+        actionForKind(
+          "stale_parse_cache",
+          dryRun ? "planned" : "applied",
+          `Remove stale parse-cache rows for ${filePath}.`,
+          { path: filePath }
+        )
+      );
+    }
+    for (const entry of corruptedParseCacheEntries) {
+      actions.push(
+        actionForKind(
+          "stale_parse_cache",
+          dryRun ? "planned" : "applied",
+          `Remove corrupted parse-cache row for ${entry.filePath} (${entry.language}).`,
+          { path: entry.filePath }
+        )
+      );
+    }
+    if (!dryRun) {
+      db.removeParseCachePaths(staleParseCachePaths);
+      db.removeParseCacheEntries(corruptedParseCacheEntries);
+    }
+  }
+
+  if (options.clearStaleCheckpoints) {
+    const staleCheckpoints = db.getStaleCheckpoints(operationalLimit);
+    const corruptedCheckpoints = db.getCorruptedCheckpoints(operationalLimit);
+    for (const checkpoint of staleCheckpoints) {
+      actions.push(
+        actionForKind(
+          "stale_checkpoint",
+          dryRun ? "planned" : "applied",
+          `Clear stale checkpoint ${checkpoint.name}.`,
+          { path: checkpoint.name }
+        )
+      );
+    }
+    for (const checkpointName of corruptedCheckpoints) {
+      actions.push(
+        actionForKind(
+          "stale_checkpoint",
+          dryRun ? "planned" : "applied",
+          `Clear corrupted checkpoint ${checkpointName}.`,
+          { path: checkpointName }
+        )
+      );
+    }
+    if (!dryRun) {
+      db.clearCheckpoints([
+        ...new Set([...staleCheckpoints.map((checkpoint) => checkpoint.name), ...corruptedCheckpoints])
+      ]);
+    }
+  }
+
+  if (options.failAbandonedRuns) {
+    const abandonedRuns = db.getAbandonedIndexRuns(operationalLimit);
+    for (const run of abandonedRuns) {
+      actions.push(
+        actionForKind(
+          "abandoned_run",
+          dryRun ? "planned" : "applied",
+          `Mark abandoned index run ${run.id} (${run.mode}) as failed.`,
+          { uid: String(run.id) }
+        )
+      );
+    }
+    if (!dryRun) {
+      db.markIndexRunsFailed(
+        abandonedRuns.map((run) => run.id),
+        stableNowIso(),
+        "marked failed during repair"
+      );
     }
   }
 
