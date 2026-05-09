@@ -56,6 +56,11 @@ describe("ParseWorkerPool", () => {
       )
     ).rejects.toThrow("timed out");
 
+    expect(pool.getStats()).toMatchObject({
+      restarts: 1,
+      timeouts: 1
+    });
+
     const adapter = createTypeScriptLanguageAdapter();
     const recovered = await pool.run(adapter.worker!, "src/demo.ts", "export const demo = 1;\n");
     expect(recovered.entities.some((entity) => entity.name === "demo")).toBe(true);

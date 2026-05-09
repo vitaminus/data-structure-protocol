@@ -1,7 +1,7 @@
-import { spawnSync } from "node:child_process";
 import path from "node:path";
 import type { Entity, LanguageAdapter, ParseResult, Relation, UnresolvedReference } from "@dsp/core";
 import { buildUid, stableNowIso } from "@dsp/core";
+import { PersistentJsonlWorker } from "./persistent-worker.ts";
 
 type RubySource = "ast" | "regex";
 
@@ -64,15 +64,96 @@ type RubyToken = {
   value: string;
 };
 
-const RIPPER_LEX_SCRIPT = `
+type RubyParseTelemetry = {
+  workerRestarts?: number;
+  workerTimeouts?: number;
+};
+
+type RubyParseResult = ParseResult & {
+  telemetry?: RubyParseTelemetry;
+};
+
+const RIPPER_LEX_SCRIPT = String.raw`
 require "json"
 require "ripper"
-source = STDIN.read
-tokens = Ripper.lex(source).map do |pos, type, token, _state|
-  { line: pos[0], type: type.to_s.sub(/^on_/, ""), value: token }
+STDIN.each_line do |raw_line|
+  line = raw_line.strip
+  next if line.empty?
+  request = JSON.parse(line)
+  source = request["content"].to_s
+  begin
+    if Ripper.sexp(source).nil?
+      reply = {
+        id: request["id"],
+        ok: false,
+        error: {
+          code: "syntax_error",
+          message: "ruby syntax error",
+          syntaxError: true
+        }
+      }
+    else
+      tokens = Ripper.lex(source).map do |pos, type, token, _state|
+        { line: pos[0], type: type.to_s.sub(/^on_/, ""), value: token }
+      end
+      reply = { id: request["id"], ok: true, result: tokens }
+    end
+  rescue => e
+    reply = {
+      id: request["id"],
+      ok: false,
+      error: {
+        code: "parse_error",
+        message: e.message
+      }
+    }
+  end
+  STDOUT.puts(JSON.generate(reply))
+  STDOUT.flush
 end
-puts JSON.generate(tokens)
 `;
+
+let ripperWorker: PersistentJsonlWorker<RubyToken[]> | undefined;
+
+function workerCommandFromEnv(envName: string, fallbackCommand: string, fallbackArgs: string[]): { command: string; args: string[] } {
+  const override = process.env[envName];
+  if (!override) {
+    return { command: fallbackCommand, args: fallbackArgs };
+  }
+  const parsed = JSON.parse(override) as unknown;
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    throw new Error(`Expected ${envName} to be a JSON array command override`);
+  }
+  return {
+    command: String(parsed[0]),
+    args: parsed.slice(1).map((value) => String(value))
+  };
+}
+
+function integerEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) {
+    return fallback;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function ripperWorkerForProcess(): PersistentJsonlWorker<RubyToken[]> {
+  ripperWorker ??= new PersistentJsonlWorker<RubyToken[]>(
+    () => workerCommandFromEnv("DSP_RUBY_RIPPER_COMMAND", "ruby", ["-e", RIPPER_LEX_SCRIPT]),
+    {
+      timeoutMs: integerEnv("DSP_RUBY_RIPPER_TIMEOUT_MS", 5000),
+      maxJobsPerWorker: integerEnv("DSP_RUBY_RIPPER_MAX_JOBS", 200)
+    }
+  );
+  return ripperWorker;
+}
+
+export async function resetRubyRipperWorker(): Promise<void> {
+  await ripperWorker?.close();
+  ripperWorker = undefined;
+}
 
 function prov(confidence: number, source: RubySource, evidence: string) {
   return [
@@ -141,20 +222,21 @@ function readMethodName(tokens: RubyToken[], index: number): { name?: string; cl
   return { name, classMethod: false, next: current + 1 };
 }
 
-function parseWithRipper(content: string): RubyParsed | undefined {
-  const result = spawnSync("ruby", ["-e", RIPPER_LEX_SCRIPT], {
-    input: content,
-    encoding: "utf8"
-  });
-  if (result.status !== 0 || !result.stdout) {
-    return undefined;
-  }
-
+async function parseWithRipper(content: string): Promise<{ parsed?: RubyParsed; telemetry: RubyParseTelemetry }> {
+  const worker = ripperWorkerForProcess();
+  const before = worker.getStats();
   let tokens: RubyToken[];
   try {
-    tokens = JSON.parse(result.stdout) as RubyToken[];
+    tokens = await worker.request({ content });
   } catch {
-    return undefined;
+    const after = worker.getStats();
+    return {
+      parsed: undefined,
+      telemetry: {
+        workerRestarts: after.restarts - before.restarts,
+        workerTimeouts: after.timeouts - before.timeouts
+      }
+    };
   }
 
   const symbols: RubySymbol[] = [];
@@ -241,14 +323,21 @@ function parseWithRipper(content: string): RubyParsed | undefined {
   }
 
   const declared = new Set(symbols.filter((symbol) => symbol.kind !== "method").map((symbol) => symbol.name));
+  const after = worker.getStats();
   return {
-    symbols,
-    mixins,
-    requires: parseRequires(content),
-    routes: parseRoutes(content),
-    constants: constants.filter((constant) => !declared.has(constant.name)),
-    activeRecordMacros: parseActiveRecordMacros(content),
-    source: "ast"
+    parsed: {
+      symbols,
+      mixins,
+      requires: parseRequires(content),
+      routes: parseRoutes(content),
+      constants: constants.filter((constant) => !declared.has(constant.name)),
+      activeRecordMacros: parseActiveRecordMacros(content),
+      source: "ast"
+    },
+    telemetry: {
+      workerRestarts: after.restarts - before.restarts,
+      workerTimeouts: after.timeouts - before.timeouts
+    }
   };
 }
 
@@ -593,7 +682,8 @@ export class RubyLanguageAdapter implements LanguageAdapter {
       return { entities, relations, unresolvedReferences };
     }
 
-    const parsed = parseWithRipper(content) ?? parseWithRegex(content);
+    const ripperAttempt = await parseWithRipper(content);
+    const parsed = ripperAttempt.parsed ?? parseWithRegex(content);
     currentSource = parsed.source;
     const confidence = parsed.source === "ast" ? 0.9 : 0.72;
 
@@ -796,11 +886,13 @@ export class RubyLanguageAdapter implements LanguageAdapter {
       });
     }
 
-    return {
+    const result: RubyParseResult = {
       entities,
       relations,
-      unresolvedReferences
+      unresolvedReferences,
+      telemetry: ripperAttempt.telemetry
     };
+    return result;
   }
 
   extractEntities(parseResult: ParseResult): Entity[] {

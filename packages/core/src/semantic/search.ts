@@ -1,4 +1,4 @@
-import type { DSPDatabase, RankedEmbedding } from "../storage/db.ts";
+import type { DSPDatabase, GraphReadCache, RankedEmbedding } from "../storage/db.ts";
 import type { EmbeddingProvider, SearchResult } from "../graph/types.ts";
 
 const HIGH_SIGNAL_RELATION_KINDS = new Set([
@@ -31,8 +31,11 @@ function providerCacheKey(provider: EmbeddingProvider): string {
   return provider.cacheKey?.() ?? provider.constructor.name;
 }
 
-function highSignalRelations(db: DSPDatabase, uid: string, direction: "from" | "to") {
-  const relations = direction === "from" ? db.getRelationsFrom(uid) : db.getRelationsTo(uid);
+function highSignalRelations(db: DSPDatabase, uid: string, direction: "from" | "to", cache: GraphReadCache) {
+  const relations =
+    direction === "from" ? db.getRelationsFromCached(uid, cache) : db.getRelationsToCached(uid, cache);
+  const endpointUids = relations.map((relation) => (direction === "from" ? relation.to : relation.from));
+  const entityByUid = new Map(db.getEntitiesByUidCached(endpointUids, cache).map((entity) => [entity.uid, entity]));
   return relations.filter((relation) => {
     if (!HIGH_SIGNAL_RELATION_KINDS.has(relation.kind)) {
       return false;
@@ -41,7 +44,7 @@ function highSignalRelations(db: DSPDatabase, uid: string, direction: "from" | "
       return false;
     }
     const otherUid = direction === "from" ? relation.to : relation.from;
-    const other = db.getEntity(otherUid);
+    const other = entityByUid.get(otherUid);
     return other?.kind !== "file" && other?.kind !== "directory";
   });
 }
@@ -61,6 +64,7 @@ export async function semanticSearch(
   const tokens = tokenize(query);
   const normalizedQuery = tokens.join(" ");
   const providerKey = options.provider ? providerCacheKey(options.provider) : undefined;
+  const cache = db.createGraphReadCache();
 
   let queryVector: number[] | undefined;
   if (options.embeddingsEnabled && options.provider) {
@@ -70,10 +74,10 @@ export async function semanticSearch(
   const lexicalCandidateUids = db.searchEntityUids(query, candidateLimit);
   const expandedCandidateUids = new Set(lexicalCandidateUids);
   for (const uid of lexicalCandidateUids) {
-    for (const relation of highSignalRelations(db, uid, "from").slice(0, 10)) {
+    for (const relation of highSignalRelations(db, uid, "from", cache).slice(0, 10)) {
       expandedCandidateUids.add(relation.to);
     }
-    for (const relation of highSignalRelations(db, uid, "to").slice(0, 10)) {
+    for (const relation of highSignalRelations(db, uid, "to", cache).slice(0, 10)) {
       expandedCandidateUids.add(relation.from);
     }
   }
@@ -95,7 +99,7 @@ export async function semanticSearch(
     }
   }
 
-  const entities = db.getEntitiesByUid([...expandedCandidateUids]);
+  const entities = db.getEntitiesByUidCached([...expandedCandidateUids], cache);
   const semanticScoresByUid = new Map(rankedEmbeddings.map((embedding) => [embedding.uid, embedding.score]));
 
   const scored: SearchResult[] = [];
@@ -126,14 +130,14 @@ export async function semanticSearch(
     lexicalScore = Math.min(1, lexicalScore);
 
     const neighborIds = [
-      ...highSignalRelations(db, entity.uid, "from").slice(0, 5).map((relation) => relation.to),
-      ...highSignalRelations(db, entity.uid, "to").slice(0, 5).map((relation) => relation.from)
+      ...highSignalRelations(db, entity.uid, "from", cache).slice(0, 5).map((relation) => relation.to),
+      ...highSignalRelations(db, entity.uid, "to", cache).slice(0, 5).map((relation) => relation.from)
     ];
     let neighborScore = 0;
     if (tokens.length > 0 && neighborIds.length > 0) {
       const neighborTokens = new Set(
         neighborIds.flatMap((uid) => {
-          const neighbor = db.getEntity(uid);
+          const neighbor = db.getEntityCached(uid, cache);
           if (!neighbor) {
             return [];
           }

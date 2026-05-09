@@ -1,7 +1,7 @@
-import { spawnSync } from "node:child_process";
 import path from "node:path";
 import type { Entity, LanguageAdapter, ParseResult, Relation, UnresolvedReference } from "@dsp/core";
 import { buildUid, stableNowIso } from "@dsp/core";
+import { PersistentJsonlWorker } from "./persistent-worker.ts";
 
 type PythonSymbol = {
   kind: "function" | "class" | "method";
@@ -17,74 +17,169 @@ type PythonAstResult = {
   symbols: PythonSymbol[];
 };
 
-const PYTHON_EXTRACT_SCRIPT = `
+type PythonParseTelemetry = {
+  workerRestarts?: number;
+  workerTimeouts?: number;
+};
+
+type PythonParseResult = ParseResult & {
+  telemetry?: PythonParseTelemetry;
+};
+
+const PYTHON_EXTRACT_SCRIPT = String.raw`
 import ast
 import json
 import sys
 
-source = sys.stdin.read()
-tree = ast.parse(source)
-imports = []
-symbols = []
+def parse_source(source):
+    tree = ast.parse(source)
+    imports = []
+    symbols = []
 
-class Visitor(ast.NodeVisitor):
-    def __init__(self):
-        self.class_stack = []
-    def visit_Import(self, node):
-        for alias in node.names:
-            imports.append(alias.name)
-        self.generic_visit(node)
-    def visit_ImportFrom(self, node):
-        mod = "." * node.level + (node.module or "")
-        imports.append(mod)
-        self.generic_visit(node)
-    def visit_FunctionDef(self, node):
-        if self.class_stack:
+    class Visitor(ast.NodeVisitor):
+        def __init__(self):
+            self.class_stack = []
+
+        def visit_Import(self, node):
+            for alias in node.names:
+                imports.append(alias.name)
+            self.generic_visit(node)
+
+        def visit_ImportFrom(self, node):
+            mod = "." * node.level + (node.module or "")
+            imports.append(mod)
+            self.generic_visit(node)
+
+        def visit_FunctionDef(self, node):
+            if self.class_stack:
+                symbols.append({
+                    "kind": "method",
+                    "name": node.name,
+                    "className": self.class_stack[-1],
+                    "startLine": node.lineno,
+                    "endLine": getattr(node, "end_lineno", node.lineno),
+                    "docstring": ast.get_docstring(node)
+                })
+            else:
+                symbols.append({
+                    "kind": "function",
+                    "name": node.name,
+                    "startLine": node.lineno,
+                    "endLine": getattr(node, "end_lineno", node.lineno),
+                    "docstring": ast.get_docstring(node)
+                })
+            self.generic_visit(node)
+
+        def visit_ClassDef(self, node):
             symbols.append({
-                "kind": "method",
+                "kind": "class",
                 "name": node.name,
-                "className": self.class_stack[-1],
                 "startLine": node.lineno,
                 "endLine": getattr(node, "end_lineno", node.lineno),
                 "docstring": ast.get_docstring(node)
             })
-        else:
-            symbols.append({
-                "kind": "function",
-                "name": node.name,
-                "startLine": node.lineno,
-                "endLine": getattr(node, "end_lineno", node.lineno),
-                "docstring": ast.get_docstring(node)
-            })
-        self.generic_visit(node)
-    def visit_ClassDef(self, node):
-        symbols.append({
-            "kind": "class",
-            "name": node.name,
-            "startLine": node.lineno,
-            "endLine": getattr(node, "end_lineno", node.lineno),
-            "docstring": ast.get_docstring(node)
-        })
-        self.class_stack.append(node.name)
-        self.generic_visit(node)
-        self.class_stack.pop()
+            self.class_stack.append(node.name)
+            self.generic_visit(node)
+            self.class_stack.pop()
 
-Visitor().visit(tree)
-print(json.dumps({"imports": imports, "symbols": symbols}))
+    Visitor().visit(tree)
+    return {"imports": imports, "symbols": symbols}
+
+for raw_line in sys.stdin:
+    line = raw_line.strip()
+    if not line:
+        continue
+    request = json.loads(line)
+    try:
+        result = parse_source(request.get("content", ""))
+        reply = {"id": request["id"], "ok": True, "result": result}
+    except SyntaxError as exc:
+        reply = {
+            "id": request["id"],
+            "ok": False,
+            "error": {
+                "code": "syntax_error",
+                "message": str(exc),
+                "syntaxError": True
+            }
+        }
+    except Exception as exc:
+        reply = {
+            "id": request["id"],
+            "ok": False,
+            "error": {
+                "code": "parse_error",
+                "message": str(exc)
+            }
+        }
+    sys.stdout.write(json.dumps(reply) + "\n")
+    sys.stdout.flush()
 `;
 
-function parseWithPythonAst(content: string): PythonAstResult | undefined {
-  const result = spawnSync("python3", ["-c", PYTHON_EXTRACT_SCRIPT], {
-    input: content,
-    encoding: "utf8"
-  });
-  if (result.status !== 0 || !result.stdout) {
-    return undefined;
+let pythonAstWorker: PersistentJsonlWorker<PythonAstResult> | undefined;
+
+function workerCommandFromEnv(envName: string, fallbackCommand: string, fallbackArgs: string[]): { command: string; args: string[] } {
+  const override = process.env[envName];
+  if (!override) {
+    return { command: fallbackCommand, args: fallbackArgs };
   }
+  const parsed = JSON.parse(override) as unknown;
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    throw new Error(`Expected ${envName} to be a JSON array command override`);
+  }
+  return {
+    command: String(parsed[0]),
+    args: parsed.slice(1).map((value) => String(value))
+  };
+}
+
+function integerEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) {
+    return fallback;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function pythonAstWorkerForProcess(): PersistentJsonlWorker<PythonAstResult> {
+  pythonAstWorker ??= new PersistentJsonlWorker<PythonAstResult>(
+    () => workerCommandFromEnv("DSP_PYTHON_PARSER_COMMAND", "python3", ["-u", "-c", PYTHON_EXTRACT_SCRIPT]),
+    {
+      timeoutMs: integerEnv("DSP_PYTHON_PARSER_TIMEOUT_MS", 5000),
+      maxJobsPerWorker: integerEnv("DSP_PYTHON_PARSER_MAX_JOBS", 200)
+    }
+  );
+  return pythonAstWorker;
+}
+
+export async function resetPythonAstWorker(): Promise<void> {
+  await pythonAstWorker?.close();
+  pythonAstWorker = undefined;
+}
+
+async function parseWithPythonAst(content: string): Promise<{ parsed?: PythonAstResult; telemetry: PythonParseTelemetry }> {
+  const worker = pythonAstWorkerForProcess();
+  const before = worker.getStats();
   try {
-    return JSON.parse(result.stdout) as PythonAstResult;
+    const parsed = await worker.request({ content });
+    const after = worker.getStats();
+    return {
+      parsed,
+      telemetry: {
+        workerRestarts: after.restarts - before.restarts,
+        workerTimeouts: after.timeouts - before.timeouts
+      }
+    };
   } catch {
-    return undefined;
+    const after = worker.getStats();
+    return {
+      parsed: undefined,
+      telemetry: {
+        workerRestarts: after.restarts - before.restarts,
+        workerTimeouts: after.timeouts - before.timeouts
+      }
+    };
   }
 }
 
@@ -129,11 +224,11 @@ function fallbackParse(content: string): PythonAstResult {
   return { imports, symbols };
 }
 
-function prov(confidence: number, evidence: string) {
+function prov(confidence: number, source: "ast" | "regex", evidence: string) {
   return [
     {
-      source: "ast" as const,
-      tool: "python-ast",
+      source,
+      tool: source === "ast" ? "python-ast-worker" : "python-regex-fallback",
       timestamp: stableNowIso(),
       confidence,
       evidence
@@ -154,9 +249,11 @@ function resolveRelativeModule(filePath: string, moduleName: string): string {
 }
 
 export async function parsePythonFile(filePath: string, content: string): Promise<ParseResult> {
-  const parsedFromAst = parseWithPythonAst(content);
+  const astAttempt = await parseWithPythonAst(content);
+  const parsedFromAst = astAttempt.parsed;
   const parsed = parsedFromAst ?? fallbackParse(content);
   const usedFallback = !parsedFromAst;
+  const provenanceSource = usedFallback ? "regex" : "ast";
   const now = stableNowIso();
   const fileUid = buildUid("file", filePath);
   const entities: Entity[] = [];
@@ -178,7 +275,7 @@ export async function parsePythonFile(filePath: string, content: string): Promis
       endLine: symbol.endLine,
       docstring: symbol.docstring,
       confidence: usedFallback ? 0.72 : 0.95,
-      provenance: prov(usedFallback ? 0.72 : 0.95, symbol.kind),
+      provenance: prov(usedFallback ? 0.72 : 0.95, provenanceSource, symbol.kind),
       metadata: {
         public: !symbol.name.startsWith("_"),
         className: symbol.className
@@ -191,7 +288,7 @@ export async function parsePythonFile(filePath: string, content: string): Promis
       to: uid,
       kind: "contains",
       confidence: 1,
-      provenance: prov(1, "file contains symbol")
+      provenance: prov(1, provenanceSource, "file contains symbol")
     });
   }
 
@@ -204,7 +301,7 @@ export async function parsePythonFile(filePath: string, content: string): Promis
       kind: "imports",
       reason: imp,
       confidence,
-      provenance: prov(confidence, `import ${imp}`)
+      provenance: prov(confidence, provenanceSource, `import ${imp}`)
     });
     if (!imp.startsWith(".")) {
       unresolvedReferences.push({
@@ -218,11 +315,13 @@ export async function parsePythonFile(filePath: string, content: string): Promis
     }
   }
 
-  return {
+  const result: PythonParseResult = {
     entities,
     relations,
-    unresolvedReferences
+    unresolvedReferences,
+    telemetry: astAttempt.telemetry
   };
+  return result;
 }
 
 export class PythonLanguageAdapter implements LanguageAdapter {

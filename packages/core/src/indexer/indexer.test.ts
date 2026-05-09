@@ -46,18 +46,121 @@ class MockAdapter implements LanguageAdapter {
   }
 }
 
+class PublicApiAwareAdapter implements LanguageAdapter {
+  language = "typescript";
+
+  canHandle(filePath: string): boolean {
+    return filePath.endsWith(".ts");
+  }
+
+  async parseFile(filePath: string): Promise<ParseResult> {
+    const now = stableNowIso();
+    const absolutePath = path.join(tempDirForPublicApiAdapter!, filePath);
+    const content = fs.readFileSync(absolutePath, "utf8");
+    const entities: ParseResult["entities"] = [];
+    const relations: ParseResult["relations"] = [];
+
+    if (filePath === "src/a.ts") {
+      const exported = content.match(/export function (\w+)\(([^)]*)\)/);
+      if (exported) {
+        entities.push({
+          uid: buildUid("function", filePath, exported[1]!),
+          kind: "function",
+          name: exported[1]!,
+          path: filePath,
+          language: "typescript",
+          signature: `export function ${exported[1]}(${exported[2]})`,
+          confidence: 1,
+          provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+          metadata: { public: true },
+          createdAt: now,
+          updatedAt: now
+        });
+      }
+      const helper = content.match(/(?:^|\n)function (\w+)\(/);
+      if (helper) {
+        entities.push({
+          uid: buildUid("function", filePath, helper[1]!),
+          kind: "function",
+          name: helper[1]!,
+          path: filePath,
+          language: "typescript",
+          signature: `function ${helper[1]}()`,
+          confidence: 1,
+          provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+          metadata: { public: false },
+          createdAt: now,
+          updatedAt: now
+        });
+      }
+    }
+
+    if (filePath === "src/b.ts") {
+      entities.push({
+        uid: buildUid("function", filePath, "consumer"),
+        kind: "function",
+        name: "consumer",
+        path: filePath,
+        language: "typescript",
+        signature: "function consumer()",
+        confidence: 1,
+        provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+        metadata: { public: false },
+        createdAt: now,
+        updatedAt: now
+      });
+      relations.push({
+        from: buildUid("file", "src/b.ts"),
+        to: buildUid("file", "src/a.ts"),
+        kind: "imports",
+        confidence: 0.9,
+        provenance: [{ source: "ast", timestamp: now, confidence: 0.9 }]
+      });
+      relations.push({
+        from: buildUid("function", "src/b.ts", "consumer"),
+        to: buildUid("function", "src/a.ts", "api"),
+        kind: "calls",
+        confidence: 0.8,
+        provenance: [{ source: "ast", timestamp: now, confidence: 0.8 }]
+      });
+    }
+
+    return {
+      entities,
+      relations,
+      unresolvedReferences: []
+    };
+  }
+
+  extractEntities(parseResult: ParseResult) {
+    return parseResult.entities;
+  }
+
+  extractRelations(parseResult: ParseResult) {
+    return parseResult.relations;
+  }
+
+  extractPublicAPI(entities: ParseResult["entities"]) {
+    return entities.filter((entity) => Boolean(entity.metadata?.public));
+  }
+}
+
+let tempDirForPublicApiAdapter: string | undefined;
+
 describe("indexer", () => {
   let tempDir: string;
   let db: DSPDatabase;
 
   beforeEach(() => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "dsp-indexer-test-"));
+    tempDirForPublicApiAdapter = tempDir;
     fs.mkdirSync(path.join(tempDir, "src"), { recursive: true });
     fs.writeFileSync(path.join(tempDir, "src", "a.ts"), "export const a = 1;\n", "utf8");
     db = new DSPDatabase(tempDir);
   });
 
   afterEach(() => {
+    tempDirForPublicApiAdapter = undefined;
     db.close();
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
@@ -185,6 +288,7 @@ describe("indexer", () => {
     expect(first.filesIndexed).toBeGreaterThan(0);
     expect(second.filesIndexed).toBe(0);
     expect(second.filesSkipped).toBeGreaterThan(0);
+    expect(second.telemetry?.cacheHitFiles).toBeGreaterThan(0);
   });
 
   it("produces the same graph snapshot with serial and parallel parsing", async () => {
@@ -402,6 +506,82 @@ describe("indexer", () => {
     expect(db.getEntity(buildUid("function", "src/renamed.ts", "demo"))).toBeDefined();
   });
 
+  it("does not reindex reverse dependents when a file's public API is unchanged", async () => {
+    execSync("git init", { cwd: tempDir, stdio: "ignore" });
+    execSync("git config user.email test@example.com", { cwd: tempDir, stdio: "ignore" });
+    execSync("git config user.name Test", { cwd: tempDir, stdio: "ignore" });
+    fs.writeFileSync(
+      path.join(tempDir, "src", "a.ts"),
+      "export function api(): number { return helper(); }\nfunction helper() { return 1; }\n",
+      "utf8"
+    );
+    fs.writeFileSync(
+      path.join(tempDir, "src", "b.ts"),
+      'import { api } from "./a";\nexport function consumer() { return api(); }\n',
+      "utf8"
+    );
+    execSync("git add src/a.ts src/b.ts", { cwd: tempDir, stdio: "ignore" });
+    execSync("git commit -m initial", { cwd: tempDir, stdio: "ignore" });
+
+    const adapter = new PublicApiAwareAdapter();
+    await indexRepository(db, [adapter], { rootDir: tempDir, full: true }, DEFAULT_CONFIG);
+
+    fs.writeFileSync(
+      path.join(tempDir, "src", "a.ts"),
+      "export function api(): number { return helper(); }\nfunction helper() { return 2; }\n",
+      "utf8"
+    );
+
+    const summary = await indexRepository(
+      db,
+      [adapter],
+      { rootDir: tempDir, changedOnly: true },
+      DEFAULT_CONFIG
+    );
+
+    expect(summary.filesIndexed).toBe(1);
+    expect(summary.telemetry?.incrementalDependentFiles).toBe(0);
+    expect(summary.telemetry?.incrementalExpansionTruncated).toBe(false);
+  });
+
+  it("reindexes reverse dependents when a file's public API changes", async () => {
+    execSync("git init", { cwd: tempDir, stdio: "ignore" });
+    execSync("git config user.email test@example.com", { cwd: tempDir, stdio: "ignore" });
+    execSync("git config user.name Test", { cwd: tempDir, stdio: "ignore" });
+    fs.writeFileSync(
+      path.join(tempDir, "src", "a.ts"),
+      "export function api(): number { return helper(); }\nfunction helper() { return 1; }\n",
+      "utf8"
+    );
+    fs.writeFileSync(
+      path.join(tempDir, "src", "b.ts"),
+      'import { api } from "./a";\nexport function consumer() { return api(); }\n',
+      "utf8"
+    );
+    execSync("git add src/a.ts src/b.ts", { cwd: tempDir, stdio: "ignore" });
+    execSync("git commit -m initial", { cwd: tempDir, stdio: "ignore" });
+
+    const adapter = new PublicApiAwareAdapter();
+    await indexRepository(db, [adapter], { rootDir: tempDir, full: true }, DEFAULT_CONFIG);
+
+    fs.writeFileSync(
+      path.join(tempDir, "src", "a.ts"),
+      "export function api(flag: boolean): number { return helper(); }\nfunction helper() { return 1; }\n",
+      "utf8"
+    );
+
+    const summary = await indexRepository(
+      db,
+      [adapter],
+      { rootDir: tempDir, changedOnly: true },
+      DEFAULT_CONFIG
+    );
+
+    expect(summary.filesIndexed).toBe(2);
+    expect(summary.telemetry?.incrementalDependentFiles).toBe(1);
+    expect(summary.telemetry?.incrementalExpansionTruncated).toBe(false);
+  });
+
   it("canonicalizes extensionless file import relations to discovered files", async () => {
     fs.writeFileSync(path.join(tempDir, "src", "b.ts"), "export const b = 1;\n", "utf8");
     class ImportAdapter extends MockAdapter {
@@ -484,9 +664,18 @@ describe("indexer", () => {
 
     const summary = await indexRepository(db, [new RegexAdapter()], { rootDir: tempDir, full: true }, DEFAULT_CONFIG);
 
+    expect(summary.telemetry?.discoveryMs).toBeGreaterThanOrEqual(0);
+    expect(summary.telemetry?.readMs).toBeGreaterThanOrEqual(0);
+    expect(summary.telemetry?.hashMs).toBeGreaterThanOrEqual(0);
+    expect(summary.telemetry?.parseMs).toBeGreaterThanOrEqual(0);
+    expect(summary.telemetry?.dbWriteMs).toBeGreaterThanOrEqual(0);
     expect(summary.telemetry?.parserFallbackFiles).toBe(1);
     expect(summary.telemetry?.fallbackByLanguage.typescript).toBe(1);
     expect(summary.telemetry?.parserSourceCounts.regex).toBe(1);
+    expect(summary.telemetry?.slowestFiles[0]).toMatchObject({
+      path: "src/a.ts",
+      language: "typescript"
+    });
   });
 
   it("reuses cached parse payloads after AST data is cleared", async () => {
@@ -506,8 +695,9 @@ describe("indexer", () => {
     db.clearAstDataForPath("src/a.ts");
     db.removeFileHash("src/a.ts");
 
-    await indexRepository(db, [adapter], { rootDir: tempDir, full: true }, DEFAULT_CONFIG);
+    const summary = await indexRepository(db, [adapter], { rootDir: tempDir, full: true }, DEFAULT_CONFIG);
     expect(adapter.calls).toBe(1);
+    expect(summary.telemetry?.cacheHitParses).toBe(1);
     expect(db.getEntity(buildUid("function", "src/a.ts", "demo"))).toBeDefined();
   });
 

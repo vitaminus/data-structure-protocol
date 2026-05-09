@@ -155,17 +155,46 @@ export async function dispatchToolCall(
     case "dsp.get_neighbors": {
       const uid = String(args.uid ?? "");
       const depth = typeof args.depth === "number" ? args.depth : 1;
+      const maxDepth = typeof args.maxDepth === "number" ? args.maxDepth : undefined;
+      const maxNodes = typeof args.maxNodes === "number" ? args.maxNodes : undefined;
       const maxEntities = typeof args.maxEntities === "number" ? args.maxEntities : undefined;
       const maxRelations = typeof args.maxRelations === "number" ? args.maxRelations : undefined;
       const maxFiles = typeof args.maxFiles === "number" ? args.maxFiles : undefined;
       const maxEstimatedTokens = typeof args.maxEstimatedTokens === "number" ? args.maxEstimatedTokens : undefined;
+      const timeoutMs = typeof args.timeoutMs === "number" ? args.timeoutMs : undefined;
       return {
-        content: [jsonText(getNeighbors(services.db, uid, depth, { maxEntities, maxRelations, maxFiles, maxEstimatedTokens }))]
+        content: [
+          jsonText(
+            getNeighbors(services.db, uid, depth, {
+              maxDepth,
+              maxNodes,
+              maxEntities,
+              maxRelations,
+              maxFiles,
+              maxEstimatedTokens,
+              timeoutMs
+            } as any)
+          )
+        ]
       };
     }
     case "dsp.impact": {
       const target = String(args.target ?? "");
-      return { content: [jsonText(runImpact(services, target))] };
+      const maxDepth = typeof args.maxDepth === "number" ? args.maxDepth : undefined;
+      const maxNodes = typeof args.maxNodes === "number" ? args.maxNodes : undefined;
+      const maxRelations = typeof args.maxRelations === "number" ? args.maxRelations : undefined;
+      const timeoutMs = typeof args.timeoutMs === "number" ? args.timeoutMs : undefined;
+      return {
+        content: [
+          jsonText(
+            (runImpact as (
+              services: DSPServices,
+              target: string,
+              options: Record<string, number | undefined>
+            ) => unknown)(services, target, { maxDepth, maxNodes, maxRelations, timeoutMs })
+          )
+        ]
+      };
     }
     case "dsp.validate": {
       return { content: [jsonText(runValidate(services))] };
@@ -185,10 +214,13 @@ export async function dispatchToolCall(
         maxTokens: typeof args.maxTokens === "number" ? args.maxTokens : undefined,
         maxFiles: typeof args.maxFiles === "number" ? args.maxFiles : undefined,
         maxDepth: typeof args.maxDepth === "number" ? args.maxDepth : undefined,
+        maxNodes: typeof args.maxNodes === "number" ? args.maxNodes : undefined,
+        maxRelations: typeof args.maxRelations === "number" ? args.maxRelations : undefined,
+        timeoutMs: typeof args.timeoutMs === "number" ? args.timeoutMs : undefined,
         includeCode: (args.includeCode as "none" | "snippets-only" | "full-files") ?? "snippets-only",
         includeTests: typeof args.includeTests === "boolean" ? args.includeTests : true,
         strategy: (args.strategy as "minimal" | "balanced" | "deep" | "debug") ?? "minimal"
-      });
+      } as any);
       return { content: [jsonText(pack)] };
     }
     default:

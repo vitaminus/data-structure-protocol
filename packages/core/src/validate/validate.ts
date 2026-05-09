@@ -1,8 +1,9 @@
 import path from "node:path";
-import { readFileSync, statSync } from "node:fs";
+import { statSync } from "node:fs";
 import type { DSPDatabase } from "../storage/db.ts";
 import type { ValidationIssue, ValidationOptions, ValidationResult, ValidationSeverity } from "../graph/types.ts";
 import { contentHash } from "../graph/uid.ts";
+import { readUtf8FileSafe } from "../util/text.ts";
 
 function severityForIssue(kind: ValidationIssue["kind"]): ValidationSeverity {
   switch (kind) {
@@ -10,6 +11,8 @@ function severityForIssue(kind: ValidationIssue["kind"]): ValidationSeverity {
     case "dangling_relation":
       return "error";
     case "stale_hash":
+    case "binary_file":
+    case "invalid_utf8":
     case "unresolved_reference":
     case "low_confidence_critical":
     case "annotation_conflict":
@@ -60,8 +63,30 @@ export function validateGraph(
       for (const nested of db.findEntitiesByPath(entity.path)) {
         affectedUids.add(nested.uid);
       }
-      const content = readFileSync(absPath, "utf8");
-      const currentHash = contentHash(content);
+      const fileContent = readUtf8FileSafe(absPath);
+      if (fileContent.kind === "binary") {
+        issues.push(
+          withSeverity({
+            kind: "binary_file",
+            uid: entity.uid,
+            path: entity.path,
+            message: `Indexed file is binary and cannot be validated as UTF-8 text: ${entity.path}`
+          })
+        );
+        continue;
+      }
+      if (fileContent.kind === "invalidUtf8") {
+        issues.push(
+          withSeverity({
+            kind: "invalid_utf8",
+            uid: entity.uid,
+            path: entity.path,
+            message: `Indexed file is not valid UTF-8 text: ${entity.path}`
+          })
+        );
+        continue;
+      }
+      const currentHash = contentHash(fileContent.kind === "text" ? fileContent.content : "");
       if (indexedHash?.hash && indexedHash.hash !== currentHash) {
         issues.push(
           withSeverity({

@@ -1,8 +1,41 @@
 import fs from "node:fs";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import ts from "typescript";
 import type { Entity, LanguageAdapter, ParseResult, Relation, UnresolvedReference } from "@dsp/core";
 import { buildUid, normalizePath, stableNowIso } from "@dsp/core";
+
+const DEFAULT_COMPILER_OPTIONS: ts.CompilerOptions = {
+  allowJs: true,
+  module: ts.ModuleKind.NodeNext,
+  moduleResolution: ts.ModuleResolutionKind.NodeNext,
+  target: ts.ScriptTarget.Latest,
+  jsx: ts.JsxEmit.ReactJSX
+};
+
+type TypeScriptResolutionTelemetry = {
+  moduleResolutionMs?: number;
+  moduleResolutionCacheHits?: number;
+  moduleResolutionCacheMisses?: number;
+};
+
+type TypeScriptParseResult = ParseResult & {
+  telemetry?: TypeScriptResolutionTelemetry;
+};
+
+type ProjectResolutionState = {
+  configPath: string;
+  configSignature: string;
+  compilerOptions: ts.CompilerOptions;
+  moduleResolutionCache: ts.ModuleResolutionCache;
+  resolvedImports: Map<string, string | undefined>;
+};
+
+const canonicalFileName = ts.sys.useCaseSensitiveFileNames ? (fileName: string) => fileName : (fileName: string) => fileName.toLowerCase();
+const directoryConfigCache = new Map<string, string | null>();
+const projectResolutionCache = new Map<string, ProjectResolutionState>();
+const defaultResolutionCaches = new Map<string, ts.ModuleResolutionCache>();
+const defaultResolvedImports = new Map<string, string | undefined>();
 
 function inferKindFromFile(filePath: string): "typescript" | "javascript" {
   const ext = path.extname(filePath).toLowerCase();
@@ -33,22 +66,73 @@ function pathForUid(resolvedFileName: string, fromPath: string): string {
   return relativeToCwd.startsWith("..") ? normalizedResolved : relativeToCwd;
 }
 
-function compilerOptionsFor(containingFile: string): ts.CompilerOptions {
-  const configPath = ts.findConfigFile(path.dirname(containingFile), ts.sys.fileExists);
+function configSignatureFor(configPath: string): string {
+  try {
+    const stat = fs.statSync(configPath);
+    return `${Math.trunc(stat.mtimeMs)}:${stat.size}`;
+  } catch {
+    return "missing";
+  }
+}
+
+function findConfigPathCached(containingFile: string): string | undefined {
+  const containingDir = path.dirname(containingFile);
+  const normalizedDir = normalizePath(containingDir);
+  const cached = directoryConfigCache.get(normalizedDir);
+  if (cached !== undefined) {
+    return cached ?? undefined;
+  }
+  const configPath = ts.findConfigFile(containingDir, ts.sys.fileExists) ?? null;
+  directoryConfigCache.set(normalizedDir, configPath);
+  return configPath ?? undefined;
+}
+
+function createProjectResolutionState(configPath: string): ProjectResolutionState {
+  const config = ts.readConfigFile(configPath, ts.sys.readFile);
+  const compilerOptions = config.error
+    ? {}
+    : ts.parseJsonConfigFileContent(config.config, ts.sys, path.dirname(configPath)).options;
+  return {
+    configPath,
+    configSignature: configSignatureFor(configPath),
+    compilerOptions,
+    moduleResolutionCache: ts.createModuleResolutionCache(path.dirname(configPath), canonicalFileName, compilerOptions),
+    resolvedImports: new Map<string, string | undefined>()
+  };
+}
+
+function defaultModuleResolutionCacheForCurrentDirectory(): ts.ModuleResolutionCache {
+  const cwd = process.cwd();
+  const cached = defaultResolutionCaches.get(cwd);
+  if (cached) {
+    return cached;
+  }
+  const cache = ts.createModuleResolutionCache(cwd, canonicalFileName, DEFAULT_COMPILER_OPTIONS);
+  defaultResolutionCaches.set(cwd, cache);
+  return cache;
+}
+
+function projectResolutionStateFor(containingFile: string): {
+  compilerOptions: ts.CompilerOptions;
+  moduleResolutionCache: ts.ModuleResolutionCache;
+  resolvedImports: Map<string, string | undefined>;
+} {
+  const configPath = findConfigPathCached(containingFile);
   if (!configPath) {
     return {
-      allowJs: true,
-      module: ts.ModuleKind.NodeNext,
-      moduleResolution: ts.ModuleResolutionKind.NodeNext,
-      target: ts.ScriptTarget.Latest,
-      jsx: ts.JsxEmit.ReactJSX
+      compilerOptions: DEFAULT_COMPILER_OPTIONS,
+      moduleResolutionCache: defaultModuleResolutionCacheForCurrentDirectory(),
+      resolvedImports: defaultResolvedImports
     };
   }
-  const config = ts.readConfigFile(configPath, ts.sys.readFile);
-  if (config.error) {
-    return {};
+  const signature = configSignatureFor(configPath);
+  const cached = projectResolutionCache.get(configPath);
+  if (cached && cached.configSignature === signature) {
+    return cached;
   }
-  return ts.parseJsonConfigFileContent(config.config, ts.sys, path.dirname(configPath)).options;
+  const state = createProjectResolutionState(configPath);
+  projectResolutionCache.set(configPath, state);
+  return state;
 }
 
 function implementationPathForTsTest(filePath: string): string | undefined {
@@ -61,20 +145,44 @@ function implementationPathForTsTest(filePath: string): string | undefined {
   return `${base}${match[2]}`;
 }
 
-function resolveImport(fromPath: string, specifier: string): string | undefined {
-  if (!specifier.startsWith(".")) {
-    return undefined;
-  }
-
+function resolveImport(
+  fromPath: string,
+  specifier: string,
+  telemetry?: TypeScriptResolutionTelemetry
+): string | undefined {
   const containingFile = path.isAbsolute(fromPath) ? fromPath : path.resolve(fromPath);
+  const projectState = projectResolutionStateFor(containingFile);
+  const cacheKey = `${normalizePath(containingFile)}\0${specifier}`;
+  if (projectState.resolvedImports.has(cacheKey)) {
+    if (telemetry) {
+      telemetry.moduleResolutionCacheHits = (telemetry.moduleResolutionCacheHits ?? 0) + 1;
+    }
+    return projectState.resolvedImports.get(cacheKey);
+  }
+  if (telemetry) {
+    telemetry.moduleResolutionCacheMisses = (telemetry.moduleResolutionCacheMisses ?? 0) + 1;
+  }
+  const resolutionStartedAt = performance.now();
   const resolved = ts.resolveModuleName(
     specifier,
     containingFile,
-    compilerOptionsFor(containingFile),
-    ts.sys
+    projectState.compilerOptions,
+    ts.sys,
+    projectState.moduleResolutionCache
   ).resolvedModule;
+  if (telemetry) {
+    telemetry.moduleResolutionMs = (telemetry.moduleResolutionMs ?? 0) + (performance.now() - resolutionStartedAt);
+  }
+  let resolvedPath: string | undefined;
   if (resolved && !resolved.isExternalLibraryImport) {
-    return pathForUid(resolved.resolvedFileName, fromPath);
+    resolvedPath = pathForUid(resolved.resolvedFileName, fromPath);
+    projectState.resolvedImports.set(cacheKey, resolvedPath);
+    return resolvedPath;
+  }
+
+  if (!specifier.startsWith(".")) {
+    projectState.resolvedImports.set(cacheKey, undefined);
+    return undefined;
   }
 
   const base = path.dirname(fromPath);
@@ -83,16 +191,29 @@ function resolveImport(fromPath: string, specifier: string): string | undefined 
   for (const ext of extensions) {
     const withExtension = `${candidate}${ext}`;
     if (fs.existsSync(withExtension)) {
-      return normalizePath(withExtension);
+      resolvedPath = normalizePath(withExtension);
+      projectState.resolvedImports.set(cacheKey, resolvedPath);
+      return resolvedPath;
     }
   }
   for (const ext of extensions) {
     const indexFile = normalizePath(path.join(candidate, `index${ext}`));
     if (fs.existsSync(indexFile)) {
-      return indexFile;
+      resolvedPath = indexFile;
+      projectState.resolvedImports.set(cacheKey, resolvedPath);
+      return resolvedPath;
     }
   }
-  return candidate;
+  resolvedPath = candidate;
+  projectState.resolvedImports.set(cacheKey, resolvedPath);
+  return resolvedPath;
+}
+
+export function resetTypeScriptProjectResolutionCache(): void {
+  directoryConfigCache.clear();
+  projectResolutionCache.clear();
+  defaultResolutionCaches.clear();
+  defaultResolvedImports.clear();
 }
 
 export async function parseTypeScriptFile(filePath: string, content: string): Promise<ParseResult> {
@@ -102,6 +223,11 @@ export async function parseTypeScriptFile(filePath: string, content: string): Pr
   const relations: Relation[] = [];
   const unresolvedReferences: UnresolvedReference[] = [];
   const callEdges: { from: string; name: string; line: number }[] = [];
+  const telemetry: TypeScriptResolutionTelemetry = {
+    moduleResolutionMs: 0,
+    moduleResolutionCacheHits: 0,
+    moduleResolutionCacheMisses: 0
+  };
   const fileUid = buildUid("file", filePath);
   const lang = inferKindFromFile(filePath);
 
@@ -144,7 +270,7 @@ export async function parseTypeScriptFile(filePath: string, content: string): Pr
     const visit = (node: ts.Node): void => {
       if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
         const specifier = node.moduleSpecifier.text;
-        const targetPath = resolveImport(filePath, specifier);
+        const targetPath = resolveImport(filePath, specifier, telemetry);
         if (targetPath) {
           relations.push({
             from: fileUid,
@@ -449,11 +575,13 @@ export async function parseTypeScriptFile(filePath: string, content: string): Pr
       });
     }
 
-  return {
+  const result: TypeScriptParseResult = {
     entities,
     relations,
-    unresolvedReferences
+    unresolvedReferences,
+    telemetry
   };
+  return result;
 }
 
 export class TypeScriptLanguageAdapter implements LanguageAdapter {

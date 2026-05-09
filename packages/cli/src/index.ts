@@ -25,6 +25,7 @@ import {
   type DSPServices,
   type Entity,
   type EntityKind,
+  type IndexSummary,
   type LanguageAdapter,
   type RelationKind,
   type WatchSummary
@@ -49,11 +50,108 @@ function printOutput(output: unknown, asJson: boolean): void {
     process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
     return;
   }
+  if (isIndexSummary(output)) {
+    process.stdout.write(`${formatIndexSummary(output)}\n`);
+    return;
+  }
   if (typeof output === "string") {
     process.stdout.write(`${output}\n`);
     return;
   }
   process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
+}
+
+function isIndexSummary(value: unknown): value is IndexSummary {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const candidate = value as Partial<IndexSummary>;
+  return (
+    typeof candidate.mode === "string" &&
+    typeof candidate.filesScanned === "number" &&
+    typeof candidate.filesIndexed === "number" &&
+    typeof candidate.filesSkipped === "number"
+  );
+}
+
+function formatNumber(value: number | undefined, digits = 1): string {
+  return Number.isFinite(value) ? Number(value).toFixed(digits) : "0.0";
+}
+
+type CliIndexTelemetry = {
+  discoveryMs?: number;
+  readMs?: number;
+  hashMs?: number;
+  parseMs?: number;
+  dbWriteMs?: number;
+  tsResolutionMs?: number;
+  tsResolutionCacheHits?: number;
+  tsResolutionCacheMisses?: number;
+  incrementalDependentFiles?: number;
+  incrementalExpansionTruncated?: boolean;
+  incrementalExpansionReason?: "maxDepth" | "maxFiles";
+  cacheHitFiles?: number;
+  cacheHitParses?: number;
+  workerRestarts?: number;
+  workerTimeouts?: number;
+  parserFallbackFiles: number;
+  skippedByReason?: Partial<Record<"unsupported" | "unchanged" | "tooLarge" | "binary" | "invalidUtf8", number>>;
+  skippedFiles?: Array<{
+    path: string;
+    reason: "unsupported" | "unchanged" | "tooLarge" | "binary" | "invalidUtf8";
+    sizeBytes: number;
+    language?: string;
+  }>;
+  slowestFiles?: Array<{
+    path: string;
+    ms: number;
+    sizeBytes: number;
+    language: string;
+  }>;
+};
+
+function formatIndexSummary(summary: IndexSummary): string {
+  const lines = [
+    `Index ${summary.mode} complete`,
+    `Files: scanned ${summary.filesScanned}, indexed ${summary.filesIndexed}, skipped ${summary.filesSkipped}`,
+    `Graph: entities ${summary.entities}, relations ${summary.relations}, unresolved ${summary.unresolvedReferences}, low-confidence ${summary.lowConfidenceRelations}`,
+    `Coverage: ${formatNumber(summary.estimatedCoverage * 100)}%`
+  ];
+  const telemetry = summary.telemetry as CliIndexTelemetry | undefined;
+  if (!telemetry) {
+    return lines.join("\n");
+  }
+  lines.push(
+    `Telemetry: discovery ${formatNumber(telemetry.discoveryMs)}ms, read ${formatNumber(telemetry.readMs)}ms, hash ${formatNumber(telemetry.hashMs)}ms, parse ${formatNumber(telemetry.parseMs)}ms, db-write ${formatNumber(telemetry.dbWriteMs)}ms`,
+    `TS resolution: ${formatNumber(telemetry.tsResolutionMs)}ms, cache hits ${telemetry.tsResolutionCacheHits ?? 0}, misses ${telemetry.tsResolutionCacheMisses ?? 0}`,
+    `Incremental dependents: ${telemetry.incrementalDependentFiles ?? 0}${telemetry.incrementalExpansionTruncated ? ` (truncated: ${telemetry.incrementalExpansionReason ?? "unknown"})` : ""}`,
+    `Cache hits: files ${telemetry.cacheHitFiles ?? 0}, parses ${telemetry.cacheHitParses ?? 0}`,
+    `Workers: restarts ${telemetry.workerRestarts ?? 0}, timeouts ${telemetry.workerTimeouts ?? 0}`,
+    `Fallbacks: files ${telemetry.parserFallbackFiles}`
+  );
+  if (telemetry.skippedByReason && Object.keys(telemetry.skippedByReason).length > 0) {
+    lines.push(
+      `Skipped reasons: ${Object.entries(telemetry.skippedByReason)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([reason, count]) => `${reason} ${count}`)
+        .join(", ")}`
+    );
+  }
+  const noteworthySkipped = (telemetry.skippedFiles ?? []).filter((file) => file.reason !== "unchanged");
+  if (noteworthySkipped.length > 0) {
+    lines.push("Skipped files:");
+    for (const file of noteworthySkipped.slice(0, 5)) {
+      lines.push(`- ${file.path} ${file.reason} ${file.sizeBytes}B${file.language ? ` ${file.language}` : ""}`);
+    }
+  }
+  const slowestFiles = telemetry.slowestFiles ?? [];
+  if (slowestFiles.length > 0) {
+    lines.push("Slowest files:");
+    for (const file of slowestFiles.slice(0, 5)) {
+      lines.push(`- ${file.path} ${formatNumber(file.ms)}ms ${file.sizeBytes}B ${file.language}`);
+    }
+  }
+  return lines.join("\n");
 }
 
 const TRAVERSAL_KINDS = new Set<RelationKind>([
@@ -87,18 +185,18 @@ function directedTree(
   direction: "children" | "parents"
 ): unknown {
   const visited = new Set<string>();
+  const cache = services.db.createGraphReadCache();
   const walk = (entity: Entity, remaining: number): unknown => {
     if (remaining <= 0 || visited.has(entity.uid)) {
       return { entity, relations: [], [direction]: [] };
     }
     visited.add(entity.uid);
     const relations = (direction === "children"
-      ? services.db.getRelationsFrom(entity.uid)
-      : services.db.getRelationsTo(entity.uid)
+      ? services.db.getRelationsFromCached(entity.uid, cache)
+      : services.db.getRelationsToCached(entity.uid, cache)
     ).filter((relation) => TRAVERSAL_KINDS.has(relation.kind));
-    const nodes = relations
-      .map((relation) => services.db.getEntity(direction === "children" ? relation.to : relation.from))
-      .filter(Boolean) as Entity[];
+    const nodeUids = relations.map((relation) => (direction === "children" ? relation.to : relation.from));
+    const nodes = services.db.getEntitiesByUidCached(nodeUids, cache);
     return {
       entity,
       relations,
@@ -124,6 +222,7 @@ function findSourceEntities(services: DSPServices, sourcePath: string): Entity[]
 }
 
 function shortestPath(services: DSPServices, fromUid: string, toUid: string): string[] | undefined {
+  const cache = services.db.createGraphReadCache();
   const queue: string[][] = [[fromUid]];
   const visited = new Set<string>([fromUid]);
   while (queue.length > 0) {
@@ -132,7 +231,7 @@ function shortestPath(services: DSPServices, fromUid: string, toUid: string): st
     if (current === toUid) {
       return pathSoFar;
     }
-    for (const relation of services.db.getRelationsFrom(current).filter((rel) => TRAVERSAL_KINDS.has(rel.kind))) {
+    for (const relation of services.db.getRelationsFromCached(current, cache).filter((rel) => TRAVERSAL_KINDS.has(rel.kind))) {
       if (!visited.has(relation.to)) {
         visited.add(relation.to);
         queue.push([...pathSoFar, relation.to]);
@@ -273,6 +372,7 @@ program
   .option("--full", "full reindex", false)
   .option("--changed-only", "index only changed files", false)
   .option("--from-git-diff", "index files from git diff", false)
+  .option("--base-ref <ref>", "git base ref or merge-base:<ref> for changed-only diff selection")
   .option("--no-embeddings", "disable embeddings for this run")
   .option("--json", "machine-readable output", false)
   .action(async (rootDir: string, options) => {
@@ -286,8 +386,9 @@ program
           full: options.full,
           changedOnly: options.changedOnly,
           fromGitDiff: options.fromGitDiff,
+          baseRef: options.baseRef,
           noEmbeddings: options.embeddings === false
-        }
+        } as any
       );
       printOutput(summary, options.json);
     } finally {
@@ -339,6 +440,7 @@ program
   .argument("[rootDir]", "root directory", ".")
   .option("--from-git-diff", "update from git diff", false)
   .option("--changed-only", "only changed files", false)
+  .option("--base-ref <ref>", "git base ref or merge-base:<ref> for changed-only diff selection")
   .option("--json", "machine-readable output", false)
   .action(async (rootDir: string, options) => {
     const services = openDSP(path.resolve(rootDir), adapters());
@@ -346,8 +448,9 @@ program
       const summary = await runIndex(services, {
         rootDir: services.rootDir,
         fromGitDiff: options.fromGitDiff,
-        changedOnly: options.changedOnly
-      });
+        changedOnly: options.changedOnly,
+        baseRef: options.baseRef
+      } as any);
       printOutput(summary, options.json);
     } finally {
       services.db.close();
@@ -357,11 +460,14 @@ program
 program
   .command("changed")
   .argument("[rootDir]", "root directory", ".")
+  .option("--base-ref <ref>", "git base ref or merge-base:<ref> for changed-file listing")
   .option("--json", "machine-readable output", false)
-  .action((rootDir: string, options: { json: boolean }) => {
+  .action((rootDir: string, options: { baseRef?: string; json: boolean }) => {
     const services = openDSP(path.resolve(rootDir), adapters());
     try {
-      const result = runChanged(services);
+      const result = (runChanged as (services: DSPServices, options: { baseRef?: string }) => string[])(services, {
+        baseRef: options.baseRef
+      });
       printOutput(result, options.json);
     } finally {
       services.db.close();
@@ -413,10 +519,13 @@ program
   .argument("<uidOrPath>", "entity uid or path")
   .argument("[rootDir]", "root directory", ".")
   .option("--depth <number>", "graph depth", "2")
+  .option("--max-depth <number>", "maximum traversal depth override")
+  .option("--max-nodes <number>", "maximum graph nodes to return")
   .option("--max-entities <number>", "maximum graph entities to return")
   .option("--max-relations <number>", "maximum graph relations to return")
   .option("--max-files <number>", "maximum graph files to include")
   .option("--max-estimated-tokens <number>", "maximum estimated graph tokens")
+  .option("--timeout-ms <number>", "maximum traversal time in milliseconds")
   .option("--json", "machine-readable output", false)
   .action(
     (
@@ -424,10 +533,13 @@ program
       rootDir: string,
       options: {
         depth: string;
+        maxDepth?: string;
+        maxNodes?: string;
         maxEntities?: string;
         maxRelations?: string;
         maxFiles?: string;
         maxEstimatedTokens?: string;
+        timeoutMs?: string;
         json: boolean;
       }
     ) => {
@@ -439,11 +551,14 @@ program
           return;
         }
         const graph = getNeighbors(services.db, entity.uid, Number(options.depth), {
+          maxDepth: options.maxDepth ? Number(options.maxDepth) : undefined,
+          maxNodes: options.maxNodes ? Number(options.maxNodes) : undefined,
           maxEntities: options.maxEntities ? Number(options.maxEntities) : undefined,
           maxRelations: options.maxRelations ? Number(options.maxRelations) : undefined,
           maxFiles: options.maxFiles ? Number(options.maxFiles) : undefined,
-          maxEstimatedTokens: options.maxEstimatedTokens ? Number(options.maxEstimatedTokens) : undefined
-        });
+          maxEstimatedTokens: options.maxEstimatedTokens ? Number(options.maxEstimatedTokens) : undefined,
+          timeoutMs: options.timeoutMs ? Number(options.timeoutMs) : undefined
+        } as any);
         printOutput({ root: entity.uid, ...graph }, options.json);
       } finally {
         services.db.close();
@@ -881,16 +996,35 @@ program
   .command("impact")
   .argument("<uidOrPath>", "target uid or path")
   .argument("[rootDir]", "root directory", ".")
+  .option("--max-depth <number>", "maximum reverse-dependency depth")
+  .option("--max-nodes <number>", "maximum impacted nodes to traverse")
+  .option("--max-relations <number>", "maximum dependency relations to inspect")
+  .option("--timeout-ms <number>", "maximum impact-analysis time in milliseconds")
   .option("--json", "machine-readable output", false)
-  .action((uidOrPath: string, rootDir: string, options: { json: boolean }) => {
-    const services = openDSP(path.resolve(rootDir), adapters());
-    try {
-      const result = runImpact(services, uidOrPath);
-      printOutput(result, options.json);
-    } finally {
-      services.db.close();
+  .action(
+    (
+      uidOrPath: string,
+      rootDir: string,
+      options: { maxDepth?: string; maxNodes?: string; maxRelations?: string; timeoutMs?: string; json: boolean }
+    ) => {
+      const services = openDSP(path.resolve(rootDir), adapters());
+      try {
+        const result = (runImpact as (services: DSPServices, target: string, options: Record<string, number | undefined>) => unknown)(
+          services,
+          uidOrPath,
+          {
+            maxDepth: options.maxDepth ? Number(options.maxDepth) : undefined,
+            maxNodes: options.maxNodes ? Number(options.maxNodes) : undefined,
+            maxRelations: options.maxRelations ? Number(options.maxRelations) : undefined,
+            timeoutMs: options.timeoutMs ? Number(options.timeoutMs) : undefined
+          }
+        );
+        printOutput(result, options.json);
+      } finally {
+        services.db.close();
+      }
     }
-  });
+  );
 
 program
   .command("validate")
@@ -932,17 +1066,50 @@ program
 program
   .command("repair")
   .argument("[rootDir]", "root directory", ".")
+  .option("--apply", "apply repairs; without this flag, repair runs in planning mode", false)
   .option("--dry-run", "show planned repairs without writing", false)
+  .option("--clean-orphaned-file-hashes", "remove file-hash rows whose file entity no longer exists", false)
+  .option("--clean-orphaned-embeddings", "remove embedding rows whose entity no longer exists", false)
+  .option("--clean-stale-parse-cache", "remove parse-cache rows with no matching file hash", false)
+  .option("--clear-stale-checkpoints", "remove old leftover checkpoints from interrupted runs", false)
+  .option("--fail-abandoned-runs", "mark long-running index runs as failed", false)
   .option("--json", "machine-readable output", false)
-  .action(async (rootDir: string, options: { dryRun: boolean; json: boolean }) => {
+  .action(
+    async (
+      rootDir: string,
+      options: {
+        apply: boolean;
+        dryRun: boolean;
+        cleanOrphanedFileHashes: boolean;
+        cleanOrphanedEmbeddings: boolean;
+        cleanStaleParseCache: boolean;
+        clearStaleCheckpoints: boolean;
+        failAbandonedRuns: boolean;
+        json: boolean;
+      }
+    ) => {
     const services = openDSP(path.resolve(rootDir), adapters());
     try {
-      const result = await runRepair(services, { dryRun: options.dryRun });
+      const result = await (
+        runRepair as (
+          services: DSPServices,
+          options: Record<string, boolean | undefined>
+        ) => Promise<unknown>
+      )(services, {
+        apply: options.apply,
+        dryRun: options.dryRun,
+        cleanOrphanedFileHashes: options.cleanOrphanedFileHashes,
+        cleanOrphanedEmbeddings: options.cleanOrphanedEmbeddings,
+        cleanStaleParseCache: options.cleanStaleParseCache,
+        clearStaleCheckpoints: options.clearStaleCheckpoints,
+        failAbandonedRuns: options.failAbandonedRuns
+      });
       printOutput(result, options.json);
     } finally {
       services.db.close();
     }
-  });
+    }
+  );
 
 program
   .command("export")

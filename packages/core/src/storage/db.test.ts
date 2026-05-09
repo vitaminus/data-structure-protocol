@@ -230,12 +230,124 @@ describe("DSPDatabase", () => {
       expect.arrayContaining([
         "idx_entities_path",
         "idx_entities_kind_path",
+        "idx_entities_language_kind_path",
+        "idx_entities_path_kind",
         "idx_relations_from_uid",
         "idx_relations_to_uid",
         "idx_relations_kind",
+        "idx_relations_kind_from_uid",
+        "idx_relations_kind_to_uid",
+        "idx_file_dependencies_to_path",
+        "idx_file_dependencies_from_path",
+        "idx_symbol_dependencies_to_uid",
+        "idx_symbol_dependencies_from_uid",
         "idx_unresolved_references_path"
       ])
     );
+  });
+
+  it("stores reverse dependency snapshots for file and symbol lookups", () => {
+    const now = stableNowIso();
+    const fileA = "src/a.ts";
+    const fileB = "src/b.ts";
+    const fileUidA = buildUid("file", fileA);
+    const fileUidB = buildUid("file", fileB);
+    const fnUidA = buildUid("function", fileA, "exported");
+    const fnUidB = buildUid("function", fileB, "consumer");
+
+    db.replaceAstFiles([
+      {
+        relPath: fileA,
+        language: "typescript",
+        hash: "hash-a",
+        indexedAt: now,
+        mtimeMs: 1,
+        sizeBytes: 10,
+        entities: [
+          {
+            uid: fileUidA,
+            kind: "file",
+            name: "a.ts",
+            path: fileA,
+            language: "typescript",
+            confidence: 1,
+            provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+            createdAt: now,
+            updatedAt: now
+          },
+          {
+            uid: fnUidA,
+            kind: "function",
+            name: "exported",
+            path: fileA,
+            language: "typescript",
+            confidence: 1,
+            provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+            createdAt: now,
+            updatedAt: now
+          }
+        ],
+        relations: [],
+        unresolved: []
+      },
+      {
+        relPath: fileB,
+        language: "typescript",
+        hash: "hash-b",
+        indexedAt: now,
+        mtimeMs: 1,
+        sizeBytes: 10,
+        entities: [
+          {
+            uid: fileUidB,
+            kind: "file",
+            name: "b.ts",
+            path: fileB,
+            language: "typescript",
+            confidence: 1,
+            provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+            createdAt: now,
+            updatedAt: now
+          },
+          {
+            uid: fnUidB,
+            kind: "function",
+            name: "consumer",
+            path: fileB,
+            language: "typescript",
+            confidence: 1,
+            provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+            createdAt: now,
+            updatedAt: now
+          }
+        ],
+        relations: [
+          {
+            from: fileUidB,
+            to: fileUidA,
+            kind: "imports",
+            confidence: 0.9,
+            provenance: [{ source: "ast", timestamp: now, confidence: 0.9 }]
+          },
+          {
+            from: fnUidB,
+            to: fnUidA,
+            kind: "calls",
+            confidence: 0.8,
+            provenance: [{ source: "ast", timestamp: now, confidence: 0.8 }]
+          }
+        ],
+        unresolved: []
+      }
+    ]);
+
+    expect(db.getReverseFileDependents([fileA])).toEqual([fileB]);
+    expect(db.getReverseSymbolDependents([fnUidA])).toEqual([fnUidB]);
+
+    db.clearAstDataForPath(fileA);
+
+    expect(db.getReverseFileDependents([fileA])).toEqual([fileB]);
+    expect(db.getReverseSymbolDependents([fnUidA])).toEqual([fnUidB]);
   });
 
   it("finds non-container orphans with a direct SQL query", () => {
@@ -319,6 +431,11 @@ describe("DSPDatabase", () => {
 
     const report = db.doctor();
 
+    expect(report.schema).toEqual({
+      currentVersion: db.expectedSchemaVersion(),
+      expectedVersion: db.expectedSchemaVersion(),
+      upToDate: true
+    });
     expect(report.integrity.ok).toBe(true);
     expect(report.orphanedEmbeddings).toContain("missing:entity");
     expect(report.orphanedFileHashes).toContain("src/missing.ts");
@@ -326,6 +443,35 @@ describe("DSPDatabase", () => {
     expect(report.parseCache.entries).toBe(1);
     expect(report.parseCache.stalePaths).toContain("src/ghost.ts");
     expect(report.maintenance.freelistPages).toBeGreaterThanOrEqual(0);
+  });
+
+  it("reports stale checkpoints and abandoned index runs", () => {
+    const oldIso = stableNowIso(new Date(Date.now() - 3 * 24 * 60 * 60 * 1000));
+    const recentIso = stableNowIso();
+    const sqlite = new Database(db.dbPath);
+    sqlite
+      .prepare("INSERT INTO index_runs(started_at, mode, status, metadata_json) VALUES (?, ?, 'running', ?)")
+      .run(oldIso, "index", "{}");
+    sqlite
+      .prepare("INSERT INTO index_runs(started_at, mode, status, metadata_json) VALUES (?, ?, 'running', ?)")
+      .run(recentIso, "update", "{}");
+    sqlite
+      .prepare("INSERT INTO checkpoints(name, metadata_json, created_at) VALUES (?, ?, ?)")
+      .run("index:stale", "{}", oldIso);
+    sqlite
+      .prepare("INSERT INTO checkpoints(name, metadata_json, created_at) VALUES (?, ?, ?)")
+      .run("index:fresh", "{}", recentIso);
+    sqlite.close();
+
+    const report = db.doctor();
+
+    expect(report.runningIndexRuns).toBe(2);
+    expect(report.abandonedIndexRuns).toEqual([
+      expect.objectContaining({ mode: "index", startedAt: oldIso })
+    ]);
+    expect(report.staleCheckpoints).toEqual([
+      expect.objectContaining({ name: "index:stale", createdAt: oldIso })
+    ]);
   });
 
   it("clears parse cache alongside other cache tables", () => {
@@ -357,6 +503,20 @@ describe("DSPDatabase", () => {
     });
 
     expect(results.map((row) => row.uid)).toEqual(["entity:alpha", "entity:beta"]);
+  });
+
+  it("stores multiple LSH bucket entries per embedding", () => {
+    const now = stableNowIso();
+    db.setEmbedding("entity:alpha", "hash-a", [1, 0.5, -0.25, 0.75, -0.5, 0.1, 0.2, -0.3], "mock", now);
+
+    const sqlite = new Database(db.dbPath, { readonly: true });
+    const rows = sqlite
+      .prepare("SELECT bucket_key FROM embedding_buckets WHERE provider = ? AND uid = ? ORDER BY bucket_key")
+      .all("mock", "entity:alpha") as { bucket_key: string }[];
+    sqlite.close();
+
+    expect(rows).toHaveLength(4);
+    expect(rows.every((row) => /^f\d:/.test(row.bucket_key))).toBe(true);
   });
 
   it("indexes entities into SQLite FTS for lexical candidate lookup", () => {
@@ -472,6 +632,106 @@ describe("DSPDatabase", () => {
       uids[604],
       uids[0]
     ]);
+  });
+
+  it("reuses a request-scoped cache for batched entity and relation reads", () => {
+    const now = stableNowIso();
+    const fileUid = buildUid("file", "src/auth.ts");
+    const fnUid = buildUid("function", "src/auth.ts", "login");
+    const callerUid = buildUid("function", "src/caller.ts", "handleLogin");
+    for (const entity of [
+      {
+        uid: fileUid,
+        kind: "file" as const,
+        name: "auth.ts",
+        path: "src/auth.ts"
+      },
+      {
+        uid: fnUid,
+        kind: "function" as const,
+        name: "login",
+        path: "src/auth.ts"
+      },
+      {
+        uid: callerUid,
+        kind: "function" as const,
+        name: "handleLogin",
+        path: "src/caller.ts"
+      }
+    ]) {
+      db.upsertEntity({
+        ...entity,
+        confidence: 1,
+        provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+        createdAt: now,
+        updatedAt: now
+      });
+    }
+    db.upsertRelation({
+      from: callerUid,
+      to: fnUid,
+      kind: "calls",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+
+    const cache = db.createGraphReadCache();
+    const firstEntities = db.getEntitiesByUidCached([callerUid, fnUid], cache);
+    const secondEntities = db.getEntitiesByUidCached([callerUid, fnUid], cache);
+    const firstRelations = db.getRelationsToCached(fnUid, cache);
+    const secondRelations = db.getRelationsToCached(fnUid, cache);
+
+    expect(firstEntities.map((entity) => entity.uid)).toEqual([callerUid, fnUid]);
+    expect(secondEntities).toEqual(firstEntities);
+    expect(secondRelations).toBe(firstRelations);
+    expect(firstRelations).toContainEqual(expect.objectContaining({ from: callerUid, to: fnUid, kind: "calls" }));
+  });
+
+  it("returns touching relations with endpoint entities for batched UID reads", () => {
+    const now = stableNowIso();
+    const rootUid = buildUid("function", "src/root.ts", "root");
+    const childUid = buildUid("function", "src/child.ts", "child");
+    const helperUid = buildUid("function", "src/helper.ts", "helper");
+
+    for (const [uid, name, filePath] of [
+      [rootUid, "root", "src/root.ts"],
+      [childUid, "child", "src/child.ts"],
+      [helperUid, "helper", "src/helper.ts"]
+    ] as const) {
+      db.upsertEntity({
+        uid,
+        kind: "function",
+        name,
+        path: filePath,
+        confidence: 1,
+        provenance: [{ source: "ast", timestamp: now, confidence: 1 }],
+        createdAt: now,
+        updatedAt: now
+      });
+    }
+    db.upsertRelation({
+      from: rootUid,
+      to: childUid,
+      kind: "calls",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+    db.upsertRelation({
+      from: helperUid,
+      to: childUid,
+      kind: "uses",
+      confidence: 1,
+      provenance: [{ source: "ast", timestamp: now, confidence: 1 }]
+    });
+
+    const cache = db.createGraphReadCache();
+    const result = db.getTouchingRelationsWithEndpoints([childUid], cache);
+
+    expect(result.relations).toEqual([
+      expect.objectContaining({ from: helperUid, to: childUid, kind: "uses" }),
+      expect.objectContaining({ from: rootUid, to: childUid, kind: "calls" })
+    ]);
+    expect(result.entities.map((entity) => entity.uid).sort()).toEqual([childUid, helperUid, rootUid].sort());
   });
 
   it("clears AST data for paths with more entities than SQLite variable limits allow", () => {

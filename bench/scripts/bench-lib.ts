@@ -5,8 +5,11 @@ import { performance } from "node:perf_hooks";
 import {
   buildContextPack,
   buildUid,
+  contentHash,
   DSPDatabase,
   indexRepository,
+  type IndexTelemetry,
+  MockEmbeddingProvider,
   semanticSearch,
   stableNowIso,
   validateGraph,
@@ -27,9 +30,17 @@ export type BenchResult = {
   contextPackP50Ms: number;
   contextPackP95Ms: number;
   retrievalRecallAt5: number;
+  retrievalRecallAt10: number;
   validateMs: number;
   rssMb: number;
   dbSizeMb: number;
+  parserFallbackFiles: number;
+  workerRestarts: number;
+  workerTimeouts: number;
+  dbQueryCount?: number;
+  coldTelemetry?: IndexTelemetry;
+  warmTelemetry?: IndexTelemetry;
+  changedTelemetry?: IndexTelemetry;
 };
 
 export type BenchCase = {
@@ -126,9 +137,22 @@ function createFixture(rootDir: string, files: number): void {
 }
 
 async function recallAt5(db: DSPDatabase): Promise<number> {
+  return recallAtK(db, 5);
+}
+
+async function recallAt10(db: DSPDatabase): Promise<number> {
+  return recallAtK(db, 10);
+}
+
+async function recallAtK(db: DSPDatabase, topK: number): Promise<number> {
+  const provider = new MockEmbeddingProvider();
   let hits = 0;
   for (const golden of GOLDEN_QUERIES) {
-    const results = await semanticSearch(db, golden.query, { topK: 5 });
+    const results = await semanticSearch(db, golden.query, {
+      topK,
+      embeddingsEnabled: true,
+      provider
+    });
     if (
       results.some((result) =>
         golden.expectedPathIncludes.some((expected) => result.path?.includes(expected))
@@ -145,12 +169,24 @@ export async function runCase(benchCase: BenchCase, parallelism: number): Promis
   createFixture(rootDir, benchCase.files);
   const db = new DSPDatabase(rootDir);
   const adapters = [new BenchAdapter()];
+  const embeddingProvider = new MockEmbeddingProvider();
   const config = {
     ...DEFAULT_CONFIG,
     performance: { ...DEFAULT_CONFIG.performance, parallelism }
   };
   try {
     const cold = await timedAsync(() => indexRepository(db, adapters, { rootDir, full: true }, config));
+    for (const entity of db.iterateEntitiesOrdered()) {
+      const semanticText = [entity.name, entity.signature ?? "", entity.description ?? "", entity.docstring ?? ""].join("\n");
+      const hash = contentHash(semanticText);
+      db.setEmbedding(
+        entity.uid,
+        hash,
+        await embeddingProvider.embed(semanticText),
+        embeddingProvider.cacheKey?.() ?? embeddingProvider.constructor.name,
+        stableNowIso()
+      );
+    }
     const warm = await timedAsync(() => indexRepository(db, adapters, { rootDir }, config));
     fs.appendFileSync(path.join(rootDir, "src", "auth-1.ts"), "\nexport const changed = true;\n", "utf8");
     const changed = await timedAsync(() =>
@@ -160,7 +196,16 @@ export async function runCase(benchCase: BenchCase, parallelism: number): Promis
     const searchTimes: number[] = [];
     const searchCandidates: number[] = [];
     for (let index = 0; index < benchCase.searchIterations; index += 1) {
-      searchTimes.push((await timedAsync(() => semanticSearch(db, "auth token validation"))).ms);
+      searchTimes.push(
+        (
+          await timedAsync(() =>
+            semanticSearch(db, "auth token validation", {
+              embeddingsEnabled: true,
+              provider: embeddingProvider
+            })
+          )
+        ).ms
+      );
       searchCandidates.push(db.searchEntityCandidates("auth token validation", 500).candidatesScanned);
     }
     const contextTimes: number[] = [];
@@ -168,6 +213,7 @@ export async function runCase(benchCase: BenchCase, parallelism: number): Promis
       contextTimes.push((await timedAsync(() => buildContextPack(db, { task: "auth token validation" }))).ms);
     }
     const retrievalRecall = await recallAt5(db);
+    const retrievalRecallTop10 = await recallAt10(db);
     const validation = timed(() => validateGraph(db, rootDir));
     const dbSize = fs.statSync(db.dbPath).size / 1024 / 1024;
     return {
@@ -182,9 +228,29 @@ export async function runCase(benchCase: BenchCase, parallelism: number): Promis
       contextPackP50Ms: percentile(contextTimes, 0.5),
       contextPackP95Ms: percentile(contextTimes, 0.95),
       retrievalRecallAt5: retrievalRecall,
+      retrievalRecallAt10: retrievalRecallTop10,
       validateMs: validation.ms,
       rssMb: process.memoryUsage().rss / 1024 / 1024,
-      dbSizeMb: dbSize
+      dbSizeMb: dbSize,
+      parserFallbackFiles:
+        (cold.value.telemetry?.parserFallbackFiles ?? 0) +
+        (warm.value.telemetry?.parserFallbackFiles ?? 0) +
+        (changed.value.telemetry?.parserFallbackFiles ?? 0),
+      workerRestarts:
+        (cold.value.telemetry?.workerRestarts ?? 0) +
+        (warm.value.telemetry?.workerRestarts ?? 0) +
+        (changed.value.telemetry?.workerRestarts ?? 0),
+      workerTimeouts:
+        (cold.value.telemetry?.workerTimeouts ?? 0) +
+        (warm.value.telemetry?.workerTimeouts ?? 0) +
+        (changed.value.telemetry?.workerTimeouts ?? 0),
+      dbQueryCount:
+        (cold.value.telemetry?.dbQueryCount ?? 0) +
+        (warm.value.telemetry?.dbQueryCount ?? 0) +
+        (changed.value.telemetry?.dbQueryCount ?? 0),
+      coldTelemetry: cold.value.telemetry,
+      warmTelemetry: warm.value.telemetry,
+      changedTelemetry: changed.value.telemetry
     };
   } finally {
     db.close();

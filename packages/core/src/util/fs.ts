@@ -13,12 +13,24 @@ export type DiscoverOptions = {
   maxFileSizeKb?: number;
 };
 
+export type DiscoverySkip = {
+  path: string;
+  reason: "tooLarge";
+  sizeBytes: number;
+};
+
+export type DiscoveryResult = {
+  files: string[];
+  skipped: DiscoverySkip[];
+};
+
 type DiscoveryManifest = {
   rootDir: string;
   excludes: string[];
   maxFileSizeKb: number;
   fingerprint: string;
   files: string[];
+  skipped?: DiscoverySkip[];
 };
 
 export function ensureDir(target: string): void {
@@ -101,7 +113,7 @@ function discoverFilesFromGit(
   rootDir: string,
   rules: import("ignore").Ignore,
   maxFileSizeKb: number
-): string[] | undefined {
+): DiscoveryResult | undefined {
   const repoRoot = findRepoRoot(rootDir);
   if (!fs.existsSync(path.join(repoRoot, ".git"))) {
     return undefined;
@@ -118,35 +130,45 @@ function discoverFilesFromGit(
       }
     );
     const rootPrefix = path.relative(repoRoot, rootDir).split(path.sep).join("/");
-    const files = output
-      .split("\0")
-      .filter(Boolean)
-      .flatMap((repoRelPath) => {
-        const normalizedRepoRelPath = repoRelPath.split(path.sep).join("/");
-        if (
-          rootPrefix &&
-          normalizedRepoRelPath !== rootPrefix &&
-          !normalizedRepoRelPath.startsWith(`${rootPrefix}/`)
-        ) {
-          return [];
-        }
-        const rel = rootPrefix
-          ? normalizedRepoRelPath.slice(rootPrefix.length).replace(/^\//, "")
-          : normalizedRepoRelPath;
-        if (!rel || rules.ignores(rel)) {
-          return [];
-        }
-        const absPath = path.join(repoRoot, normalizedRepoRelPath);
-        const stat = fs.statSync(absPath);
-        return stat.size <= maxFileSizeKb * 1024 ? [path.resolve(absPath)] : [];
-      });
-    return files.sort();
+    const files: string[] = [];
+    const skipped: DiscoverySkip[] = [];
+    for (const repoRelPath of output.split("\0").filter(Boolean)) {
+      const normalizedRepoRelPath = repoRelPath.split(path.sep).join("/");
+      if (
+        rootPrefix &&
+        normalizedRepoRelPath !== rootPrefix &&
+        !normalizedRepoRelPath.startsWith(`${rootPrefix}/`)
+      ) {
+        continue;
+      }
+      const rel = rootPrefix
+        ? normalizedRepoRelPath.slice(rootPrefix.length).replace(/^\//, "")
+        : normalizedRepoRelPath;
+      if (!rel || rules.ignores(rel)) {
+        continue;
+      }
+      const absPath = path.join(repoRoot, normalizedRepoRelPath);
+      const stat = fs.statSync(absPath);
+      if (stat.size > maxFileSizeKb * 1024) {
+        skipped.push({
+          path: path.resolve(absPath),
+          reason: "tooLarge",
+          sizeBytes: stat.size
+        });
+        continue;
+      }
+      files.push(path.resolve(absPath));
+    }
+    return {
+      files: files.sort(),
+      skipped: skipped.sort((left, right) => left.path.localeCompare(right.path))
+    };
   } catch {
     return undefined;
   }
 }
 
-export function discoverFiles(rootDir: string, options: DiscoverOptions = {}): string[] {
+export function discoverFilesDetailed(rootDir: string, options: DiscoverOptions = {}): DiscoveryResult {
   const rules = ignore();
   const excludes = options.excludes ?? DEFAULT_EXCLUDES;
   const gitIgnores = readGitIgnore(rootDir);
@@ -161,7 +183,13 @@ export function discoverFiles(rootDir: string, options: DiscoverOptions = {}): s
     cachedManifest.fingerprint === fingerprint &&
     JSON.stringify(cachedManifest.excludes) === JSON.stringify(excludes)
   ) {
-    return cachedManifest.files.map((filePath) => path.resolve(filePath));
+    return {
+      files: cachedManifest.files.map((filePath) => path.resolve(filePath)),
+      skipped: (cachedManifest.skipped ?? []).map((entry) => ({
+        ...entry,
+        path: path.resolve(entry.path)
+      }))
+    };
   }
   const gitFiles = discoverFilesFromGit(rootDir, rules, maxFileSizeKb);
   if (gitFiles) {
@@ -170,11 +198,13 @@ export function discoverFiles(rootDir: string, options: DiscoverOptions = {}): s
       excludes: [...excludes],
       maxFileSizeKb,
       fingerprint,
-      files: gitFiles
+      files: gitFiles.files,
+      skipped: gitFiles.skipped
     });
     return gitFiles;
   }
   const files: string[] = [];
+  const skipped: DiscoverySkip[] = [];
   const pending = [path.resolve(rootDir)];
 
   while (pending.length > 0) {
@@ -200,21 +230,36 @@ export function discoverFiles(rootDir: string, options: DiscoverOptions = {}): s
         continue;
       }
       const stat = fs.statSync(full);
-      if (stat.size <= maxFileSizeKb * 1024) {
-        files.push(full);
+      if (stat.size > maxFileSizeKb * 1024) {
+        skipped.push({
+          path: full,
+          reason: "tooLarge",
+          sizeBytes: stat.size
+        });
+        continue;
       }
+      files.push(full);
     }
   }
 
   const sorted = files.sort();
+  const sortedSkipped = skipped.sort((left, right) => left.path.localeCompare(right.path));
   writeDiscoveryManifest(rootDir, {
     rootDir: path.resolve(rootDir),
     excludes: [...excludes],
     maxFileSizeKb,
     fingerprint,
-    files: sorted
+    files: sorted,
+    skipped: sortedSkipped
   });
-  return sorted;
+  return {
+    files: sorted,
+    skipped: sortedSkipped
+  };
+}
+
+export function discoverFiles(rootDir: string, options: DiscoverOptions = {}): string[] {
+  return discoverFilesDetailed(rootDir, options).files;
 }
 
 export function readTextFile(filePath: string): string {

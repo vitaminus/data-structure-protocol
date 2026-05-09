@@ -9,8 +9,10 @@ import type {
   IndexSummary,
   EmbeddingProvider,
   LanguageAdapter,
+  RepairOptions,
   RepairResult,
   SearchResult,
+  TraversalLimits,
   ValidationOptions,
   ValidationResult
 } from "./graph/types.ts";
@@ -93,8 +95,8 @@ export async function runBootstrap(
   return bootstrapRepository(services.db, services.adapters, services.rootDir, services.config, options);
 }
 
-export function runChanged(services: DSPServices): string[] {
-  return changedFiles(services.db, services.rootDir);
+export function runChanged(services: DSPServices, options: { baseRef?: string } = {}): string[] {
+  return changedFiles(services.db, services.rootDir, options.baseRef);
 }
 
 export async function runSearch(
@@ -111,8 +113,8 @@ export async function runSearch(
   });
 }
 
-export function runImpact(services: DSPServices, target: string): ImpactResult {
-  return analyzeImpact(services.db, target);
+export function runImpact(services: DSPServices, target: string, options: TraversalLimits = {}): ImpactResult {
+  return analyzeImpact(services.db, target, options);
 }
 
 export function runValidate(
@@ -124,7 +126,7 @@ export function runValidate(
 
 export async function runRepair(
   services: DSPServices,
-  options: { dryRun?: boolean } = {}
+  options: RepairOptions = {}
 ): Promise<RepairResult> {
   return repairGraph(services.db, services.rootDir, services.adapters, services.config, options);
 }

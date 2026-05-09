@@ -22,6 +22,7 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: pnpm doctor
       - run: pnpm -r run lint
       - run: pnpm -r run test
       - run: pnpm -r run build
@@ -64,6 +65,7 @@ jobs:
   bench-smoke:
     runs-on: ubuntu-latest
     needs: test
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -79,8 +81,30 @@ jobs:
       - run: pnpm bench:compare bench-results.json bench/baselines/ci-smoke.json
       - uses: actions/upload-artifact@v4
         with:
-          name: bench-results
+          name: bench-smoke-results
           path: bench-results.json
+
+  bench-medium:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm bench:smoke > bench-medium-results.json
+        env:
+          DSP_BENCH_CASES: tiny,medium
+          DSP_BENCH_PARALLELISM: "1,4"
+      - run: pnpm bench:compare bench-medium-results.json bench/baselines/main-medium.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-medium-results
+          path: bench-medium-results.json
 
   bench-soak:
     runs-on: ubuntu-latest

@@ -1,5 +1,112 @@
 # DSP Improvement Tasks
 
+## 2026-05-09 Performance and Reliability Upgrade Program
+
+This section tracks the current full-stack performance/reliability push for DSP.
+
+Execution order:
+
+1. land observability first so later optimizations are measurable;
+2. add hard safety bounds before widening traversal or incremental propagation;
+3. remove unsafe hot-path process/SQLite/git overhead;
+4. strengthen benchmarks, doctor/repair, and CI only after runtime behavior is stable.
+
+### 94. Expand index telemetry and slow-file reporting
+
+Status: done
+
+- Extend index telemetry with `discoveryMs`, `readMs`, `hashMs`, `parseMs`, `dbWriteMs`, `cacheHitFiles`, `cacheHitParses`, `workerRestarts`, `workerTimeouts`, `parserFallbackFiles`, `slowestFiles`, and optional `dbQueryCount`.
+- Surface the telemetry in CLI `--json`, keep human-readable summaries compact, and show top slow files without breaking current machine consumers.
+- Persist benchmark-ready telemetry artifacts so performance changes can be compared before and after later hot-path work.
+
+### 95. Add hard truncation limits to traversal, impact, and context-pack
+
+Status: done
+
+- Introduce shared traversal limits for `maxDepth`, `maxNodes`, `maxRelations`, and `timeoutMs` across graph traversal, impact analysis, and context-pack expansion.
+- Extend `ImpactResult`, CLI output, and MCP output with explicit `truncated` state and `truncationReason` so large or cyclic graphs fail predictably instead of hanging.
+- Add coverage for cyclic graphs, depth/node/relation caps, timeouts, and context-pack truncation visibility.
+
+### 96. Replace shell-style git calls with validated argument-based execution
+
+Status: done
+
+- Replace interpolated `git` shell strings with `execFileSync`/argument arrays and validate `baseRef` inputs before execution.
+- Add `--base-ref` support plus tested modes for unstaged changes, staged changes, merge-base/PR diffing, deletes, renames, and copies.
+- Keep changed-only cleanup deterministic so stale graph state is removed correctly when git reports deleted or renamed files.
+
+### 97. Add batched graph read APIs and request-scoped caches
+
+Status: done
+
+- Add batch database helpers for entity/relation endpoint reads, including `getEntitiesByUidCached`, `getRelationsForUids`, and `getTouchingRelationsWithEndpoints`.
+- Add request-scoped entity/relation caches and reduce repeated JSON parse work for hot read paths.
+- Track query-count deltas in tests/benchmarks so the new APIs prove fewer SQLite round trips instead of only moving logic around.
+
+### 98. Refactor search, context-pack, impact, and CLI graph paths onto batched reads
+
+Status: done
+
+- Move `semanticSearch`, `buildContextPack`, `streamNeighbors`, `analyzeImpact`, and graph-heavy CLI commands onto the new batched database APIs.
+- Preserve deterministic ordering plus provenance/confidence data while removing repeated `getEntity`, `getRelationsFrom`, and `getRelationsTo` loops.
+- Add latency-focused regression coverage that compares output stability and verifies fewer SQL statements on medium/large fixtures.
+
+### 99. Cache TypeScript project resolution state
+
+Status: done
+
+- Cache `tsconfigPath -> compilerOptions` and reuse `ts.createModuleResolutionCache` instead of re-reading or reparsing project config for each import.
+- Support `baseUrl`, `paths`, project references, and mixed TS/JS module extensions while keeping current resolution behavior deterministic.
+- Add alias-resolution integration tests and cold-vs-warm timing metrics to prove warm indexing gets faster on import-heavy TypeScript projects.
+
+### 100. Replace per-file Python and Ruby external parsing with persistent workers
+
+Status: done
+
+- Add long-lived Python and Ruby parser workers with a stable request protocol, per-job timeout, bounded lifetime, crash restart, and explicit fallback telemetry.
+- Preserve safe syntax-error handling and existing fallback parsers so one worker failure cannot fail the full index run.
+- Add worker-path tests for success, syntax error, timeout, crash/restart, and fallback activation.
+
+### 101. Add reverse dependency indexes for more precise incremental updates
+
+Status: done
+
+- Add persistent `file_dependencies` and `symbol_dependencies` tables with safe migrations and bounded write/update paths.
+- Compare old/new public API snapshots for changed files so private-only edits do not fan out, while public API changes trigger bounded reverse-dependent reindexing.
+- Cover TypeScript, Python, Ruby, and Rust incremental cases including rename reconciliation, truncation, and changed-only speedups versus full index.
+
+### 102. Tighten SQLite schema for hot paths and migration safety
+
+Status: done
+
+- Add or verify the remaining hot-path indexes, update schema versioning, and make `doctor` verify the active schema plus migration compatibility.
+- Evaluate targeted storage changes such as `WITHOUT ROWID`, typed hot metadata columns, batched upserts, and reduced JSON stringify/parse churn without breaking existing DBs.
+- Keep benchmark guardrails in place so schema work must be faster or neutral on the current smoke suite.
+
+### 103. Improve semantic/vector search scalability and recall measurement
+
+Status: done
+
+- Replace the current embedding bucket strategy with a stronger ANN path or a materially better bounded-LSH alternative that works locally.
+- Make embedding cache identity include provider key/content hash and keep lexical fallback behavior intact when embeddings are disabled or missing.
+- Add recall@5/10 benchmarks and large-entity-set latency checks so semantic search changes are measurable, not anecdotal.
+
+### 104. Expand benchmark fixtures and CI performance gates
+
+Status: done
+
+- Add realistic fixtures for a small TS app, Next.js-like app, Rails-like app, Rust workspace, FastAPI-like app, and a mixed monorepo scale target.
+- Extend benchmark results with changed-only timings, search/context-pack p50/p95, impact p95, validate time, RSS, DB size, parser fallback counters, worker restarts/timeouts, query count, and recall metrics.
+- Keep PR smoke benchmarks fast, move medium coverage onto `main`, and publish soak artifacts on schedule/manual runs with regression thresholds enforced in CI.
+
+### 105. Harden crash recovery, doctor/repair, and large-repo reliability
+
+Status: done
+
+- Add failure-mode tests for interrupted index runs, corrupted checkpoints, concurrent read-while-indexing, invalid UTF-8, binary/huge file skipping, stale parse cache, SQLite busy/retry, graph cycles, and truncation visibility.
+- Extend `doctor`/`repair` with machine-readable output, stale-run/checkpoint detection, orphan cleanup, explicit destructive flags, and runtime/dependency capability checks.
+- Update README, CLI help, examples, and CI workflows to document fallback behavior, large-repo mode, recovery semantics, and the final supported reliability contract.
+
 ## 1. Deduplicate graph neighbor traversal
 
 Status: done

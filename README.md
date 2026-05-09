@@ -57,7 +57,7 @@ pnpm dsp export --format protocol
 - Multi-language indexing (TS/JS, Python, Rust, Ruby)
 - SQLite canonical graph storage
 - JSON import/export + deterministic `.dsp/` export
-- Incremental `update` and git-aware changed-file indexing
+- Incremental `update` and git-aware changed-file indexing, including `--base-ref` and `merge-base:<ref>` PR-mode diffs
 - Impact analysis and stale-index validation
 - MCP tools for agent integration (`dsp.get_context_pack`, search, impact, validate)
 
@@ -71,3 +71,22 @@ pnpm dsp export --format protocol
 - Reviewable exports
 - Safe failure with low-confidence marking
 - Language-aware precision
+
+## Benchmark tiers
+
+- Pull requests run a fast smoke benchmark and compare against [bench/baselines/ci-smoke.json](/Users/vitaminus/projects/for%20llm/data-structure-protocol/bench/baselines/ci-smoke.json).
+- Pushes to `main` run a wider medium benchmark gate and upload artifacts for regression review.
+- Scheduled or manual runs execute the soak benchmark and upload the full result set.
+
+Benchmark outputs track indexing latency, search/context-pack latency, retrieval recall, memory, DB size, and parser telemetry so hot-path changes stay measurable.
+
+## Operational safety
+
+- `pnpm doctor` checks the supported Node range, `better-sqlite3`, SQLite FTS5 capability, `tsx`, `python3`, and `ruby`.
+- `pnpm doctor -- --json` returns the same runtime report in machine-readable form.
+- `pnpm dsp doctor --json` returns the graph/database health report, including schema status, orphaned caches, stale parse-cache rows, stale checkpoints, and abandoned index runs.
+- `pnpm dsp repair` is planning-only by default. Add `--apply` to write fixes.
+- Destructive maintenance is opt-in: use `--clean-orphaned-file-hashes`, `--clean-orphaned-embeddings`, `--clean-stale-parse-cache`, `--clear-stale-checkpoints`, and `--fail-abandoned-runs` only when you want those repairs applied.
+- `--clean-stale-parse-cache` and `--clear-stale-checkpoints` also remove corrupted rows discovered by `doctor`, not just old-but-well-formed entries.
+- Oversize, binary, and invalid-UTF8 files are skipped safely and recorded in index telemetry instead of being dropped silently.
+- `validate` reports binary and invalid-UTF8 indexed files as explicit warnings, and `context-pack` adds risk notes when code payloads are omitted for unreadable files.

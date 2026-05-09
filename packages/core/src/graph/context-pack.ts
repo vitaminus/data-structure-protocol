@@ -1,10 +1,17 @@
-import fs from "node:fs";
 import path from "node:path";
-import type { ContextPackRequest, ContextPackResponse, EmbeddingProvider, Entity, Relation } from "./types.ts";
+import type {
+  ContextPackRequest,
+  ContextPackResponse,
+  EmbeddingProvider,
+  Entity,
+  Relation,
+  TraversalTruncationReason
+} from "./types.ts";
 import { DSPDatabase } from "../storage/db.ts";
 import { semanticSearch } from "../semantic/search.ts";
 import { relationPriority, streamNeighbors } from "./query.ts";
 import { contentHash } from "./uid.ts";
+import { readUtf8FileSafe, readUtf8PrefixSafe } from "../util/text.ts";
 
 type StrategyDefaults = {
   maxFiles: number;
@@ -75,67 +82,49 @@ function lineRangeForEntities(entities: Entity[]): { startLine?: number; endLine
   };
 }
 
-function readUtf8Prefix(
-  filePath: string,
-  maxChars: number
-): { content: string; truncated: boolean } {
-  const maxBytes = Math.max(256, maxChars * 4);
-  const fd = fs.openSync(filePath, "r");
-  try {
-    const buffer = Buffer.allocUnsafe(maxBytes);
-    const bytesRead = fs.readSync(fd, buffer, 0, maxBytes, 0);
-    const content = buffer.subarray(0, bytesRead).toString("utf8").slice(0, maxChars);
-    const stat = fs.fstatSync(fd);
-    return {
-      content,
-      truncated: stat.size > bytesRead || content.length >= maxChars
-    };
-  } finally {
-    fs.closeSync(fd);
-  }
-}
-
 function readCodePayload(
   db: DSPDatabase,
   files: string[],
   entities: Entity[],
   mode: NonNullable<ContextPackRequest["includeCode"]>,
   options: { maxCharsPerFile: number; maxTotalChars: number }
-): NonNullable<ContextPackResponse["code"]> | undefined {
+): { code?: NonNullable<ContextPackResponse["code"]>; skipped: string[] } {
   if (mode === "none") {
-    return undefined;
+    return { skipped: [] };
   }
   const rootDir = rootDirForDb(db);
   let remainingChars = options.maxTotalChars;
-  return files.flatMap<CodePayload>((filePath) => {
+  const skipped: string[] = [];
+  const code = files.flatMap<CodePayload>((filePath) => {
     if (remainingChars <= 0) {
       return [];
     }
     const absPath = path.resolve(rootDir, filePath);
     const fileCharBudget = Math.max(160, Math.min(options.maxCharsPerFile, remainingChars));
     if (mode === "full-files") {
-      try {
-        const prefix = readUtf8Prefix(absPath, fileCharBudget);
-        remainingChars -= prefix.content.length;
-        return [
-          {
-            path: filePath,
-            mode,
-            content: prefix.content,
-            truncated: prefix.truncated
-          }
-        ];
-      } catch {
+      const prefix = readUtf8PrefixSafe(absPath, fileCharBudget);
+      if (prefix.kind !== "text") {
+        skipped.push(`${filePath} (${prefix.kind})`);
         return [];
       }
+      remainingChars -= prefix.content.length;
+      return [
+        {
+          path: filePath,
+          mode,
+          content: prefix.content,
+          truncated: prefix.truncated
+        }
+      ];
     }
 
     let raw: string;
-    try {
-      raw = fs.readFileSync(absPath, "utf8");
-    } catch {
+    const safeContent = readUtf8FileSafe(absPath);
+    if (safeContent.kind !== "text") {
+      skipped.push(`${filePath} (${safeContent.kind})`);
       return [];
     }
+    raw = safeContent.content;
     if (fileCharBudget <= 0) {
       return [];
     }
@@ -158,32 +147,40 @@ function readCodePayload(
       }
     ];
   });
+  return {
+    ...(code.length > 0 ? { code } : {}),
+    skipped
+  };
 }
 
 async function relationDepthFilter(
   db: DSPDatabase,
   seedUids: Set<string>,
   maxDepth: number,
-  options: { maxEntities: number; maxRelations: number }
-): Promise<{ entities: Set<string>; relations: Relation[] }> {
+  options: { maxEntities: number; maxRelations: number; timeoutMs?: number }
+): Promise<{ entities: Set<string>; relations: Relation[]; truncated: boolean; truncationReason?: TraversalTruncationReason }> {
   const accepted: Relation[] = [];
   const acceptedKeys = new Set<string>();
   const visited = new Set<string>(seedUids);
+  let truncationReason: TraversalTruncationReason | undefined;
 
   for (const seedUid of seedUids) {
     if (accepted.length >= options.maxRelations || visited.size >= options.maxEntities) {
+      truncationReason ??= accepted.length >= options.maxRelations ? "maxRelations" : "maxNodes";
       break;
     }
     for await (const event of streamNeighbors(db, seedUid, maxDepth, {
       maxEntities: options.maxEntities,
-      maxRelations: options.maxRelations - accepted.length
+      maxRelations: options.maxRelations - accepted.length,
+      timeoutMs: options.timeoutMs
     })) {
       if (event.type === "entity") {
         visited.add(event.entity.uid);
-        if (visited.size >= options.maxEntities) {
-          break;
-        }
         continue;
+      }
+      if (event.type === "truncation") {
+        truncationReason ??= event.reason;
+        break;
       }
       const relation = event.relation;
       const relationKey = `${relation.from}\0${relation.kind}\0${relation.to}`;
@@ -198,12 +195,17 @@ async function relationDepthFilter(
       accepted.push(relation);
       visited.add(relation.from);
       visited.add(relation.to);
-      if (accepted.length >= options.maxRelations || visited.size >= options.maxEntities) {
-        break;
-      }
+    }
+    if (truncationReason) {
+      break;
     }
   }
-  return { entities: visited, relations: accepted };
+  return {
+    entities: visited,
+    relations: accepted,
+    truncated: Boolean(truncationReason),
+    ...(truncationReason ? { truncationReason } : {})
+  };
 }
 
 function contextPackServices(input: DSPDatabase | ContextPackServices): ContextPackServices {
@@ -360,14 +362,23 @@ function enforceContextBudget(context: ContextPackResponse): ContextPackResponse
   ];
 
   for (const stage of stages) {
-    current = alignContextLists({ ...stage(current), truncated: true });
+    current = alignContextLists({
+      ...stage(current),
+      truncated: true,
+      truncationReason: current.truncationReason ?? "maxTokens"
+    });
     estimatedTokens = estimateContextTokens(current);
     if (estimatedTokens <= current.maxTokens) {
       return { ...current, estimatedTokens };
     }
   }
 
-  return { ...current, estimatedTokens: Math.min(estimatedTokens, current.maxTokens), truncated: true };
+  return {
+    ...current,
+    estimatedTokens: Math.min(estimatedTokens, current.maxTokens),
+    truncated: true,
+    truncationReason: current.truncationReason ?? "maxTokens"
+  };
 }
 
 async function rerankContextEntities(
@@ -455,16 +466,17 @@ export async function buildContextPack(
   const selectedEntities = rankedEntities.slice(0, maxFiles * 3);
   const selectedUids = new Set(selectedEntities.map((entity) => entity.uid));
   const maxTraversalEntities = Math.min(
-    Math.max(maxFiles * 8, selectedUids.size),
+    request.maxNodes ?? Math.max(maxFiles * 8, selectedUids.size),
     Math.max(48, Math.floor(maxTokens / 40))
   );
   const maxTraversalRelations = Math.min(
-    Math.max(maxFiles * 40, 300),
+    request.maxRelations ?? Math.max(maxFiles * 40, 300),
     Math.max(120, Math.floor(maxTokens / 12))
   );
   const graphSlice = await relationDepthFilter(db, selectedUids, maxDepth, {
     maxEntities: maxTraversalEntities,
-    maxRelations: maxTraversalRelations
+    maxRelations: maxTraversalRelations,
+    timeoutMs: request.timeoutMs
   });
   const contextEntities = [...selectedEntities];
   const contextEntityUids = new Set(contextEntities.map((entity) => entity.uid));
@@ -478,7 +490,9 @@ export async function buildContextPack(
       (includeTests || !relationHasTestEndpoint(relation, entitiesByUid))
   );
   const dependencies = graphDependencies.slice(0, 300);
-  const dependenciesTruncated = graphDependencies.length > dependencies.length;
+  const dependenciesTruncated = graphSlice.truncated || graphDependencies.length > dependencies.length;
+  const traversalTruncationReason =
+    graphDependencies.length > dependencies.length ? "maxRelations" : graphSlice.truncationReason;
   for (const uid of graphSlice.entities) {
     const entity = entitiesByUid.get(uid);
     if (!includeTests && entity?.kind === "test") {
@@ -502,7 +516,7 @@ export async function buildContextPack(
   const maxCodeTokens = includeCode === "full-files" ? Math.max(400, Math.floor(maxTokens * 0.45)) : Math.max(240, Math.floor(maxTokens * 0.25));
   const maxCodeChars = Math.max(320, maxCodeTokens * 4);
   const maxCharsPerFile = Math.max(160, Math.floor(maxCodeChars / Math.max(1, files.length)));
-  const code = readCodePayload(db, files, rankedContextEntities, includeCode, {
+  const codePayload = readCodePayload(db, files, rankedContextEntities, includeCode, {
     maxCharsPerFile,
     maxTotalChars: maxCodeChars
   });
@@ -512,7 +526,14 @@ export async function buildContextPack(
       : "No direct public API edges in selected context.",
     tests.length > 0 ? `${tests.length} related tests included.` : "No tests in top-ranked context.",
     ...(embeddingsEnabled ? ["Semantic reranking applied to context entities."] : []),
-    ...(dependenciesTruncated ? [`Graph dependencies truncated from ${graphDependencies.length} to ${dependencies.length}.`] : [])
+    ...(codePayload.skipped.length > 0
+      ? [`Skipped code payloads for unreadable files: ${codePayload.skipped.slice(0, 5).join(", ")}.`]
+      : []),
+    ...(dependenciesTruncated
+      ? [
+          `Graph dependencies truncated from ${graphDependencies.length} to ${dependencies.length}${traversalTruncationReason ? ` due to ${traversalTruncationReason}.` : "."}`
+        ]
+      : [])
   ];
 
   const suggestedEditOrder = topoSortByDependencies(files, rankedContextEntities, dependencies).slice(
@@ -524,12 +545,13 @@ export async function buildContextPack(
     files,
     dependencies,
     tests,
-    ...(code ? { code } : {}),
+    ...(codePayload.code ? { code: codePayload.code } : {}),
     riskNotes,
     suggestedEditOrder,
     estimatedTokens: 0,
     maxTokens,
-    truncated: dependenciesTruncated
+    truncated: dependenciesTruncated,
+    ...(traversalTruncationReason ? { truncationReason: traversalTruncationReason } : {})
   };
   return enforceContextBudget(context);
 }

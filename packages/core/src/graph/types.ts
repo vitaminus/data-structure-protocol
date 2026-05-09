@@ -117,6 +117,15 @@ export type SearchResult = {
   neighbors: string[];
 };
 
+export type TraversalTruncationReason = "maxDepth" | "maxNodes" | "maxRelations" | "timeout";
+
+export type TraversalLimits = {
+  maxDepth?: number;
+  maxNodes?: number;
+  maxRelations?: number;
+  timeoutMs?: number;
+};
+
 export type ImpactResult = {
   target: string;
   directDependents: string[];
@@ -127,6 +136,8 @@ export type ImpactResult = {
   suggestedFiles: string[];
   confidence: number;
   reasons: string[];
+  truncated: boolean;
+  truncationReason?: TraversalTruncationReason;
 };
 
 export type ValidationSeverity = "error" | "warning" | "info";
@@ -135,6 +146,8 @@ export type ValidationIssue = {
   kind:
     | "missing_file"
     | "stale_hash"
+    | "binary_file"
+    | "invalid_utf8"
     | "dangling_relation"
     | "unresolved_reference"
     | "low_confidence_critical"
@@ -165,13 +178,31 @@ export type ValidationOptions = {
   deep?: boolean;
 };
 
+export type RepairActionKind =
+  | ValidationIssue["kind"]
+  | "orphaned_file_hash"
+  | "orphaned_embedding"
+  | "stale_parse_cache"
+  | "stale_checkpoint"
+  | "abandoned_run";
+
 export type RepairAction = {
-  kind: ValidationIssue["kind"];
+  kind: RepairActionKind;
   status: "planned" | "applied" | "skipped";
   message: string;
   path?: string;
   uid?: string;
   relation?: { from: string; to: string; kind: RelationKind };
+};
+
+export type RepairOptions = {
+  dryRun?: boolean;
+  apply?: boolean;
+  cleanOrphanedFileHashes?: boolean;
+  cleanOrphanedEmbeddings?: boolean;
+  cleanStaleParseCache?: boolean;
+  clearStaleCheckpoints?: boolean;
+  failAbandonedRuns?: boolean;
 };
 
 export type RepairResult = {
@@ -186,6 +217,9 @@ export type ContextPackRequest = {
   maxTokens?: number;
   maxFiles?: number;
   maxDepth?: number;
+  maxNodes?: number;
+  maxRelations?: number;
+  timeoutMs?: number;
   includeCode?: "none" | "snippets-only" | "full-files";
   includeTests?: boolean;
   strategy?: "minimal" | "balanced" | "deep" | "debug";
@@ -209,9 +243,51 @@ export type ContextPackResponse = {
   estimatedTokens: number;
   maxTokens: number;
   truncated: boolean;
+  truncationReason?: TraversalTruncationReason | "maxTokens";
 };
 
 export type IndexMode = "index" | "update" | "bootstrap";
+
+export type IndexSlowFile = {
+  path: string;
+  ms: number;
+  sizeBytes: number;
+  language: string;
+};
+
+export type IndexSkipReason = "unsupported" | "unchanged" | "tooLarge" | "binary" | "invalidUtf8";
+
+export type IndexSkippedFile = {
+  path: string;
+  reason: IndexSkipReason;
+  sizeBytes: number;
+  language?: string;
+};
+
+export type IndexTelemetry = {
+  discoveryMs: number;
+  readMs: number;
+  hashMs: number;
+  parseMs: number;
+  dbWriteMs: number;
+  tsResolutionMs?: number;
+  tsResolutionCacheHits?: number;
+  tsResolutionCacheMisses?: number;
+  incrementalDependentFiles?: number;
+  incrementalExpansionTruncated?: boolean;
+  incrementalExpansionReason?: "maxDepth" | "maxFiles";
+  cacheHitFiles: number;
+  cacheHitParses: number;
+  workerRestarts: number;
+  workerTimeouts: number;
+  parserFallbackFiles: number;
+  fallbackByLanguage: Record<string, number>;
+  parserSourceCounts: Record<string, number>;
+  skippedByReason: Partial<Record<IndexSkipReason, number>>;
+  skippedFiles: IndexSkippedFile[];
+  slowestFiles: IndexSlowFile[];
+  dbQueryCount?: number;
+};
 
 export type FileIndexRequest = {
   rootDir: string;
@@ -220,6 +296,7 @@ export type FileIndexRequest = {
   full?: boolean;
   changedOnly?: boolean;
   fromGitDiff?: boolean;
+  baseRef?: string;
   noEmbeddings?: boolean;
 };
 
@@ -234,9 +311,5 @@ export type IndexSummary = {
   unresolvedReferences: number;
   lowConfidenceRelations: number;
   estimatedCoverage: number;
-  telemetry?: {
-    parserFallbackFiles: number;
-    fallbackByLanguage: Record<string, number>;
-    parserSourceCounts: Record<string, number>;
-  };
+  telemetry?: IndexTelemetry;
 };

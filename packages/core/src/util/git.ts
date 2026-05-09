@@ -1,4 +1,4 @@
-import * as childProcess from "node:child_process";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -15,13 +15,33 @@ export type GitChangedFile = {
   oldPath?: string;
 };
 
+function validateGitRef(baseRef: string): string {
+  if (!baseRef || /[\0\r\n\t ]/.test(baseRef) || baseRef.startsWith("-") || !/^[A-Za-z0-9._/:~^-]+$/.test(baseRef)) {
+    throw new Error(`Invalid git base ref: ${baseRef}`);
+  }
+  return baseRef;
+}
+
+function runGit(rootDir: string, args: string[]): string {
+  return execFileSync("git", args, {
+    cwd: rootDir,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"]
+  });
+}
+
+function resolveGitDiffBase(rootDir: string, baseRef: string): string {
+  if (baseRef.startsWith("merge-base:")) {
+    const mergeBaseRef = validateGitRef(baseRef.slice("merge-base:".length));
+    return runGit(rootDir, ["merge-base", mergeBaseRef, "HEAD"]).trim();
+  }
+  return validateGitRef(baseRef);
+}
+
 export function changedFileEntriesFromGit(rootDir: string, baseRef = "HEAD"): GitChangedFile[] {
+  const resolvedBaseRef = resolveGitDiffBase(rootDir, baseRef);
   try {
-    const output = childProcess.execSync(`git diff --name-status ${baseRef}`, {
-      cwd: rootDir,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"]
-    });
+    const output = runGit(rootDir, ["diff", "--name-status", resolvedBaseRef, "--"]);
     return splitLines(output).map((line) => {
       const [status, firstPath, secondPath] = line.split("\t");
       if (status?.startsWith("R") || status?.startsWith("C")) {
@@ -47,11 +67,7 @@ export function changedFilesFromGit(rootDir: string, baseRef = "HEAD"): string[]
 
 export function changedFilesStaged(rootDir: string): string[] {
   try {
-    const output = childProcess.execSync("git diff --cached --name-only", {
-      cwd: rootDir,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"]
-    });
+    const output = runGit(rootDir, ["diff", "--cached", "--name-only", "--"]);
     return splitLines(output).map((p) => path.resolve(rootDir, p));
   } catch {
     return [];
@@ -60,23 +76,11 @@ export function changedFilesStaged(rootDir: string): string[] {
 
 export function workingTreeFingerprint(rootDir: string): string | undefined {
   try {
-    const head = childProcess.execSync("git rev-parse HEAD", {
-      cwd: rootDir,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"]
-    }).trim();
-    const gitDir = childProcess.execSync("git rev-parse --git-dir", {
-      cwd: rootDir,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"]
-    }).trim();
+    const head = runGit(rootDir, ["rev-parse", "HEAD"]).trim();
+    const gitDir = runGit(rootDir, ["rev-parse", "--git-dir"]).trim();
     const indexPath = path.resolve(rootDir, gitDir, "index");
     const indexStat = fs.existsSync(indexPath) ? fs.statSync(indexPath) : undefined;
-    const dirtyPaths = childProcess.execSync("git ls-files -m -d -o --exclude-standard --directory -z", {
-      cwd: rootDir,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"]
-    });
+    const dirtyPaths = runGit(rootDir, ["ls-files", "-m", "-d", "-o", "--exclude-standard", "--directory", "-z"]);
     return [
       head,
       `${Math.trunc(indexStat?.mtimeMs ?? 0)}:${indexStat?.size ?? 0}`,

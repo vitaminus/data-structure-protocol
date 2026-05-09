@@ -12,8 +12,9 @@ import type {
 import { buildUid } from "../graph/uid.ts";
 import { mergeProvenance, topSourcePriority } from "../graph/provenance.ts";
 import { ensureDir } from "../util/fs.ts";
+import { safeJsonParse } from "./json.ts";
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 5;
 const SQLITE_LIST_CHUNK_SIZE = 400;
 const SQLITE_CACHE_SIZE_KB = 32 * 1024;
 const SQLITE_MMAP_SIZE_BYTES = 256 * 1024 * 1024;
@@ -22,7 +23,11 @@ const SQLITE_BUSY_RETRIES = 4;
 const PARSE_CACHE_MAX_ROWS = 20000;
 const PARSE_CACHE_MAX_AGE_DAYS = 30;
 const SQLITE_VACUUM_FREELIST_THRESHOLD = 2000;
-const EMBEDDING_BUCKET_BITS = 8;
+const STALE_INDEX_RUN_AFTER_MS = 60 * 60 * 1000;
+const STALE_CHECKPOINT_AFTER_MS = 24 * 60 * 60 * 1000;
+const EMBEDDING_BUCKET_BITS = 12;
+const EMBEDDING_BUCKET_FAMILIES = 4;
+const EMBEDDING_BUCKET_MAX_HAMMING_DISTANCE = 1;
 
 function toJson(value: unknown): string {
   return JSON.stringify(value ?? null);
@@ -32,21 +37,77 @@ function fromJson<T>(value: string | null): T {
   return value ? (JSON.parse(value) as T) : (null as T);
 }
 
-function embeddingBucketKey(vector: number[]): string {
-  const bits: string[] = [];
-  for (let index = 0; index < EMBEDDING_BUCKET_BITS; index += 1) {
-    bits.push((vector[index] ?? 0) >= 0 ? "1" : "0");
-  }
-  return bits.join("");
+function safeJsonObject(value: string | null): { ok: boolean; value: Record<string, unknown> } {
+  return safeJsonParse<Record<string, unknown>>(value, {});
 }
 
-function embeddingBucketNeighbors(bucketKey: string): string[] {
+function normalizeVector(vector: number[]): number[] {
+  let norm = 0;
+  for (const value of vector) {
+    norm += value * value;
+  }
+  if (norm <= 0) {
+    return vector.map(() => 0);
+  }
+  const scale = Math.sqrt(norm);
+  return vector.map((value) => value / scale);
+}
+
+function projectionWeight(family: number, bit: number, dimension: number): number {
+  let state = (family + 1) * 0x9e3779b1 ^ (bit + 1) * 0x85ebca6b ^ (dimension + 1) * 0xc2b2ae35;
+  state ^= state >>> 16;
+  state = Math.imul(state, 0x7feb352d);
+  state ^= state >>> 15;
+  state = Math.imul(state, 0x846ca68b);
+  state ^= state >>> 16;
+  return (state & 1) === 0 ? -1 : 1;
+}
+
+function embeddingBucketKeyForFamily(vector: number[], family: number): string {
+  const normalized = normalizeVector(vector);
+  const bits: string[] = [];
+  for (let bit = 0; bit < EMBEDDING_BUCKET_BITS; bit += 1) {
+    let dot = 0;
+    for (let dimension = 0; dimension < normalized.length; dimension += 1) {
+      dot += (normalized[dimension] ?? 0) * projectionWeight(family, bit, dimension);
+    }
+    bits.push(dot >= 0 ? "1" : "0");
+  }
+  return `f${family}:${bits.join("")}`;
+}
+
+function embeddingBucketKeys(vector: number[]): string[] {
+  const keys: string[] = [];
+  for (let family = 0; family < EMBEDDING_BUCKET_FAMILIES; family += 1) {
+    keys.push(embeddingBucketKeyForFamily(vector, family));
+  }
+  return keys;
+}
+
+function embeddingBucketNeighbors(bucketKey: string, maxHammingDistance = EMBEDDING_BUCKET_MAX_HAMMING_DISTANCE): string[] {
+  const separator = bucketKey.indexOf(":");
+  if (separator === -1) {
+    return [bucketKey];
+  }
+  const familyPrefix = bucketKey.slice(0, separator + 1);
+  const bits = bucketKey.slice(separator + 1);
   const neighbors = [bucketKey];
-  for (let index = 0; index < bucketKey.length; index += 1) {
-    const flipped = bucketKey.slice(0, index) + (bucketKey[index] === "1" ? "0" : "1") + bucketKey.slice(index + 1);
-    neighbors.push(flipped);
+  if (maxHammingDistance <= 0) {
+    return neighbors;
+  }
+  for (let index = 0; index < bits.length; index += 1) {
+    const flipped = bits.slice(0, index) + (bits[index] === "1" ? "0" : "1") + bits.slice(index + 1);
+    neighbors.push(`${familyPrefix}${flipped}`);
   }
   return neighbors;
+}
+
+function embeddingBucketQueryKeys(vector: number[]): string[] {
+  const keys: string[] = [];
+  for (const bucketKey of embeddingBucketKeys(vector)) {
+    keys.push(...embeddingBucketNeighbors(bucketKey));
+  }
+  return [...new Set(keys)];
 }
 
 function protocolUidForEntity(entity: Entity): string {
@@ -127,6 +188,18 @@ function rewritePathBasedUid(uid: string, oldPath: string, newPath: string): str
   return uid;
 }
 
+function dependencyFilePathForUid(uid: string, entityByUid: Map<string, Entity>): string | undefined {
+  const entityPath = entityByUid.get(uid)?.path;
+  if (entityPath) {
+    return entityPath;
+  }
+  return uid.startsWith("file:") && !uid.includes("#") ? uid.slice("file:".length) : undefined;
+}
+
+function isSymbolDependencyUid(uid: string): boolean {
+  return uid.includes("#") || (!uid.startsWith("file:") && !uid.startsWith("directory:") && !uid.startsWith("repository:"));
+}
+
 export type GraphSnapshot = {
   entities: Entity[];
   relations: Relation[];
@@ -176,6 +249,11 @@ export type StoredCheckpoint = {
 };
 
 export type DatabaseDoctorReport = {
+  schema: {
+    currentVersion: number;
+    expectedVersion: number;
+    upToDate: boolean;
+  };
   integrity: {
     ok: boolean;
     rows: string[];
@@ -184,10 +262,22 @@ export type DatabaseDoctorReport = {
   orphanedEmbeddings: string[];
   danglingUnresolvedPaths: string[];
   runningIndexRuns: number;
+  abandonedIndexRuns: Array<{
+    id: number;
+    mode: string;
+    startedAt: string;
+  }>;
+  corruptedIndexRunMetadata: number[];
   checkpoints: number;
+  staleCheckpoints: Array<{
+    name: string;
+    createdAt: string;
+  }>;
+  corruptedCheckpoints: string[];
   parseCache: {
     entries: number;
     stalePaths: string[];
+    corruptedEntries: string[];
   };
   maintenance: {
     freelistPages: number;
@@ -198,12 +288,64 @@ export type CachedParseResult = {
   entities: Entity[];
   relations: Relation[];
   unresolvedReferences: UnresolvedReference[];
+  telemetry?: {
+    moduleResolutionMs?: number;
+    moduleResolutionCacheHits?: number;
+    moduleResolutionCacheMisses?: number;
+  };
+};
+
+export type ParseCacheEntryKey = {
+  language: string;
+  filePath: string;
+  contentHash: string;
 };
 
 export type EntitySearchCandidates = {
   uids: string[];
   candidatesScanned: number;
 };
+
+export type GraphReadCache = {
+  entityByUid: Map<string, Entity | undefined>;
+  relationsFromByUid: Map<string, Relation[]>;
+  relationsToByUid: Map<string, Relation[]>;
+  touchingRelationsByKey: Map<string, Relation[]>;
+};
+
+export type FileDependency = {
+  fromPath: string;
+  toPath: string;
+  kind: string;
+  confidence: number;
+};
+
+export type SymbolDependency = {
+  fromUid: string;
+  toUid: string;
+  kind: string;
+  confidence: number;
+};
+
+export type IndexRunRecord = {
+  id: number;
+  startedAt: string;
+  endedAt?: string;
+  mode: string;
+  status: string;
+  metadata: Record<string, unknown>;
+};
+
+const DEPENDENCY_RELATION_KINDS = new Set<RelationKind>([
+  "imports",
+  "depends_on",
+  "calls",
+  "uses",
+  "tests",
+  "routes_to",
+  "extends",
+  "implements"
+]);
 
 export class DSPDatabase {
   readonly dbPath: string;
@@ -345,14 +487,38 @@ export class DSPDatabase {
         PRIMARY KEY(language, file_path, content_hash)
       );
 
+      CREATE TABLE IF NOT EXISTS file_dependencies (
+        from_path TEXT NOT NULL,
+        to_path TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        PRIMARY KEY(from_path, to_path, kind)
+      );
+
+      CREATE TABLE IF NOT EXISTS symbol_dependencies (
+        from_uid TEXT NOT NULL,
+        to_uid TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        PRIMARY KEY(from_uid, to_uid, kind)
+      );
+
       CREATE VIRTUAL TABLE IF NOT EXISTS entity_fts
       USING fts5(uid UNINDEXED, name, path, description, docstring, tags);
 
       CREATE INDEX IF NOT EXISTS idx_entities_path ON entities(path);
       CREATE INDEX IF NOT EXISTS idx_entities_kind_path ON entities(kind, path);
+      CREATE INDEX IF NOT EXISTS idx_entities_language_kind_path ON entities(language, kind, path);
+      CREATE INDEX IF NOT EXISTS idx_entities_path_kind ON entities(path, kind);
       CREATE INDEX IF NOT EXISTS idx_relations_from_uid ON relations(from_uid);
       CREATE INDEX IF NOT EXISTS idx_relations_to_uid ON relations(to_uid);
       CREATE INDEX IF NOT EXISTS idx_relations_kind ON relations(kind);
+      CREATE INDEX IF NOT EXISTS idx_relations_kind_from_uid ON relations(kind, from_uid);
+      CREATE INDEX IF NOT EXISTS idx_relations_kind_to_uid ON relations(kind, to_uid);
+      CREATE INDEX IF NOT EXISTS idx_file_dependencies_to_path ON file_dependencies(to_path);
+      CREATE INDEX IF NOT EXISTS idx_file_dependencies_from_path ON file_dependencies(from_path);
+      CREATE INDEX IF NOT EXISTS idx_symbol_dependencies_to_uid ON symbol_dependencies(to_uid);
+      CREATE INDEX IF NOT EXISTS idx_symbol_dependencies_from_uid ON symbol_dependencies(from_uid);
       CREATE INDEX IF NOT EXISTS idx_unresolved_references_path ON unresolved_references(path);
       CREATE INDEX IF NOT EXISTS idx_embedding_buckets_uid ON embedding_buckets(uid);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoints_name ON checkpoints(name);
@@ -425,9 +591,47 @@ export class DSPDatabase {
       this.ensureFileHashColumn("mtime_ms", "INTEGER");
       this.ensureFileHashColumn("size_bytes", "INTEGER");
     }
+    if (current < 4) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS file_dependencies (
+          from_path TEXT NOT NULL,
+          to_path TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          confidence REAL NOT NULL,
+          PRIMARY KEY(from_path, to_path, kind)
+        );
+        CREATE TABLE IF NOT EXISTS symbol_dependencies (
+          from_uid TEXT NOT NULL,
+          to_uid TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          confidence REAL NOT NULL,
+          PRIMARY KEY(from_uid, to_uid, kind)
+        );
+        CREATE INDEX IF NOT EXISTS idx_file_dependencies_to_path ON file_dependencies(to_path);
+        CREATE INDEX IF NOT EXISTS idx_file_dependencies_from_path ON file_dependencies(from_path);
+        CREATE INDEX IF NOT EXISTS idx_symbol_dependencies_to_uid ON symbol_dependencies(to_uid);
+        CREATE INDEX IF NOT EXISTS idx_symbol_dependencies_from_uid ON symbol_dependencies(from_uid);
+      `);
+    }
+    if (current < 5) {
+      this.db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_entities_language_kind_path ON entities(language, kind, path);
+        CREATE INDEX IF NOT EXISTS idx_entities_path_kind ON entities(path, kind);
+        CREATE INDEX IF NOT EXISTS idx_relations_kind_from_uid ON relations(kind, from_uid);
+        CREATE INDEX IF NOT EXISTS idx_relations_kind_to_uid ON relations(kind, to_uid);
+      `);
+    }
     if (current < SCHEMA_VERSION) {
       this.setSchemaVersion(SCHEMA_VERSION);
     }
+  }
+
+  currentSchemaVersion(): number {
+    return this.schemaVersion();
+  }
+
+  expectedSchemaVersion(): number {
+    return SCHEMA_VERSION;
   }
 
   private ensureFileHashColumn(column: string, definition: string): void {
@@ -551,16 +755,283 @@ export class DSPDatabase {
     if (!row) {
       return undefined;
     }
+    const metadata = safeJsonObject(row.metadata_json ?? "{}");
     return {
       id: row.id,
       name: row.name,
-      metadata: fromJson<Record<string, unknown>>(row.metadata_json ?? "{}") ?? {},
+      metadata: metadata.value,
       createdAt: row.created_at
     };
   }
 
   clearCheckpoint(name: string): void {
     this.withBusyRetry(() => this.prepareCached("clear-checkpoint", "DELETE FROM checkpoints WHERE name = ?").run(name));
+  }
+
+  clearCheckpoints(names: string[]): number {
+    if (names.length === 0) {
+      return 0;
+    }
+    let removed = 0;
+    this.withBusyRetry(() => {
+      for (const chunk of chunks([...new Set(names)])) {
+        const placeholders = chunk.map(() => "?").join(", ");
+        removed += this.db.prepare(`DELETE FROM checkpoints WHERE name IN (${placeholders})`).run(...chunk).changes;
+      }
+    });
+    return removed;
+  }
+
+  getStaleCheckpoints(limit = 100, olderThanMs = STALE_CHECKPOINT_AFTER_MS): Array<{ name: string; createdAt: string }> {
+    const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+    const rows = this.readDb
+      .prepare(
+        `
+        SELECT name, created_at
+        FROM checkpoints
+        WHERE created_at < ?
+        ORDER BY created_at, name
+        LIMIT ?
+        `
+      )
+      .all(cutoff, limit) as { name: string; created_at: string }[];
+    return rows.map((row) => ({ name: row.name, createdAt: row.created_at }));
+  }
+
+  getAbandonedIndexRuns(limit = 100, olderThanMs = STALE_INDEX_RUN_AFTER_MS): IndexRunRecord[] {
+    const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+    const rows = this.readDb
+      .prepare(
+        `
+        SELECT id, started_at, ended_at, mode, status, metadata_json
+        FROM index_runs
+        WHERE status = 'running' AND started_at < ?
+        ORDER BY started_at, id
+        LIMIT ?
+        `
+      )
+      .all(cutoff, limit) as {
+      id: number;
+      started_at: string;
+      ended_at: string | null;
+      mode: string;
+      status: string;
+      metadata_json: string | null;
+    }[];
+    return rows.map((row) => {
+      const metadata = safeJsonObject(row.metadata_json ?? "{}");
+      return {
+      id: row.id,
+      startedAt: row.started_at,
+      endedAt: row.ended_at ?? undefined,
+      mode: row.mode,
+      status: row.status,
+      metadata: metadata.value
+      };
+    });
+  }
+
+  getCorruptedCheckpoints(limit = 100): string[] {
+    const rows = this.readDb
+      .prepare("SELECT name, metadata_json FROM checkpoints ORDER BY name LIMIT ?")
+      .all(limit) as { name: string; metadata_json: string | null }[];
+    return rows
+      .filter((row) => !safeJsonObject(row.metadata_json ?? "{}").ok)
+      .map((row) => row.name);
+  }
+
+  getCorruptedIndexRunMetadata(limit = 100): number[] {
+    const rows = this.readDb
+      .prepare("SELECT id, metadata_json FROM index_runs ORDER BY id LIMIT ?")
+      .all(limit) as { id: number; metadata_json: string | null }[];
+    return rows
+      .filter((row) => !safeJsonObject(row.metadata_json ?? "{}").ok)
+      .map((row) => row.id);
+  }
+
+  getCorruptedParseCacheEntries(limit = 100): string[] {
+    return this.getCorruptedParseCacheRows(limit).map(
+      (row) => `${row.language}:${row.filePath}:${row.contentHash}`
+    );
+  }
+
+  getCorruptedParseCacheRows(limit = 100): ParseCacheEntryKey[] {
+    const rows = this.readDb
+      .prepare(
+        "SELECT language, file_path, content_hash, payload_json FROM parse_cache ORDER BY file_path, language, content_hash LIMIT ?"
+      )
+      .all(limit) as { language: string; file_path: string; content_hash: string; payload_json: string }[];
+    return rows
+      .filter((row) => !safeJsonParse<CachedParseResult>(row.payload_json, { entities: [], relations: [], unresolvedReferences: [] }).ok)
+      .map((row) => ({
+        language: row.language,
+        filePath: row.file_path,
+        contentHash: row.content_hash
+      }));
+  }
+
+  markIndexRunsFailed(ids: number[], endedAt: string, reason: string): number {
+    if (ids.length === 0) {
+      return 0;
+    }
+    let updated = 0;
+    this.transaction(() => {
+      for (const run of this.getIndexRunsById(ids)) {
+        updated += this.prepareCached(
+          "mark-index-run-failed",
+          "UPDATE index_runs SET status = 'failed', ended_at = ?, metadata_json = ? WHERE id = ?"
+        ).run(
+          endedAt,
+          toJson({
+            ...run.metadata,
+            repairMarkedFailedAt: endedAt,
+            repairFailureReason: reason
+          }),
+          run.id
+        ).changes;
+      }
+    });
+    return updated;
+  }
+
+  getOrphanedFileHashes(limit = 100): string[] {
+    const rows = this.readDb
+      .prepare(
+        `
+        SELECT file_hashes.path
+        FROM file_hashes
+        LEFT JOIN entities ON entities.uid = ('file:' || file_hashes.path)
+        WHERE entities.uid IS NULL
+        ORDER BY file_hashes.path
+        LIMIT ?
+        `
+      )
+      .all(limit) as { path: string }[];
+    return rows.map((row) => row.path);
+  }
+
+  removeFileHashes(filePaths: string[]): number {
+    if (filePaths.length === 0) {
+      return 0;
+    }
+    let removed = 0;
+    this.withBusyRetry(() => {
+      for (const chunk of chunks([...new Set(filePaths)])) {
+        const placeholders = chunk.map(() => "?").join(", ");
+        removed += this.db.prepare(`DELETE FROM file_hashes WHERE path IN (${placeholders})`).run(...chunk).changes;
+      }
+    });
+    return removed;
+  }
+
+  getOrphanedEmbeddings(limit = 100): string[] {
+    const rows = this.readDb
+      .prepare(
+        `
+        SELECT embeddings.uid
+        FROM embeddings
+        LEFT JOIN entities ON entities.uid = embeddings.uid
+        WHERE entities.uid IS NULL
+        ORDER BY embeddings.uid
+        LIMIT ?
+        `
+      )
+      .all(limit) as { uid: string }[];
+    return rows.map((row) => row.uid);
+  }
+
+  removeEmbeddings(uids: string[]): number {
+    if (uids.length === 0) {
+      return 0;
+    }
+    let removed = 0;
+    this.transaction(() => {
+      for (const chunk of chunks([...new Set(uids)])) {
+        const placeholders = chunk.map(() => "?").join(", ");
+        this.db.prepare(`DELETE FROM embedding_buckets WHERE uid IN (${placeholders})`).run(...chunk);
+        removed += this.db.prepare(`DELETE FROM embeddings WHERE uid IN (${placeholders})`).run(...chunk).changes;
+      }
+    });
+    return removed;
+  }
+
+  getStaleParseCachePaths(limit = 100): string[] {
+    const rows = this.readDb
+      .prepare(
+        `
+        SELECT DISTINCT parse_cache.file_path
+        FROM parse_cache
+        LEFT JOIN file_hashes ON file_hashes.path = parse_cache.file_path
+        WHERE file_hashes.path IS NULL
+        ORDER BY parse_cache.file_path
+        LIMIT ?
+        `
+      )
+      .all(limit) as { file_path: string }[];
+    return rows.map((row) => row.file_path);
+  }
+
+  removeParseCachePaths(filePaths: string[]): number {
+    if (filePaths.length === 0) {
+      return 0;
+    }
+    let removed = 0;
+    this.withBusyRetry(() => {
+      for (const chunk of chunks([...new Set(filePaths)])) {
+        const placeholders = chunk.map(() => "?").join(", ");
+        removed += this.db.prepare(`DELETE FROM parse_cache WHERE file_path IN (${placeholders})`).run(...chunk).changes;
+      }
+    });
+    return removed;
+  }
+
+  removeParseCacheEntries(entries: ParseCacheEntryKey[]): number {
+    if (entries.length === 0) {
+      return 0;
+    }
+    let removed = 0;
+    this.withBusyRetry(() => {
+      for (const entry of entries) {
+        removed += this.db
+          .prepare("DELETE FROM parse_cache WHERE language = ? AND file_path = ? AND content_hash = ?")
+          .run(entry.language, entry.filePath, entry.contentHash).changes;
+      }
+    });
+    return removed;
+  }
+
+  private getIndexRunsById(ids: number[]): IndexRunRecord[] {
+    if (ids.length === 0) {
+      return [];
+    }
+    const records: IndexRunRecord[] = [];
+    for (const chunk of chunks([...new Set(ids)])) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      const rows = this.readDb
+        .prepare(
+          `SELECT id, started_at, ended_at, mode, status, metadata_json FROM index_runs WHERE id IN (${placeholders})`
+        )
+        .all(...chunk) as {
+        id: number;
+        started_at: string;
+        ended_at: string | null;
+        mode: string;
+        status: string;
+        metadata_json: string | null;
+      }[];
+      for (const row of rows) {
+        const metadata = safeJsonObject(row.metadata_json ?? "{}");
+        records.push({
+          id: row.id,
+          startedAt: row.started_at,
+          endedAt: row.ended_at ?? undefined,
+          mode: row.mode,
+          status: row.status,
+          metadata: metadata.value
+        });
+      }
+    }
+    return records.sort((left, right) => left.id - right.id);
   }
 
   integrityCheck(): { ok: boolean; rows: string[] } {
@@ -573,31 +1044,11 @@ export class DSPDatabase {
   }
 
   doctor(limit = 100): DatabaseDoctorReport {
+    const currentVersion = this.currentSchemaVersion();
+    const expectedVersion = this.expectedSchemaVersion();
     const integrity = this.integrityCheck();
-    const orphanedFileHashes = this.readDb
-      .prepare(
-        `
-        SELECT file_hashes.path
-        FROM file_hashes
-        LEFT JOIN entities ON entities.uid = ('file:' || file_hashes.path)
-        WHERE entities.uid IS NULL
-        ORDER BY file_hashes.path
-        LIMIT ?
-        `
-      )
-      .all(limit) as { path: string }[];
-    const orphanedEmbeddings = this.readDb
-      .prepare(
-        `
-        SELECT embeddings.uid
-        FROM embeddings
-        LEFT JOIN entities ON entities.uid = embeddings.uid
-        WHERE entities.uid IS NULL
-        ORDER BY embeddings.uid
-        LIMIT ?
-        `
-      )
-      .all(limit) as { uid: string }[];
+    const orphanedFileHashes = this.getOrphanedFileHashes(limit);
+    const orphanedEmbeddings = this.getOrphanedEmbeddings(limit);
     const danglingUnresolvedPaths = this.readDb
       .prepare(
         `
@@ -621,36 +1072,44 @@ export class DSPDatabase {
         count: number;
       }
     ).count;
+    const abandonedIndexRuns = this.getAbandonedIndexRuns(limit);
+    const corruptedIndexRunMetadata = this.getCorruptedIndexRunMetadata(limit);
+    const staleCheckpoints = this.getStaleCheckpoints(limit);
+    const corruptedCheckpoints = this.getCorruptedCheckpoints(limit);
     const parseCacheEntries = (
       this.readDb.prepare("SELECT COUNT(*) AS count FROM parse_cache").get() as {
         count: number;
       }
     ).count;
-    const staleParseCachePaths = this.readDb
-      .prepare(
-        `
-        SELECT DISTINCT parse_cache.file_path
-        FROM parse_cache
-        LEFT JOIN file_hashes ON file_hashes.path = parse_cache.file_path
-        WHERE file_hashes.path IS NULL
-        ORDER BY parse_cache.file_path
-        LIMIT ?
-        `
-      )
-      .all(limit) as { file_path: string }[];
+    const staleParseCachePaths = this.getStaleParseCachePaths(limit);
+    const corruptedParseCacheEntries = this.getCorruptedParseCacheEntries(limit);
     const freelistPages = (
       this.readDb.prepare("PRAGMA freelist_count").get() as { freelist_count?: number; count?: number } | undefined
     )?.freelist_count ?? 0;
     return {
+      schema: {
+        currentVersion,
+        expectedVersion,
+        upToDate: currentVersion === expectedVersion
+      },
       integrity,
-      orphanedFileHashes: orphanedFileHashes.map((row) => row.path),
-      orphanedEmbeddings: orphanedEmbeddings.map((row) => row.uid),
+      orphanedFileHashes,
+      orphanedEmbeddings,
       danglingUnresolvedPaths: danglingUnresolvedPaths.map((row) => row.path),
       runningIndexRuns,
+      abandonedIndexRuns: abandonedIndexRuns.map((run) => ({
+        id: run.id,
+        mode: run.mode,
+        startedAt: run.startedAt
+      })),
+      corruptedIndexRunMetadata,
       checkpoints,
+      staleCheckpoints,
+      corruptedCheckpoints,
       parseCache: {
         entries: parseCacheEntries,
-        stalePaths: staleParseCachePaths.map((row) => row.file_path)
+        stalePaths: staleParseCachePaths,
+        corruptedEntries: corruptedParseCacheEntries
       },
       maintenance: {
         freelistPages
@@ -671,7 +1130,12 @@ export class DSPDatabase {
     if (!row) {
       return undefined;
     }
-    return fromJson<CachedParseResult>(row.payload_json);
+    const parsed = safeJsonParse<CachedParseResult>(row.payload_json, {
+      entities: [],
+      relations: [],
+      unresolvedReferences: []
+    });
+    return parsed.ok ? parsed.value : undefined;
   }
 
   setCachedParseResult(language: string, filePath: string, hash: string, payload: CachedParseResult, updatedAt: string): void {
@@ -813,11 +1277,33 @@ export class DSPDatabase {
     return merged.sort((a, b) => `${a.from}\0${a.to}\0${a.kind}`.localeCompare(`${b.from}\0${b.to}\0${b.kind}`));
   }
 
+  private touchingRelationCacheKey(uids: string[]): string {
+    return [...new Set(uids)].sort().join("\0");
+  }
+
+  createGraphReadCache(): GraphReadCache {
+    return {
+      entityByUid: new Map(),
+      relationsFromByUid: new Map(),
+      relationsToByUid: new Map(),
+      touchingRelationsByKey: new Map()
+    };
+  }
+
   getEntity(uid: string): Entity | undefined {
     const row = this.prepareReadCached("get-entity", "SELECT * FROM entities WHERE uid = ?").get(uid) as
       | Record<string, unknown>
       | undefined;
     return row ? this.rowToEntity(row) : undefined;
+  }
+
+  getEntityCached(uid: string, cache: GraphReadCache): Entity | undefined {
+    if (cache.entityByUid.has(uid)) {
+      return cache.entityByUid.get(uid);
+    }
+    const entity = this.getEntity(uid);
+    cache.entityByUid.set(uid, entity);
+    return entity;
   }
 
   getEntities(limit = 10000): Entity[] {
@@ -892,6 +1378,20 @@ export class DSPDatabase {
     return rows.map((row) => this.rowToEntity(row));
   }
 
+  getEntitiesForPath(filePath: string): Entity[] {
+    const rows = this.prepareReadCached(
+      "get-entities-for-path",
+      `
+      SELECT *
+      FROM entities
+      WHERE path = ? AND source_priority < 100
+      ORDER BY uid
+      `
+    )
+      .all(filePath) as Record<string, unknown>[];
+    return rows.map((row) => this.rowToEntity(row));
+  }
+
   getEntitiesByUid(uids: string[]): Entity[] {
     if (uids.length === 0) {
       return [];
@@ -909,6 +1409,23 @@ export class DSPDatabase {
     }
 
     return uids.map((uid) => byUid.get(uid)).filter((entity): entity is Entity => Boolean(entity));
+  }
+
+  getEntitiesByUidCached(uids: string[], cache: GraphReadCache): Entity[] {
+    if (uids.length === 0) {
+      return [];
+    }
+
+    const missingUids = [...new Set(uids)].filter((uid) => !cache.entityByUid.has(uid));
+    if (missingUids.length > 0) {
+      const fetched = this.getEntitiesByUid(missingUids);
+      const fetchedByUid = new Map(fetched.map((entity) => [entity.uid, entity]));
+      for (const uid of missingUids) {
+        cache.entityByUid.set(uid, fetchedByUid.get(uid));
+      }
+    }
+
+    return uids.map((uid) => cache.entityByUid.get(uid)).filter((entity): entity is Entity => Boolean(entity));
   }
 
   searchEntityUids(query: string, limit = 500): string[] {
@@ -1082,6 +1599,16 @@ export class DSPDatabase {
     );
   }
 
+  getRelationsFromCached(uid: string, cache: GraphReadCache): Relation[] {
+    const cached = cache.relationsFromByUid.get(uid);
+    if (cached) {
+      return cached;
+    }
+    const relations = this.getRelationsFrom(uid);
+    cache.relationsFromByUid.set(uid, relations);
+    return relations;
+  }
+
   getRelationsTo(uid: string): Relation[] {
     const rows = this.prepareReadCached(
       "get-relations-to",
@@ -1092,6 +1619,16 @@ export class DSPDatabase {
       rows.map((row) => this.rowToRelation(row)),
       this.syntheticContainsToUid(uid)
     );
+  }
+
+  getRelationsToCached(uid: string, cache: GraphReadCache): Relation[] {
+    const cached = cache.relationsToByUid.get(uid);
+    if (cached) {
+      return cached;
+    }
+    const relations = this.getRelationsTo(uid);
+    cache.relationsToByUid.set(uid, relations);
+    return relations;
   }
 
   getRelationsTouching(uids: string[], limit: number | null = 5000): Relation[] {
@@ -1124,6 +1661,86 @@ export class DSPDatabase {
       synthetic
     );
     return limit === null ? merged : merged.slice(0, limit);
+  }
+
+  getRelationsForUids(uids: string[], cache?: GraphReadCache, limit: number | null = null): Relation[] {
+    if (uids.length === 0) {
+      return [];
+    }
+    if (!cache || limit !== null) {
+      return this.getRelationsTouching(uids, limit);
+    }
+    const cacheKey = this.touchingRelationCacheKey(uids);
+    const cached = cache.touchingRelationsByKey.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+    const relations = this.getRelationsTouching(uids, null);
+    cache.touchingRelationsByKey.set(cacheKey, relations);
+    return relations;
+  }
+
+  getTouchingRelationsWithEndpoints(
+    uids: string[],
+    cache?: GraphReadCache,
+    limit: number | null = null
+  ): { relations: Relation[]; entities: Entity[] } {
+    const relations = this.getRelationsForUids(uids, cache, limit);
+    const endpointUids = [...new Set(relations.flatMap((relation) => [relation.from, relation.to]))];
+    const entities = cache ? this.getEntitiesByUidCached(endpointUids, cache) : this.getEntitiesByUid(endpointUids);
+    return { relations, entities };
+  }
+
+  getReverseFileDependents(targetPaths: string[], limit: number | null = 5000): string[] {
+    if (targetPaths.length === 0) {
+      return [];
+    }
+    const dependents: string[] = [];
+    for (const chunk of chunks([...new Set(targetPaths)])) {
+      if (limit !== null && dependents.length >= limit) {
+        break;
+      }
+      const placeholders = chunk.map(() => "?").join(", ");
+      const remainingLimit = limit === null ? null : limit - dependents.length;
+      const sql = `
+        SELECT DISTINCT from_path
+        FROM file_dependencies
+        WHERE to_path IN (${placeholders})
+        ORDER BY from_path
+        ${remainingLimit === null ? "" : "LIMIT ?"}
+      `;
+      const rows = this.readDb
+        .prepare(sql)
+        .all(...chunk, ...(remainingLimit === null ? [] : [remainingLimit])) as { from_path: string }[];
+      dependents.push(...rows.map((row) => row.from_path));
+    }
+    return [...new Set(dependents)].sort();
+  }
+
+  getReverseSymbolDependents(targetUids: string[], limit: number | null = 5000): string[] {
+    if (targetUids.length === 0) {
+      return [];
+    }
+    const dependents: string[] = [];
+    for (const chunk of chunks([...new Set(targetUids)])) {
+      if (limit !== null && dependents.length >= limit) {
+        break;
+      }
+      const placeholders = chunk.map(() => "?").join(", ");
+      const remainingLimit = limit === null ? null : limit - dependents.length;
+      const sql = `
+        SELECT DISTINCT from_uid
+        FROM symbol_dependencies
+        WHERE to_uid IN (${placeholders})
+        ORDER BY from_uid
+        ${remainingLimit === null ? "" : "LIMIT ?"}
+      `;
+      const rows = this.readDb
+        .prepare(sql)
+        .all(...chunk, ...(remainingLimit === null ? [] : [remainingLimit])) as { from_uid: string }[];
+      dependents.push(...rows.map((row) => row.from_uid));
+    }
+    return [...new Set(dependents)].sort();
   }
 
   deleteRelation(fromUid: string, toUid: string, kind?: RelationKind): number {
@@ -1465,28 +2082,35 @@ export class DSPDatabase {
     }
     this.removeFileHash(oldPath);
 
-    for (const entity of oldEntities) {
+    const rewrittenEntities = oldEntities.map((entity) => ({
+      ...entity,
+      uid: uidMap.get(entity.uid)!,
+      path: newPath,
+      metadata: {
+        ...(entity.metadata ?? {}),
+        previousPath: oldPath,
+        renameReconciledAt: indexedAt
+      },
+      updatedAt: indexedAt
+    }));
+    const rewrittenRelations = relations.map((relation) => ({
+      ...relation,
+      from: uidMap.get(relation.from) ?? relation.from,
+      to: uidMap.get(relation.to) ?? relation.to,
+      metadata: {
+        ...(relation.metadata ?? {}),
+        renameReconciledAt: indexedAt
+      }
+    }));
+
+    for (const entity of rewrittenEntities) {
       this.upsertEntity({
-        ...entity,
-        uid: uidMap.get(entity.uid)!,
-        path: newPath,
-        metadata: {
-          ...(entity.metadata ?? {}),
-          previousPath: oldPath,
-          renameReconciledAt: indexedAt
-        },
-        updatedAt: indexedAt
+        ...entity
       });
     }
-    for (const relation of relations) {
+    for (const relation of rewrittenRelations) {
       this.upsertRelation({
-        ...relation,
-        from: uidMap.get(relation.from) ?? relation.from,
-        to: uidMap.get(relation.to) ?? relation.to,
-        metadata: {
-          ...(relation.metadata ?? {}),
-          renameReconciledAt: indexedAt
-        }
+        ...relation
       });
     }
     for (const ref of unresolvedRows) {
@@ -1502,6 +2126,7 @@ export class DSPDatabase {
         indexedAt
       );
     }
+    this.replaceDependencySnapshotForAstFile(newPath, rewrittenEntities, rewrittenRelations);
     for (const row of embeddingRows) {
       this.db
         .prepare(
@@ -1667,6 +2292,98 @@ export class DSPDatabase {
       );
   }
 
+  private clearDependencySnapshotsForPaths(filePaths: string[]): void {
+    const uniquePaths = [...new Set(filePaths)];
+    if (uniquePaths.length === 0) {
+      return;
+    }
+    for (const chunk of chunks(uniquePaths)) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      this.db.prepare(`DELETE FROM file_dependencies WHERE from_path IN (${placeholders})`).run(...chunk);
+    }
+  }
+
+  private clearDependencySnapshotsForUids(uids: string[]): void {
+    const uniqueUids = [...new Set(uids)];
+    if (uniqueUids.length === 0) {
+      return;
+    }
+    for (const chunk of chunks(uniqueUids)) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      this.db.prepare(`DELETE FROM symbol_dependencies WHERE from_uid IN (${placeholders})`).run(...chunk);
+    }
+  }
+
+  private replaceDependencySnapshotForAstFile(filePath: string, entities: Entity[], relations: Relation[]): void {
+    this.clearDependencySnapshotsForPaths([filePath]);
+    this.clearDependencySnapshotsForUids(entities.map((entity) => entity.uid));
+
+    const entityByUid = new Map(entities.map((entity) => [entity.uid, entity]));
+    const fileDependencies = new Map<string, FileDependency>();
+    const symbolDependencies = new Map<string, SymbolDependency>();
+
+    for (const relation of relations) {
+      if (!DEPENDENCY_RELATION_KINDS.has(relation.kind)) {
+        continue;
+      }
+
+      const fromPath = dependencyFilePathForUid(relation.from, entityByUid);
+      const toPath = dependencyFilePathForUid(relation.to, entityByUid);
+      if (fromPath && toPath && fromPath !== toPath) {
+        const key = `${fromPath}\0${toPath}\0${relation.kind}`;
+        const existing = fileDependencies.get(key);
+        if (!existing || relation.confidence > existing.confidence) {
+          fileDependencies.set(key, {
+            fromPath,
+            toPath,
+            kind: relation.kind,
+            confidence: relation.confidence
+          });
+        }
+      }
+
+      if (!isSymbolDependencyUid(relation.from) || !isSymbolDependencyUid(relation.to) || relation.from === relation.to) {
+        continue;
+      }
+      const key = `${relation.from}\0${relation.to}\0${relation.kind}`;
+      const existing = symbolDependencies.get(key);
+      if (!existing || relation.confidence > existing.confidence) {
+        symbolDependencies.set(key, {
+          fromUid: relation.from,
+          toUid: relation.to,
+          kind: relation.kind,
+          confidence: relation.confidence
+        });
+      }
+    }
+
+    for (const dependency of fileDependencies.values()) {
+      this.prepareCached(
+        "upsert-file-dependency",
+        `
+        INSERT INTO file_dependencies(from_path, to_path, kind, confidence)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(from_path, to_path, kind) DO UPDATE SET
+          confidence = excluded.confidence
+        `
+      )
+        .run(dependency.fromPath, dependency.toPath, dependency.kind, dependency.confidence);
+    }
+
+    for (const dependency of symbolDependencies.values()) {
+      this.prepareCached(
+        "upsert-symbol-dependency",
+        `
+        INSERT INTO symbol_dependencies(from_uid, to_uid, kind, confidence)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(from_uid, to_uid, kind) DO UPDATE SET
+          confidence = excluded.confidence
+        `
+      )
+        .run(dependency.fromUid, dependency.toUid, dependency.kind, dependency.confidence);
+    }
+  }
+
   clearAstDataForPaths(filePaths: string[]): void {
     const uniquePaths = [...new Set(filePaths)];
     if (uniquePaths.length === 0) {
@@ -1695,8 +2412,10 @@ export class DSPDatabase {
         this.db.prepare(`DELETE FROM entity_fts WHERE uid IN (${placeholders})`).run(...chunk);
         this.db.prepare(`DELETE FROM entities WHERE uid IN (${placeholders})`).run(...chunk);
       }
+      this.clearDependencySnapshotsForUids(uids);
     }
 
+    this.clearDependencySnapshotsForPaths(uniquePaths);
     for (const chunk of chunks(uniquePaths)) {
       const placeholders = chunk.map(() => "?").join(", ");
       this.db.prepare(`DELETE FROM unresolved_references WHERE path IN (${placeholders})`).run(...chunk);
@@ -1724,6 +2443,7 @@ export class DSPDatabase {
         mtimeMs: file.mtimeMs,
         sizeBytes: file.sizeBytes
       });
+      this.replaceDependencySnapshotForAstFile(file.relPath, file.entities, file.relations);
     }
     this.refreshEntityFtsByUid(entityUidsToRefresh);
   }
@@ -1947,7 +2667,8 @@ export class DSPDatabase {
   }
 
   setEmbedding(uid: string, hash: string, vector: number[], provider: string, updatedAt: string): void {
-    const bucketKey = embeddingBucketKey(vector);
+    const normalizedVector = normalizeVector(vector);
+    const bucketKeys = embeddingBucketKeys(normalizedVector);
     this.transaction(() => {
       this.db
         .prepare(
@@ -1961,12 +2682,14 @@ export class DSPDatabase {
           updated_at = excluded.updated_at
         `
         )
-        .run(uid, hash, toJson(vector), provider, updatedAt);
+        .run(uid, hash, toJson(normalizedVector), provider, updatedAt);
       this.prepareCached("clear-embedding-buckets-for-uid", "DELETE FROM embedding_buckets WHERE uid = ?").run(uid);
-      this.prepareCached(
-        "insert-embedding-bucket",
-        "INSERT OR REPLACE INTO embedding_buckets(provider, bucket_key, uid) VALUES (?, ?, ?)"
-      ).run(provider, bucketKey, uid);
+      for (const bucketKey of bucketKeys) {
+        this.prepareCached(
+          "insert-embedding-bucket",
+          "INSERT OR REPLACE INTO embedding_buckets(provider, bucket_key, uid) VALUES (?, ?, ?)"
+        ).run(provider, bucketKey, uid);
+      }
     });
   }
 
@@ -2059,7 +2782,7 @@ export class DSPDatabase {
     const scanLimit = options.scanLimit ?? Math.max(topK * 20, 2000);
     const bucketCandidates = this.getEmbeddingsByBucket(
       provider,
-      embeddingBucketNeighbors(embeddingBucketKey(queryVector)),
+      embeddingBucketQueryKeys(queryVector),
       scanLimit
     );
     const scanSource = bucketCandidates.length >= Math.min(topK, 10)
