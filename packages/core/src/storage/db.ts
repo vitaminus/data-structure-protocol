@@ -188,6 +188,18 @@ function rewritePathBasedUid(uid: string, oldPath: string, newPath: string): str
   return uid;
 }
 
+function dependencyFilePathForUid(uid: string, entityByUid: Map<string, Entity>): string | undefined {
+  const entityPath = entityByUid.get(uid)?.path;
+  if (entityPath) {
+    return entityPath;
+  }
+  return uid.startsWith("file:") && !uid.includes("#") ? uid.slice("file:".length) : undefined;
+}
+
+function isSymbolDependencyUid(uid: string): boolean {
+  return uid.includes("#") || (!uid.startsWith("file:") && !uid.startsWith("directory:") && !uid.startsWith("repository:"));
+}
+
 export type GraphSnapshot = {
   entities: Entity[];
   relations: Relation[];
@@ -270,6 +282,47 @@ export type EntitySearchCandidates = {
   uids: string[];
   candidatesScanned: number;
 };
+
+export type GraphReadCache = {
+  entityByUid: Map<string, Entity | undefined>;
+  relationsFromByUid: Map<string, Relation[]>;
+  relationsToByUid: Map<string, Relation[]>;
+  touchingRelationsByKey: Map<string, Relation[]>;
+};
+
+export type FileDependency = {
+  fromPath: string;
+  toPath: string;
+  kind: string;
+  confidence: number;
+};
+
+export type SymbolDependency = {
+  fromUid: string;
+  toUid: string;
+  kind: string;
+  confidence: number;
+};
+
+export type IndexRunRecord = {
+  id: number;
+  startedAt: string;
+  endedAt?: string;
+  mode: string;
+  status: string;
+  metadata: Record<string, unknown>;
+};
+
+const DEPENDENCY_RELATION_KINDS = new Set<RelationKind>([
+  "imports",
+  "depends_on",
+  "calls",
+  "uses",
+  "tests",
+  "routes_to",
+  "extends",
+  "implements"
+]);
 
 export class DSPDatabase {
   readonly dbPath: string;
@@ -946,11 +999,33 @@ export class DSPDatabase {
     return merged.sort((a, b) => `${a.from}\0${a.to}\0${a.kind}`.localeCompare(`${b.from}\0${b.to}\0${b.kind}`));
   }
 
+  private touchingRelationCacheKey(uids: string[]): string {
+    return [...new Set(uids)].sort().join("\0");
+  }
+
+  createGraphReadCache(): GraphReadCache {
+    return {
+      entityByUid: new Map(),
+      relationsFromByUid: new Map(),
+      relationsToByUid: new Map(),
+      touchingRelationsByKey: new Map()
+    };
+  }
+
   getEntity(uid: string): Entity | undefined {
     const row = this.prepareReadCached("get-entity", "SELECT * FROM entities WHERE uid = ?").get(uid) as
       | Record<string, unknown>
       | undefined;
     return row ? this.rowToEntity(row) : undefined;
+  }
+
+  getEntityCached(uid: string, cache: GraphReadCache): Entity | undefined {
+    if (cache.entityByUid.has(uid)) {
+      return cache.entityByUid.get(uid);
+    }
+    const entity = this.getEntity(uid);
+    cache.entityByUid.set(uid, entity);
+    return entity;
   }
 
   getEntities(limit = 10000): Entity[] {
@@ -1042,6 +1117,23 @@ export class DSPDatabase {
     }
 
     return uids.map((uid) => byUid.get(uid)).filter((entity): entity is Entity => Boolean(entity));
+  }
+
+  getEntitiesByUidCached(uids: string[], cache: GraphReadCache): Entity[] {
+    if (uids.length === 0) {
+      return [];
+    }
+
+    const missingUids = [...new Set(uids)].filter((uid) => !cache.entityByUid.has(uid));
+    if (missingUids.length > 0) {
+      const fetched = this.getEntitiesByUid(missingUids);
+      const fetchedByUid = new Map(fetched.map((entity) => [entity.uid, entity]));
+      for (const uid of missingUids) {
+        cache.entityByUid.set(uid, fetchedByUid.get(uid));
+      }
+    }
+
+    return uids.map((uid) => cache.entityByUid.get(uid)).filter((entity): entity is Entity => Boolean(entity));
   }
 
   searchEntityUids(query: string, limit = 500): string[] {
@@ -1215,6 +1307,16 @@ export class DSPDatabase {
     );
   }
 
+  getRelationsFromCached(uid: string, cache: GraphReadCache): Relation[] {
+    const cached = cache.relationsFromByUid.get(uid);
+    if (cached) {
+      return cached;
+    }
+    const relations = this.getRelationsFrom(uid);
+    cache.relationsFromByUid.set(uid, relations);
+    return relations;
+  }
+
   getRelationsTo(uid: string): Relation[] {
     const rows = this.prepareReadCached(
       "get-relations-to",
@@ -1225,6 +1327,16 @@ export class DSPDatabase {
       rows.map((row) => this.rowToRelation(row)),
       this.syntheticContainsToUid(uid)
     );
+  }
+
+  getRelationsToCached(uid: string, cache: GraphReadCache): Relation[] {
+    const cached = cache.relationsToByUid.get(uid);
+    if (cached) {
+      return cached;
+    }
+    const relations = this.getRelationsTo(uid);
+    cache.relationsToByUid.set(uid, relations);
+    return relations;
   }
 
   getRelationsTouching(uids: string[], limit: number | null = 5000): Relation[] {
@@ -1257,6 +1369,86 @@ export class DSPDatabase {
       synthetic
     );
     return limit === null ? merged : merged.slice(0, limit);
+  }
+
+  getRelationsForUids(uids: string[], cache?: GraphReadCache, limit: number | null = null): Relation[] {
+    if (uids.length === 0) {
+      return [];
+    }
+    if (!cache || limit !== null) {
+      return this.getRelationsTouching(uids, limit);
+    }
+    const cacheKey = this.touchingRelationCacheKey(uids);
+    const cached = cache.touchingRelationsByKey.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+    const relations = this.getRelationsTouching(uids, null);
+    cache.touchingRelationsByKey.set(cacheKey, relations);
+    return relations;
+  }
+
+  getTouchingRelationsWithEndpoints(
+    uids: string[],
+    cache?: GraphReadCache,
+    limit: number | null = null
+  ): { relations: Relation[]; entities: Entity[] } {
+    const relations = this.getRelationsForUids(uids, cache, limit);
+    const endpointUids = [...new Set(relations.flatMap((relation) => [relation.from, relation.to]))];
+    const entities = cache ? this.getEntitiesByUidCached(endpointUids, cache) : this.getEntitiesByUid(endpointUids);
+    return { relations, entities };
+  }
+
+  getReverseFileDependents(targetPaths: string[], limit: number | null = 5000): string[] {
+    if (targetPaths.length === 0) {
+      return [];
+    }
+    const dependents: string[] = [];
+    for (const chunk of chunks([...new Set(targetPaths)])) {
+      if (limit !== null && dependents.length >= limit) {
+        break;
+      }
+      const placeholders = chunk.map(() => "?").join(", ");
+      const remainingLimit = limit === null ? null : limit - dependents.length;
+      const sql = `
+        SELECT DISTINCT from_path
+        FROM file_dependencies
+        WHERE to_path IN (${placeholders})
+        ORDER BY from_path
+        ${remainingLimit === null ? "" : "LIMIT ?"}
+      `;
+      const rows = this.readDb
+        .prepare(sql)
+        .all(...chunk, ...(remainingLimit === null ? [] : [remainingLimit])) as { from_path: string }[];
+      dependents.push(...rows.map((row) => row.from_path));
+    }
+    return [...new Set(dependents)].sort();
+  }
+
+  getReverseSymbolDependents(targetUids: string[], limit: number | null = 5000): string[] {
+    if (targetUids.length === 0) {
+      return [];
+    }
+    const dependents: string[] = [];
+    for (const chunk of chunks([...new Set(targetUids)])) {
+      if (limit !== null && dependents.length >= limit) {
+        break;
+      }
+      const placeholders = chunk.map(() => "?").join(", ");
+      const remainingLimit = limit === null ? null : limit - dependents.length;
+      const sql = `
+        SELECT DISTINCT from_uid
+        FROM symbol_dependencies
+        WHERE to_uid IN (${placeholders})
+        ORDER BY from_uid
+        ${remainingLimit === null ? "" : "LIMIT ?"}
+      `;
+      const rows = this.readDb
+        .prepare(sql)
+        .all(...chunk, ...(remainingLimit === null ? [] : [remainingLimit])) as { from_uid: string }[];
+      dependents.push(...rows.map((row) => row.from_uid));
+    }
+    return [...new Set(dependents)].sort();
   }
 
   deleteRelation(fromUid: string, toUid: string, kind?: RelationKind): number {

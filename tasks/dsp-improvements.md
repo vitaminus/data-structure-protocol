@@ -13,7 +13,7 @@ Execution order:
 
 ### 94. Expand index telemetry and slow-file reporting
 
-Status: in progress
+Status: done
 
 - Extend index telemetry with `discoveryMs`, `readMs`, `hashMs`, `parseMs`, `dbWriteMs`, `cacheHitFiles`, `cacheHitParses`, `workerRestarts`, `workerTimeouts`, `parserFallbackFiles`, `slowestFiles`, and optional `dbQueryCount`.
 - Surface the telemetry in CLI `--json`, keep human-readable summaries compact, and show top slow files without breaking current machine consumers.
